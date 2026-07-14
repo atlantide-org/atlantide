@@ -1,0 +1,4 @@
+config = "infra.py"
+
+# `atlantide component add ... --as site` appends a [components.site] source here,
+# and records the resolved commit + hash in atlantide.lock.

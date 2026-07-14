@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: atlantide-linux-x86_64
+          - os: macos-14
+            asset: atlantide-macos-arm64
+          - os: windows-latest
+            asset: atlantide-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Build binary
+        run: uv run --extra build pyinstaller atlantide.spec --clean --noconfirm
+
+      - name: Stage asset
+        shell: bash
+        run: |
+          mkdir -p out
+          if [ -f dist/atlantide.exe ]; then
+            cp dist/atlantide.exe "out/${{ matrix.asset }}"
+          else
+            cp dist/atlantide "out/${{ matrix.asset }}"
+            chmod +x "out/${{ matrix.asset }}"
+          fi
+
+      - name: Smoke test
+        shell: bash
+        run: "out/${{ matrix.asset }} --version"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/${{ matrix.asset }}
+          fail_on_unmatched_files: true
+
+  pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    # Trusted Publishing (OIDC): PyPI verifies this workflow's identity, so no API
+    # token is stored anywhere. Requires `id-token: write` and a matching publisher
+    # registered on PyPI (see below). `contents: read` is all this job needs.
+    permissions:
+      id-token: write
+      contents: read
+    environment:
+      name: pypi
+      url: https://pypi.org/project/atlantide/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Assert tag matches package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(uv version --short)"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag v$tag != pyproject version $version — bump the version before tagging"
+            exit 1
+          fi
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Publish to PyPI (Trusted Publishing, no token)
+        uses: pypa/gh-action-pypi-publish@release/v1

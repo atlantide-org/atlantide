@@ -1,0 +1,5 @@
+# Project defaults — run `atlantide plan|apply|destroy` from examples/ with no flags.
+config = "aws/infra.py"
+state = "aws/infra.db"
+secrets_key = "aws/atlantide.key"        # secrets-store encryption keyfile
+secrets_store = "aws/atlantide.secrets"  # encrypted name->value store
