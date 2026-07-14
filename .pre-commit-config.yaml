@@ -1,0 +1,26 @@
+# Local gate mirroring CI (ruff -> mypy -> import contracts).
+# Install once with: uv run pre-commit install
+# NOTE: `ruff format` is intentionally NOT enforced — the codebase uses manual
+# alignment in places (e.g. operator tables); adopt it as a deliberate one-time
+# reformat if desired, then add a ruff-format hook here + a --check step in CI.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --fix
+        language: system
+        types: [python]
+        require_serial: true
+      - id: mypy
+        name: mypy
+        entry: uv run mypy
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: import-linter
+        name: import contracts
+        entry: uv run lint-imports
+        language: system
+        pass_filenames: false
+        always_run: true

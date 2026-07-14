@@ -1,0 +1,56 @@
+name: Release
+
+# Build the standalone CLI on every platform and attach the binaries to a
+# GitHub Release when a version tag (e.g. v0.1.0) is pushed.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write  # required to create the release and upload assets
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: atlantide-linux-x86_64
+          - os: macos-14        # Apple Silicon
+            asset: atlantide-macos-arm64
+          - os: macos-13        # Intel
+            asset: atlantide-macos-x86_64
+          - os: windows-latest
+            asset: atlantide-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Build binary
+        run: uv run --extra build pyinstaller atlantide.spec --clean --noconfirm
+
+      - name: Stage asset
+        shell: bash
+        run: |
+          mkdir -p out
+          if [ -f dist/atlantide.exe ]; then
+            cp dist/atlantide.exe "out/${{ matrix.asset }}"
+          else
+            cp dist/atlantide "out/${{ matrix.asset }}"
+            chmod +x "out/${{ matrix.asset }}"
+          fi
+
+      - name: Smoke test
+        shell: bash
+        run: "out/${{ matrix.asset }} --version"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/${{ matrix.asset }}
+          fail_on_unmatched_files: true

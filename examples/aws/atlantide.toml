@@ -1,0 +1,3 @@
+# Project defaults — run `atlantide plan|apply|destroy` from this dir with no flags.
+config = "example-one.py"
+state = "infra.db"
