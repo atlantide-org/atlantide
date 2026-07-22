@@ -13,6 +13,9 @@ import os
 from pathlib import Path
 from typing import ClassVar
 
+from cryptography.exceptions import InvalidTag
+
+from atlantide.core.check import FAIL, OK, Check
 from atlantide.core.errors import SecretsError
 from atlantide.secrets._aesgcm import decrypt, encrypt, load_or_create_key
 from atlantide.secrets.backend import SecretsProvider
@@ -59,6 +62,43 @@ class KeyfileValueStore(SecretsProvider):
     def names(self) -> list[str]:
         return sorted(self._load())
 
+    # -- preflight --------------------------------------------------------
+
+    def check(self) -> Check:
+        """Confirm the store opens with the key this install holds.
+
+        The failure worth catching is a store encrypted under a *different* key —
+        a keyfile not shared with the rest of the team, or one regenerated after
+        being lost. Resolution only happens mid-apply, and the symptom there
+        (every secret unreadable) does not name its cause.
+
+        An absent store is not a failure: a project may simply have no secrets.
+        """
+        if not self._store.exists():
+            return Check(f"secrets: {self.name}", OK, f"no store yet at {self._store}")
+        try:
+            values = self._load()
+        except SecretsError as exc:
+            return Check(f"secrets: {self.name}", FAIL, self._why(exc))
+        return Check(
+            f"secrets: {self.name}", OK, f"{len(values)} secret(s) in {self._store}"
+        )
+
+    def _why(self, exc: SecretsError) -> str:
+        """Explain a failed open, in terms of what the operator can act on.
+
+        A decryption failure is identified by what it wraps, not by its wording.
+        AES-GCM authentication cannot say whether the key is wrong or the bytes
+        are damaged — the two are the same failure — so the message names both
+        instead of guessing.
+        """
+        if isinstance(exc.__cause__, InvalidTag | ValueError):
+            return (
+                f"cannot decrypt {self._store} with {self._key_path} — wrong or "
+                f"regenerated keyfile, or a damaged store"
+            )
+        return str(exc)
+
     # -- storage ----------------------------------------------------------
 
     def _load(self) -> dict[str, str]:
@@ -73,8 +113,8 @@ class KeyfileValueStore(SecretsProvider):
     def _save(self, values: dict[str, str]) -> None:
         blob = encrypt(self._load_key(), json.dumps(values, sort_keys=True).encode("utf-8"))
         self._store.parent.mkdir(parents=True, exist_ok=True)
-        # Write via a 0600 temp file, then atomically replace, so the plaintext
-        # window is never world-readable and a crash can't leave a half-written store.
+        # Write to a 0600 temp file and replace atomically, so the store is never
+        # world-readable and a crash cannot leave it half-written.
         tmp = self._store.with_suffix(self._store.suffix + ".tmp")
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:

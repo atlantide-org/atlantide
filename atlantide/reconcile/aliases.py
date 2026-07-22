@@ -107,6 +107,6 @@ def persist_migration(
     """
     for old_id in remap:
         backend.delete(old_id)
-    for node_id, node in migrated.nodes.items():
-        if prior.nodes.get(node_id) != node:
-            backend.put(node)
+    backend.put_many(
+        node for node_id, node in migrated.nodes.items() if prior.nodes.get(node_id) != node
+    )

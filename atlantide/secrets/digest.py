@@ -5,11 +5,11 @@ A :class:`~atlantide.core.types.SecretRef` serializes to ``{"$secret_ref":
 handle, never a value. State also keeps a salted digest of the *resolved* value
 so a rotation (same name, new value) is detectable without storing the value.
 
-The salt is scoped per ``{node_id}:{field}`` so the same value under two fields
-yields different digests (no cross-field correlation). A per-install salt (see
-:class:`~atlantide.secrets.material.KeyMaterial`) is preferred; the fixed
-:data:`_LEGACY_SALT` is the default for salt-less callers and the migration
-fallback for digests written before per-install salts existed.
+The salt is scoped per ``{node_id}:{field}``, so the same value under two fields
+yields different digests and cannot be correlated across fields. A per-install
+salt (see :class:`~atlantide.secrets.material.KeyMaterial`) is used where
+available; :data:`_FALLBACK_SALT` is the fixed fallback for callers that supply
+no salt.
 """
 
 from __future__ import annotations
@@ -21,13 +21,10 @@ from atlantide.core.types import SecretRef
 
 _MARKER_KEY = "$secret_ref"
 
-#: Fixed fallback salt. A per-install salt derived from the keyfile key is
-#: preferred (see ``KeyMaterial.salt``); this constant is used when no install
-#: salt is available and to verify pre-migration digests.
-_LEGACY_SALT = b"atlantide/secret/v1"
+_FALLBACK_SALT = b"atlantide/secret/v1"
 
 
-def secret_digest(scope: str, plaintext: str, *, salt: bytes = _LEGACY_SALT) -> str:
+def secret_digest(scope: str, plaintext: str, *, salt: bytes = _FALLBACK_SALT) -> str:
     """Stable per-scope digest of a resolved secret value (hex sha256)."""
     hasher = hashlib.sha256()
     hasher.update(salt)

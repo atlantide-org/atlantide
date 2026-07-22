@@ -64,3 +64,12 @@ class MemoryStateBackend(StateBackend):
     def release_lock(self, owner: str) -> Result[None, LockError]:
         self._holds = {nid: lease for nid, lease in self._holds.items() if lease.owner != owner}
         return Success(None)
+
+    def locks(self) -> dict[str, Lease]:
+        return dict(self._holds)
+
+    def force_unlock(self, node_ids: Set[str]) -> int:
+        broken = [nid for nid in node_ids if nid in self._holds]
+        for node_id in broken:
+            del self._holds[node_id]
+        return len(broken)

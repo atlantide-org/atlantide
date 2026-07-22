@@ -53,9 +53,10 @@ class SourceFile(LocalResource):
     def __init__(
         self, name: str, /, *, path: str, checksum: str | None = None, **data: Any
     ) -> None:
-        # A fresh config read (no pinned checksum) fingerprints the file now, so
-        # its bytes enter the Merkle inputs and every plan re-checks it. A rehydrate
-        # (deploy) passes the artifact's pinned checksum and must not touch disk.
+        # A fresh config read has no pinned checksum and fingerprints the file now,
+        # so its bytes enter the Merkle inputs and every plan re-checks it. A
+        # rehydrate on deploy passes the artifact's pinned checksum and must not
+        # touch disk.
         if checksum is None:
             if not isinstance(path, str) or contains_ref(path):
                 raise LanguageError("SourceFile.path must be a literal filesystem path")

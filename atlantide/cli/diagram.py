@@ -26,7 +26,7 @@ def to_mermaid(graph: DiGraph) -> str:
     for cluster, (stack, node_ids) in enumerate(by_stack.items()):
         lines.append(f'  subgraph cluster{cluster}["{stack}"]')
         for node_id in node_ids:
-            # the box already names the stack, so drop it from the node label
+            # The box already names the stack, so drop it from the node label.
             lines.append(f'    {ids[node_id]}["{short_id(node_id)}"]')
         lines.append("  end")
     for node_id in graph.node_ids:

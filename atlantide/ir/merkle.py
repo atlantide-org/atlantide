@@ -32,7 +32,7 @@ def merkle_hashes(ir: IRGraph, topo_order: Sequence[str]) -> dict[str, str]:
     for node_id in topo_order:
         node = by_id[node_id]
         # ``ignore_changes`` fields are excluded so drift in them never moves the
-        # hash (and thus never triggers UPDATE/REPLACE) — the diff drops them too.
+        # hash, and so never triggers an UPDATE or REPLACE. The diff drops them too.
         ignored = set(node.ignore_changes)
         properties = (
             {k: v for k, v in node.properties.items() if k not in ignored}

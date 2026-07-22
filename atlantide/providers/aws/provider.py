@@ -23,9 +23,9 @@ from atlantide.core.provider import provider_guard
 from atlantide.providers.aws.handlers import HANDLERS, AwsHandler
 from atlantide.providers.aws.region import Region
 
-#: Retry transient AWS failures with backoff instead of aborting the apply:
-#: throttling / 5xx, plus IAM eventual consistency (a just-created role isn't
-#: immediately assumable by the service that will use it, e.g. Lambda).
+#: Transient AWS failures retried with backoff rather than aborting the apply:
+#: throttling, service 5xx, and IAM eventual consistency, where a just-created
+#: role is not yet assumable by the service that will use it.
 _RETRY_ATTEMPTS = 6
 _RETRY_BASE_DELAY = 1.0
 
@@ -42,7 +42,7 @@ def _is_transient(exc: ClientError) -> bool:
     code = error.get("Code", "")
     if code in _TRANSIENT_CODES:
         return True
-    # IAM eventual consistency: the role exists but isn't assumable/visible yet.
+    # IAM eventual consistency: the role exists but is not yet assumable or visible.
     if code == "InvalidParameterValueException":
         message = error.get("Message", "").lower()
         return "assume" in message or "role" in message
@@ -72,8 +72,9 @@ class AwsProvider(Provider):
         self.region = region
         self.endpoint_url = endpoint_url
         self._aliases = dict(aliases or {})
-        # One Session per alias (``None`` = the default profile/chain), so alternate
-        # accounts get their own credentials without env-only assumptions.
+        # One Session per alias (``None`` is the default profile/chain), so alternate
+        # accounts resolve their own credentials rather than relying on the
+        # environment.
         self._sessions: dict[str | None, Any] = {None: boto3.Session(profile_name=profile)}
         self._clients: dict[tuple[str | None, str, str], Any] = {}
 

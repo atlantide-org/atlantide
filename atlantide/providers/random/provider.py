@@ -34,7 +34,8 @@ class RandomProvider(Provider):
         return {"result": result} if isinstance(result, str) else None
 
     async def update(self, ctx: Context, prior: dict[str, Any], res: Resource) -> dict[str, Any]:
-        # All inputs are immutable, so a change is a REPLACE — update just keeps the value.
+        # All inputs are immutable, so a change is a REPLACE; update returns the
+        # pinned value unchanged.
         return dict(prior)
 
     async def delete(self, ctx: Context, res: Resource) -> None:

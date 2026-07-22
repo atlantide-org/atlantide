@@ -16,7 +16,7 @@ from atlantide.providers.aws.resources.iam import IamPolicy, IamRole
 from atlantide.providers.aws.resources.messaging import SnsSubscription, SnsTopic
 from atlantide.providers.aws.resources.networking import SecurityGroup, Subnet, Vpc
 from atlantide.providers.aws.resources.observability import CloudWatchLogGroup
-from atlantide.providers.aws.resources.s3 import S3Bucket, S3BucketPolicy
+from atlantide.providers.aws.resources.s3 import S3Bucket, S3BucketPolicy, S3Folder
 from atlantide.providers.aws.resources.sqs import SqsQueue
 
 __all__ = [
@@ -34,6 +34,7 @@ __all__ = [
     "Route53Record",
     "S3Bucket",
     "S3BucketPolicy",
+    "S3Folder",
     "SecurityGroup",
     "SnsSubscription",
     "SnsTopic",

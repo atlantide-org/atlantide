@@ -135,8 +135,8 @@ def join(separator: str, parts: Any) -> Transform:
     return Transform("join", (separator, tuple(parts)))
 
 
-#: The live handle objects that serialize to single-key ``$...`` markers — the one
-#: place that enumerates them, so codecs and validators stay in sync.
+#: The live handle objects that serialize to single-key ``$...`` markers. Codecs
+#: and validators read this tuple so they stay in sync.
 HANDLES = (Ref, SecretRef, StackOutputRef, Transform)
 
 

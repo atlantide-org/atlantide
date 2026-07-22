@@ -36,7 +36,7 @@ _ALLOWED_NODES: frozenset[str] = frozenset(
     }
 )
 
-# Builtins that are dangerous even if never injected — rejected for clear errors.
+# Builtins rejected by name, even when not injected, so config gets a clear error.
 _FORBIDDEN_NAMES: frozenset[str] = frozenset(
     {
         "eval", "exec", "compile", "open", "__import__", "globals", "locals",
@@ -48,10 +48,10 @@ _FORBIDDEN_NAMES: frozenset[str] = frozenset(
 _IMPORT_PREFIX = "atlantide"
 
 # Internal implementation packages. Config imports only the public surface
-# (`atlantide.core`, `atlantide.policy`, `atlantide.providers.*`); the packages
-# below expose the interpreter/IR internals — and, transitively, the stdlib
-# modules they import (`importlib`, `operator`, `base64`, ...) — so importing
-# from them is a sandbox escape. See `_import_allowed`.
+# (`atlantide.core`, `atlantide.policy`, `atlantide.providers.*`). The packages
+# below expose interpreter and IR internals, and transitively the stdlib modules
+# they import (`importlib`, `operator`, `base64`, ...), so importing from them is
+# a sandbox escape. See `_import_allowed`.
 _FORBIDDEN_IMPORT_PREFIXES: tuple[str, ...] = (
     "atlantide.lang",
     "atlantide.ir",

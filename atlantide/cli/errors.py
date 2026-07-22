@@ -88,7 +88,9 @@ def render_error(err: BaseException) -> None:
 
 
 def fail(message: str) -> NoReturn:
-    console.print(f"[bold red]error:[/] {message}")
+    # Escaped: these messages quote config keys such as [state].backend, which
+    # Rich would otherwise read as markup and swallow.
+    console.print(f"[bold red]error:[/] {escape(message)}")
     raise typer.Exit(1)
 
 

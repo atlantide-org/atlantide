@@ -45,7 +45,7 @@ async def with_lock(
 
 def lock_scope(changeset: ChangeSet, graph: DiGraph) -> frozenset[str]:
     """Node ids to lock: the actionable (non-NOOP) changes plus every node they
-    depend on, blocking a concurrent apply that mutates a shared dependency."""
+    depend on, so a concurrent apply cannot mutate a shared dependency."""
     scope: set[str] = set()
     for change in changeset.actionable:
         scope.add(change.node_id)

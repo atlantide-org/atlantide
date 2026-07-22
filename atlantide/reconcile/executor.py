@@ -76,10 +76,12 @@ def _noop_progress(node_id: str, action: Action, phase: str) -> None:
 
 @dataclass(slots=True)
 class ApplyReport:
-    """What one run did, per action — not to be confused with the other
-    "outputs": ``outputs`` here is the *declared exports* (``output()`` calls),
-    resolved; live per-node values are ``LiveOutputs``; committed cross-stack
-    values are ``StateBackend.outputs()``."""
+    """What one run did, per action.
+
+    ``outputs`` holds the resolved declared exports (``output()`` calls). Live
+    per-node values are ``LiveOutputs``; committed cross-stack values are
+    ``StateBackend.outputs()``.
+    """
 
     created: list[str] = field(default_factory=list)
     updated: list[str] = field(default_factory=list)
@@ -145,18 +147,18 @@ class _Applier:
         self.prior_state = prior
         self.prior_graph = state_digraph(prior)
         # Live values for ref resolution: prior outputs, with sealed sensitive
-        # values decrypted back to plaintext. Persisted nodes stay sealed.
+        # values unsealed. Persisted rows stay sealed.
         self.live_outputs: LiveOutputs = {
             nid: unseal_outputs(node.outputs, env.secrets) for nid, node in prior.nodes.items()
         }
         self.report = ApplyReport()
         self.ctx = Context()
         self.delete_ids = {c.node_id for c in changeset.by_action(Action.DELETE)}
-        # Completed-node undos, in completion order (a node completes only after its
-        # dependencies, so reversing this list undoes dependents-first).
+        # Completed-node undos in completion order; a node completes only after its
+        # dependencies, so reversing this list undoes dependents first.
         self.compensations: list[Compensation] = []
-        # CBD REPLACEs create the new resource forward and defer destroying the old
-        # (node id -> the old Resource) to a terminal cleanup phase.
+        # node id -> prior Resource, for CBD REPLACEs whose destroy is deferred to
+        # the cleanup phase.
         self.cbd_deferred: dict[str, Resource] = {}
 
     async def run(self) -> ApplyReport:
@@ -169,16 +171,16 @@ class _Applier:
             if self.on_failure == "rollback":
                 await self._rollback()
             raise
-        # Phase 1b: destroy the old halves of CBD REPLACEs, dependents first (new
-        # resources and rewired dependents already in place). Terminal.
+        # Phase 1b: destroy the prior halves of CBD REPLACEs, dependents first, once
+        # the replacements and rewired dependents are in place. Terminal.
         if self.cbd_deferred:
             await self._run(self.desired.graph, self._cbd_cleanup, reverse=True)
-        # Phase 2: deletes, dependents first. Terminal — not rolled back (recreating
-        # a just-destroyed resource would lose its identity/outputs).
+        # Phase 2: deletes, dependents first. Terminal — not rolled back, since
+        # recreating a destroyed resource would lose its identity and outputs.
         if self.delete_ids:
             await self._run(self.prior_graph, self._delete_node, reverse=True)
-        # Declared exports resolve against live outputs (refs to unchanged nodes
-        # resolve — their outputs were seeded from prior state at construction).
+        # Declared exports resolve against live outputs; refs to unchanged nodes
+        # resolve from the prior-state seed set up at construction.
         self.report.outputs = {
             name: resolve_value(value, self.live_outputs)
             for name, value in self.desired.output_decls.items()
@@ -187,9 +189,8 @@ class _Applier:
             self.desired.output_decls, self.env
         )
         # Persist stack outputs so a StackReference in another config can read them.
-        # Sensitive exports (e.g. a generated password) are sealed at rest; the
-        # in-memory report keeps them in the clear for the caller (redacted only
-        # at the render boundary).
+        # Sensitive exports are sealed at rest; the in-memory report keeps them in
+        # the clear and redacts at the render boundary.
         if self.report.outputs:
             self.env.backend.set_outputs(self._persistable_outputs())
         return self.report
@@ -275,7 +276,7 @@ class _Applier:
             reconstruct(prior_node, self.env, self.live_outputs) if prior_node else res
         )
         if change.create_before_destroy and prior_node is not None:
-            # create the new resource first; destroy the old in the cleanup phase.
+            # Create the replacement now; the prior resource is destroyed in cleanup.
             created = await provider.create(self.ctx, res)
             self.live_outputs[node_id] = created
             self.cbd_deferred[node_id] = old
@@ -285,7 +286,7 @@ class _Applier:
                     provider, self.ctx, _with_outputs(res, created), prior_node, self.env.backend
                 ),
             )
-        else:  # destroy-before-create: remove the old, then create the new
+        else:  # destroy-before-create: delete the prior resource, then create
             await provider.delete(self.ctx, old)
             created = await provider.create(self.ctx, res)
             self.live_outputs[node_id] = created
@@ -356,11 +357,11 @@ class _Applier:
             self.compensations.append((node_id, undo))
 
     async def _rollback(self) -> None:
-        """Undo completed nodes in reverse completion order (best-effort, sequential).
+        """Undo completed nodes in reverse completion order, sequentially.
 
-        Every recorded node is attempted even if one undo fails, so a flaky
-        compensation can't strand the rest; ids undone (whether or not their
-        provider call errored) land in ``report.rolled_back``.
+        Every recorded undo is attempted even if an earlier one fails. All
+        attempted ids are recorded in ``report.rolled_back``, regardless of
+        whether the provider call succeeded.
         """
         for node_id, undo in reversed(self.compensations):
             self.report.rolled_back.append(node_id)
@@ -369,11 +370,11 @@ class _Applier:
 
 
 def _with_outputs(res: Resource, outputs: dict[str, Any]) -> Resource:
-    """``res`` with its freshly-created computed outputs (e.g. the real id) restored.
+    """``res`` with the computed outputs of the create (notably its id) restored.
 
     A compensation deletes the resource just created; the id lets the provider act
-    on it directly rather than locating it by attributes, which is unsafe when those
-    (e.g. a VPC's CIDR) are shared with an unrelated resource.
+    on it directly rather than locating it by attributes, which can match an
+    unrelated resource sharing those attributes (e.g. a VPC CIDR).
     """
     fields = type(res).model_fields
     updates = {key: value for key, value in outputs.items() if key in fields}

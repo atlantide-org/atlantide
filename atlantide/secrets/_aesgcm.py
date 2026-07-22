@@ -49,7 +49,8 @@ def load_or_create_key(path: Path) -> bytes:
         return key
     key = os.urandom(KEY_BYTES)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Write restricted (0600) before any bytes land, so the key is never world-readable.
+    # Restrict to 0600 before any bytes are written, so the key is never
+    # world-readable.
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         os.write(fd, key)

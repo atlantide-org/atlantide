@@ -59,17 +59,22 @@ _SEQUENCE = (str, bytes, list, tuple)
 
 
 def _native_call_cost(args: list[Any], kwargs: dict[str, Any]) -> int:
-    """Fuel to charge for a native builtin call: one step per argument plus one
-    per element of each sized argument (``sum(range(N))`` costs ~N, so a runaway
-    native loop hits the fuel limit instead of running unbounded)."""
+    """Fuel charged for a native builtin call.
+
+    One step per argument plus one per element of each sized argument, so
+    ``sum(range(N))`` costs about N and a runaway native loop reaches the fuel
+    limit rather than running unbounded.
+    """
     values = [*args, *kwargs.values()]
     return len(values) + sum(_sized_len(v) for v in values)
 
 
 def _binop_cost(op_type: type[ast.operator], left: Any, right: Any) -> int:
-    """Fuel for a value-producing binary op whose result can dwarf its inputs:
-    sequence repetition (``"a" * N``) and integer power (``2 ** N``). Bounds the
-    output size so a single node can't allocate unbounded memory for one tick."""
+    """Fuel for a binary op whose result can be far larger than its inputs.
+
+    Covers sequence repetition (``"a" * N``) and integer power (``2 ** N``),
+    bounding output size so one node cannot allocate unbounded memory per tick.
+    """
     if op_type is ast.Mult:
         # Normalise to (sequence, count) regardless of operand order.
         seq, count = (left, right) if isinstance(left, _SEQUENCE) else (right, left)
@@ -371,18 +376,18 @@ class Interpreter:
                 args.append(self._eval(arg, scope))
         kwargs = {kw.arg: self._eval(kw.value, scope) for kw in node.keywords if kw.arg}
         if not isinstance(func, Closure):
-            # Native builtin: it will loop/allocate outside the interpreter, so
-            # meter it by input size up front and normalise set arguments to a
-            # sorted order (native iteration would otherwise leak PYTHONHASHSEED).
+            # Native builtins loop and allocate outside the interpreter, so meter
+            # by input size up front and normalise set arguments to a sorted order;
+            # native iteration would otherwise expose PYTHONHASHSEED ordering.
             args = [self._normalize_arg(a) for a in args]
             kwargs = {k: self._normalize_arg(v) for k, v in kwargs.items()}
             self._tick(_native_call_cost(args, kwargs))
         return func(*args, **kwargs)
 
     def _normalize_arg(self, value: Any) -> Any:
-        """Coerce a top-level set/frozenset argument to a deterministically
-        ordered list so native builtins (``list``, ``str.join``, ``str``) don't
-        expose hash-seed ordering."""
+        """Coerce a top-level set or frozenset argument to a deterministically ordered
+        list, so native builtins (``list``, ``str.join``, ``str``) do not expose
+        hash-seed ordering."""
         if isinstance(value, frozenset | set):
             return list(self._iter(value))
         return value

@@ -29,7 +29,7 @@ def _encode(value: Any, path: str) -> str:
     """Encode one value. ``path`` locates ``value`` in the tree for error messages."""
     if value is None:
         return "null"
-    # bool is a subclass of int, so it MUST be checked before the int branch.
+    # bool is a subclass of int, so it must be checked before the int branch.
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):

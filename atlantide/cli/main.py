@@ -2,13 +2,23 @@
 
 Commands: ``plan`` | ``apply`` | ``destroy`` | ``refresh`` | ``graph``; ``build`` |
 ``verify`` | ``deploy`` (portable ``.atlas`` artifacts); ``resources`` | ``schema``;
-``component`` (published components) | ``secret`` (local secrets store).
-Config file and state db can be set in ``atlantide.toml``
-(:mod:`atlantide.cli.project`).
+``component`` (published components) | ``secret`` (local secrets store) |
+``state check`` / ``migrate`` / ``unlock`` (backend administration).
+Config file, state backend (local sqlite, s3 or postgres) and secrets provider
+are set in ``atlantide.toml`` (:mod:`atlantide.cli.project`), optionally under a
+``--profile`` overlay.
 
-Rendering lives in :mod:`atlantide.cli.render` / ``json_out`` / ``diagram`` /
-``progress``; error plumbing in :mod:`atlantide.cli.errors`. This module holds
-the command definitions and the engine/provider wiring.
+Every command that reads or writes state announces which state it is: with a
+shared backend the difference between "no changes" and "wrong target" is
+otherwise invisible until something is destroyed.
+
+This module holds the resource-facing commands and the engine/provider wiring.
+The rest is split by concern: :mod:`atlantide.cli.target` resolves the profile,
+project and state destination; :mod:`atlantide.cli.state` and
+:mod:`atlantide.cli.component` own their subcommand groups;
+:mod:`atlantide.cli.options` the option types they share; rendering lives in
+:mod:`atlantide.cli.render` / ``json_out`` / ``diagram`` / ``progress``, and
+error plumbing in :mod:`atlantide.cli.errors`.
 """
 
 from __future__ import annotations
@@ -35,8 +45,17 @@ from atlantide.cli.errors import (
 )
 from atlantide.cli.introspect import all_types, schema_rows
 from atlantide.cli.json_out import drift_json, emit_json, plan_json, report_json
+from atlantide.cli.options import (
+    ConfigArg,
+    ConfirmOpt,
+    JsonOpt,
+    ParallelismOpt,
+    RegionOpt,
+    StateOpt,
+    require_confirm,
+)
 from atlantide.cli.progress import live_apply
-from atlantide.cli.project import ProjectConfig, load_project
+from atlantide.cli.project import ProjectConfig
 from atlantide.cli.render import (
     MUT_COLOR,
     render_destroy_preview,
@@ -44,6 +63,8 @@ from atlantide.cli.render import (
     render_plan,
     render_report,
 )
+from atlantide.cli.state import app as state_app
+from atlantide.cli.target import StateTarget, load_project, use_profile
 from atlantide.components import mount as mount_components
 from atlantide.components.lock import load_lock
 from atlantide.core import AtlantideError, ProviderRegistry
@@ -54,8 +75,8 @@ from atlantide.providers.aws import AwsAlias, AwsProvider
 from atlantide.providers.local import LocalProvider
 from atlantide.providers.random import RandomProvider
 from atlantide.reconcile import Action, OnFailure
-from atlantide.secrets import KeyfileValueStore, KeyMaterial, SecretsRegistry
-from atlantide.state import MemoryStateBackend, SqliteStateBackend
+from atlantide.secrets import KeyfileValueStore
+from atlantide.state import MemoryStateBackend
 
 app = typer.Typer(add_completion=True, help="Atlantide — typed, deterministic IaC.")
 
@@ -86,43 +107,29 @@ def _main(
         bool,
         typer.Option("--debug", help="On error, print the full traceback and cause chain."),
     ] = False,
+    profile: Annotated[
+        str | None,
+        typer.Option(
+            "--profile",
+            "-P",
+            envvar="ATLANTIDE_PROFILE",
+            help="Apply the [profile.<name>] overlay from atlantide.toml.",
+        ),
+    ] = None,
 ) -> None:
     """Atlantide — typed, deterministic IaC."""
     set_debug(debug)
+    use_profile(profile)
     # Make any vendored published components importable as `atlantide.components.*`
     # before a config is evaluated. No-op until `atlantide component vendor` has run.
-    mount_components(Path.cwd())
+    mount_components(load_project().directory)
 
 
-ConfigArg = Annotated[Path | None, typer.Argument(help="Atlas-lang config (.py).")]
-StateOpt = Annotated[Path | None, typer.Option("--state", help="State database file.")]
-ConfirmOpt = Annotated[
-    bool,
-    typer.Option("--confirm", "-y", help="Skip the interactive confirmation prompt."),
-]
-
-_DEFAULT_STATE = Path("atlantide.db")
 _ON_FAILURE: tuple[str, ...] = get_args(OnFailure)
 
-RegionOpt = Annotated[
-    str | None, typer.Option("--region", help="AWS region (overrides atlantide.toml).")
-]
-ParallelismOpt = Annotated[
-    int | None,
-    typer.Option("--parallelism", "-p", help="Max concurrent provider operations."),
-]
-JsonOpt = Annotated[
-    bool, typer.Option("--json", help="Emit machine-readable JSON instead of text.")
-]
 
-
-def _require_confirm(confirm: bool, question: str) -> None:
-    """Prompt before a mutating action unless ``--confirm`` was passed (aborts on no)."""
-    if not confirm:
-        typer.confirm(question, abort=True)
-
-
-# Engine / provider / secrets wiring; one load_project() per command.
+# Engine wiring. A state-touching command resolves its StateTarget once, then
+# builds an engine from it; compile-only commands skip both.
 
 
 def _providers(
@@ -148,45 +155,30 @@ def _providers(
     return registry, all_types()
 
 
-def _store_and_key(state_path: Path, project: ProjectConfig) -> tuple[Path, Path]:
-    """The keyfile value-store and encryption-key paths (flag/toml, else beside the db)."""
-    base = state_path.parent
-    store = Path(project.secrets_store) if project.secrets_store else base / "atlantide.secrets"
-    key = Path(project.secrets_key) if project.secrets_key else base / "atlantide.key"
-    return store, key
-
-
-def _value_store(state_path: Path, project: ProjectConfig) -> KeyfileValueStore:
-    """The local keyfile value-store."""
-    store, key = _store_and_key(state_path, project)
-    return KeyfileValueStore(store, key)
-
-
-def _secrets(state_path: Path, project: ProjectConfig) -> SecretsRegistry:
-    """Default secrets registry: the local keyfile value-store, plus install key
-    material (per-install digest salt + at-rest sealing of sensitive outputs).
-
-    The keyfile is loaded lazily by the material, so a project with no secrets
-    and no sensitive outputs never creates a key.
-    """
-    store, key = _store_and_key(state_path, project)
-    registry = SecretsRegistry(material=KeyMaterial(str(key)))
-    registry.register(KeyfileValueStore(store, key), default=True)
-    return registry
+def _target(
+    state: Path | None, project: ProjectConfig, *, announce: bool = True
+) -> StateTarget:
+    """This command's state target. Announced unless the output is machine-readable,
+    where the same value rides along as a ``state`` field instead."""
+    target = StateTarget.resolve(state, project)
+    if announce:
+        target.announce()
+    return target
 
 
 def _engine(
-    state_path: Path,
-    project: ProjectConfig,
+    target: StateTarget,
     *,
     region: str | None = None,
     parallelism: int | None = None,
 ) -> Engine:
+    """The engine for a state-touching command, wired to ``target``."""
+    project = target.project
     providers, types = _providers(project, region)
-    par = parallelism or project.parallelism
     return Engine(
-        providers, SqliteStateBackend(str(state_path)), types,
-        secrets=_secrets(state_path, project), parallelism=par,
+        providers, target.open(), types,
+        secrets=target.secrets(),
+        parallelism=parallelism or project.parallelism,
     )
 
 
@@ -200,17 +192,13 @@ def _stateless_engine(project: ProjectConfig) -> Engine:
 
 
 def _resolve_config(config: Path | None, project: ProjectConfig) -> Path:
+    """The config to evaluate. A path from the toml is relative to the project
+    root; one typed on the command line is relative to where it was typed."""
     if config is not None:
         return config
     if project.config:
-        return Path(project.config)
+        return project.resolve(project.config)
     fail("no config given and none set in atlantide.toml (expected a .py path)")
-
-
-def _resolve_state(state: Path | None, project: ProjectConfig) -> Path:
-    if state is not None:
-        return state
-    return Path(project.state) if project.state else _DEFAULT_STATE
 
 
 @app.command()
@@ -233,11 +221,12 @@ def plan(
     """
     project = load_project()
     cfg = _resolve_config(config, project)
-    with _engine(_resolve_state(state, project), project) as engine:
+    target = _target(state, project, announce=not json_out)
+    with _engine(target) as engine:
         source = cfg.read_text()
         plan_obj = unwrap_or_diag(engine.plan(source, str(cfg)), source)
         if json_out:
-            emit_json(plan_json(plan_obj))
+            emit_json({**plan_json(plan_obj), "state": target.label})
         else:
             render_plan(plan_obj)
         if plan_obj.blocked:
@@ -291,9 +280,8 @@ def apply(
     require_choice(on_failure, _ON_FAILURE, "--on-failure")
     project = load_project()
     cfg = _resolve_config(config, project)
-    with _engine(
-        _resolve_state(state, project), project, region=region, parallelism=parallelism
-    ) as engine:
+    target = _target(state, project, announce=not json_out)
+    with _engine(target, region=region, parallelism=parallelism) as engine:
         source = cfg.read_text()
         plan_obj = unwrap_or_diag(engine.plan(source, str(cfg)), source)
         if not json_out:
@@ -306,7 +294,7 @@ def apply(
             if not json_out:
                 console.print("[dim]nothing to apply[/]")
             return
-        _require_confirm(confirm, "\nApply these changes?")
+        require_confirm(confirm, "\nApply these changes?")
         actionable = [(c.node_id, c.action) for c in plan_obj.changeset.actionable]
         used_live = console.is_terminal and not json_out
         started = time.perf_counter()
@@ -323,7 +311,7 @@ def apply(
             )
         report = unwrap_or_diag(result, source)
         if json_out:
-            emit_json(report_json(report))
+            emit_json({**report_json(report), "state": target.label})
         else:
             render_report(report, elapsed=time.perf_counter() - started, show_nodes=not used_live)
 
@@ -378,11 +366,9 @@ def deploy(
     """Apply a .atlas artifact directly — no source, no config re-execution."""
     require_choice(on_failure, _ON_FAILURE, "--on-failure")
     art = _read_artifact(artifact)
-    _require_confirm(confirm, f"Deploy {artifact} ({len(art.ir)} nodes)?")
+    require_confirm(confirm, f"Deploy {artifact} ({len(art.ir)} nodes)?")
     project = load_project()
-    with _engine(
-        _resolve_state(state, project), project, region=region, parallelism=parallelism
-    ) as engine:
+    with _engine(_target(state, project), region=region, parallelism=parallelism) as engine:
         started = time.perf_counter()
         if console.is_terminal:
             with live_apply([]) as progress:  # rows appear as nodes start
@@ -412,15 +398,13 @@ def destroy(
 ) -> None:
     """Destroy every resource recorded in state (shows what, then prompts)."""
     project = load_project()
-    with _engine(
-        _resolve_state(state, project), project, region=region, parallelism=parallelism
-    ) as engine:
+    with _engine(_target(state, project), region=region, parallelism=parallelism) as engine:
         node_ids = sorted(engine.backend.load().nodes)
         if not node_ids:
             console.print("[dim]nothing in state to destroy[/]")
             return
         render_destroy_preview(node_ids)  # show what will be removed first
-        _require_confirm(confirm, f"\nDestroy these {len(node_ids)} resource(s)?")
+        require_confirm(confirm, f"\nDestroy these {len(node_ids)} resource(s)?")
         started = time.perf_counter()
         if console.is_terminal:
             with live_apply([(nid, Action.DELETE) for nid in node_ids]) as progress:
@@ -461,16 +445,15 @@ def refresh(
     back into state (drifted outputs overwritten, missing resources removed).
     """
     project = load_project()
-    with _engine(
-        _resolve_state(state, project), project, region=region, parallelism=parallelism
-    ) as engine:
+    target = _target(state, project, announce=not json_out)
+    with _engine(target, region=region, parallelism=parallelism) as engine:
         if not engine.backend.load().nodes:
             if not json_out:
                 console.print("[dim]nothing in state to refresh[/]")
             return
         report = unwrap_or_exit(run_async(engine.refresh(write=write)))
         if json_out:
-            emit_json(drift_json(report))
+            emit_json({**drift_json(report), "state": target.label})
         else:
             render_drift(report, wrote=write)
         if detailed_exitcode and report.has_drift:
@@ -478,14 +461,15 @@ def refresh(
 
 
 app.add_typer(component_app, name="component")
+app.add_typer(state_app, name="state")
 
 secret_app = typer.Typer(help="Manage the local secrets value-store (name → value).")
 app.add_typer(secret_app, name="secret")
 
 
 def _store_for(state: Path | None) -> KeyfileValueStore:
-    project = load_project()
-    return _value_store(_resolve_state(state, project), project)
+    """The keyfile value-store the ``secret`` subcommands read and write."""
+    return StateTarget.resolve(state, load_project()).value_store()
 
 
 @secret_app.command("set")

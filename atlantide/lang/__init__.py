@@ -57,9 +57,9 @@ def _run_module(
     except ValidationError as exc:
         return Failure(LanguageError(f"invalid resource inputs: {exc}"))
     except Exception as exc:
-        # A native runtime error (ZeroDivisionError, KeyError, ValueError from
-        # int('x'), RecursionError, ...) surfaced from config evaluation. The
-        # contract is that config-level errors return a Failure, never crash the
-        # engine, so wrap it as a LanguageError.
+        # A native runtime error surfaced from config evaluation
+        # (ZeroDivisionError, KeyError, ValueError from int('x'), RecursionError).
+        # Config-level errors must return a Failure rather than crash the engine,
+        # so wrap it as a LanguageError.
         return Failure(LanguageError(f"evaluation error: {type(exc).__name__}: {exc}"))
     return Success(registry)

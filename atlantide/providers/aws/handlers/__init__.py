@@ -28,7 +28,11 @@ from atlantide.providers.aws.handlers.networking import (
     VpcHandler,
 )
 from atlantide.providers.aws.handlers.observability import CloudWatchLogGroupHandler
-from atlantide.providers.aws.handlers.s3 import S3BucketHandler, S3BucketPolicyHandler
+from atlantide.providers.aws.handlers.s3 import (
+    S3BucketHandler,
+    S3BucketPolicyHandler,
+    S3FolderHandler,
+)
 from atlantide.providers.aws.handlers.sqs import SqsQueueHandler
 
 __all__ = ["HANDLERS", "AwsHandler"]
@@ -36,6 +40,7 @@ __all__ = ["HANDLERS", "AwsHandler"]
 _HANDLER_CLASSES: list[type[AwsHandler[Any]]] = [
     S3BucketHandler,
     S3BucketPolicyHandler,
+    S3FolderHandler,
     SqsQueueHandler,
     IamRoleHandler,
     IamPolicyHandler,

@@ -64,8 +64,8 @@ class SecretsRegistry:
     def digest_matches(self, scope: str, plaintext: str, stored: str | None) -> bool:
         """Whether ``stored`` is a digest of ``plaintext`` under this install.
 
-        Checks the per-install salt, then the fixed legacy salt — so a digest
-        written before per-install salts existed does not read as a rotation.
+        Checks the per-install salt, then the fixed fallback salt, so a digest
+        written without an install salt does not read as a rotation.
         """
         if stored is None:
             return False

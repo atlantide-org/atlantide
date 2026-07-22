@@ -11,6 +11,7 @@ from atlantide.core.errors import SecretsError
 from atlantide.secrets import (
     EnvSecretsProvider,
     KeyfileValueStore,
+    SecretsProvider,
     SecretsRegistry,
     is_secret_ref_marker,
     secret_digest,
@@ -117,3 +118,66 @@ def test_secret_ref_marker_roundtrip() -> None:
     assert is_secret_ref_marker(marker)
     assert not is_secret_ref_marker({"$ref": "a#b"})
     assert secret_ref_from_marker(marker) == ref
+
+
+# -- preflight ---------------------------------------------------------------
+
+
+def test_check_reports_an_empty_project_as_fine(tmp_path: object) -> None:
+    """No store yet is not a failure — a project may simply have no secrets."""
+    result = _store(tmp_path).check()
+    assert result.status == "ok"
+    assert "no store yet" in result.detail
+
+
+def test_check_counts_stored_secrets(tmp_path: object) -> None:
+    store = _store(tmp_path)
+    store.set("a", "1")
+    store.set("b", "2")
+    result = store.check()
+    assert result.status == "ok"
+    assert "2 secret(s)" in result.detail
+
+
+def test_check_catches_a_store_written_under_another_key(tmp_path: object) -> None:
+    """The failure this exists for: a keyfile not shared, or regenerated after loss.
+
+    Resolution only happens mid-apply, where the symptom is every secret being
+    unreadable and nothing naming the cause.
+    """
+    base = str(tmp_path)  # type: ignore[arg-type]
+    original = _store(tmp_path, "shared")
+    original.set("token", "abc")
+    # Same store file, a key that never encrypted it.
+    stranger = KeyfileValueStore(
+        os.path.join(base, "shared.enc"), os.path.join(base, "other.key")
+    )
+    result = stranger.check()
+    assert result.status == "fail"
+    assert "keyfile" in result.detail
+
+
+def test_check_reports_a_corrupt_store(tmp_path: object) -> None:
+    store = _store(tmp_path)
+    store.set("a", "1")
+    with open(os.path.join(str(tmp_path), "s.enc"), "wb") as fh:  # type: ignore[arg-type]
+        fh.write(b"not ciphertext")
+    assert store.check().status == "fail"
+
+
+def test_env_provider_reports_itself_usable() -> None:
+    assert EnvSecretsProvider().check().status == "ok"
+
+
+def test_a_provider_without_a_check_says_so() -> None:
+    """The ABC default must not claim a pass it did not earn."""
+
+    class Custom(SecretsProvider):
+        name = "custom"
+
+        def resolve(self, name: str) -> str:
+            return "x"
+
+    result = Custom().check()
+    assert result.status == "skip"
+    assert result.name == "secrets: custom"

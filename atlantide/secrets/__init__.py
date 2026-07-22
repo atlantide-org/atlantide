@@ -3,8 +3,9 @@
 A resource field holds a :class:`~atlantide.core.types.SecretRef` (a name, never a
 value). Config, IR, and state carry only the handle; the plaintext is resolved
 from a pluggable :class:`SecretsProvider` (keyfile value-store default, env for
-dev) in-memory at apply and never persisted. State keeps a salted digest of the
-resolved value so a rotation is detectable, and *seals* sensitive computed
+dev, SSM Parameter Store for shared setups) in-memory at apply and never
+persisted. State keeps a salted digest of the resolved value so a rotation is
+detectable, and *seals* sensitive computed
 outputs at rest (see :class:`~atlantide.secrets.material.KeyMaterial`).
 """
 
@@ -15,6 +16,7 @@ from atlantide.secrets.digest import (
     secret_ref_from_marker,
 )
 from atlantide.secrets.env import EnvSecretsProvider
+from atlantide.secrets.factory import SecretsConfig, make_secrets_registry
 from atlantide.secrets.keyfile_store import KeyfileValueStore
 from atlantide.secrets.material import KeyMaterial, is_sealed_marker
 from atlantide.secrets.registry import SecretsRegistry
@@ -23,10 +25,12 @@ __all__ = [
     "EnvSecretsProvider",
     "KeyMaterial",
     "KeyfileValueStore",
+    "SecretsConfig",
     "SecretsProvider",
     "SecretsRegistry",
     "is_sealed_marker",
     "is_secret_ref_marker",
+    "make_secrets_registry",
     "secret_digest",
     "secret_ref_from_marker",
 ]

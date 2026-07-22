@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from typing import ClassVar
 
+from atlantide.core.check import OK, Check
 from atlantide.core.errors import SecretsError
 from atlantide.secrets.backend import SecretsProvider
 
@@ -23,3 +24,11 @@ class EnvSecretsProvider(SecretsProvider):
         if value is None:
             raise SecretsError(f"secret {name!r} not found in the environment")
         return value
+
+    def check(self) -> Check:
+        """Always usable: the environment is already here, whatever is in it.
+
+        Whether a *particular* variable is set is a per-secret question the plan
+        answers, not a reachability one.
+        """
+        return Check(f"secrets: {self.name}", OK, "reads the process environment")

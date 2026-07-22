@@ -83,8 +83,16 @@ State defaults to `atlantide.db`; override with `--state`. Mutating commands
 (**default `rollback`**: undo completed nodes on failure). `plan` and `refresh`
 support `--json` and `--detailed-exitcode` (0 = no change, 2 = changes, 1 = error).
 
+Every command that touches state prints where that state is (`state:
+s3://acme-atlantide-state/prod/atlantide.json`) before it does anything — with a
+shared backend, "no changes" and "wrong target" otherwise look identical. With
+`--json` the same value is a `state` field on the payload instead.
+
 Config path, state db, and defaults can be fixed once in `atlantide.toml` so
-commands take no flags inside a project:
+commands take no flags inside a project. The file is looked up in the working
+directory and then in each parent, as git does, so commands behave the same from
+anywhere inside the project; paths in it resolve against the directory holding
+it.
 
 ```toml
 config      = "infra.py"
@@ -101,8 +109,118 @@ profile  = "prod-account"                # a resource selects it via provider_al
 endpoint = "http://localhost:4566"
 ```
 
+### Environments (profiles)
+
+One project usually has several environments that differ in a few keys. A
+`[profile.<name>]` table overlays the top level — table by table, so an override
+restates only what changes — and `--profile/-P` (or `ATLANTIDE_PROFILE`) selects
+it:
+
+```toml
+parallelism = 4
+
+[profile.prod]
+parallelism = 16
+
+[profile.prod.state]                     # inherits the base [state] keys it omits
+backend    = "s3"
+bucket     = "acme-atlantide-state"
+key        = "prod/atlantide.json"
+lock_table = "atlantide-locks"
+```
+
+```bash
+uv run atlantide --profile prod apply    # the banner reads "… [profile prod]"
+```
+
+Naming a profile the file does not define is an error, not a silent fall-through
+to the base config.
+
+### Remote state and secrets
+
+State defaults to a local SQLite file, which is single-machine. Point `[state]` at
+a shared backend and the same commands work for a whole team or a CI runner —
+locking stays per-subgraph, so applies over disjoint parts of the graph still run
+concurrently across hosts.
+
+```toml
+[state]
+backend    = "s3"                      # "local" (default) | "s3" | "postgres"
+bucket     = "acme-atlantide-state"
+key        = "prod/atlantide.json"
+lock_table = "atlantide-locks"         # DynamoDB table, hash key `node_id` (S)
+region     = "eu-north-1"
+kms_key_id = "alias/atlantide"         # optional; SSE-S3 (AES256) otherwise
+```
+
+```toml
+[state]
+backend = "postgres"                   # needs the extra: uv sync --extra postgres
+dsn     = "postgresql://…"             # or the ATLANTIDE_STATE_DSN env var
+schema  = "atlantide"
+```
+
+The bucket and lock table are not created for you — they are the trust root for
+shared state. Enable bucket versioning (so a bad write is recoverable) and a
+DynamoDB TTL on `expires_at` (so abandoned leases self-evict). Every write is a
+compare-and-swap on the object's ETag: a run whose view of state went stale is
+refused, never silently overwritten. An explicit `--state <file>` still forces the
+local file and says so.
+
+`state check` verifies all of that up front rather than one failed API call at a
+time — the bucket and its versioning, the lock table's key schema and TTL, the
+secrets provider, and (by default) that the endpoint really honours conditional
+writes, which an S3-compatible store may quietly ignore:
+
+```bash
+uv run atlantide state check              # --no-probe skips the scratch write
+```
+
+Adopt a remote backend from an existing local state — or leave one — with:
+
+```bash
+uv run atlantide state migrate --from atlantide.db     # local -> remote
+uv run atlantide state migrate --to-local atlantide.db # remote -> local
+uv run atlantide state migrate --force                 # replace a populated destination
+```
+
+Either direction copies as one write, so an interrupted migration cannot leave a
+half-populated destination.
+
+A lease outlives a run that is killed, so `state unlock` shows who holds what and
+can break a hold the TTL has not yet lapsed. With no selector it only lists:
+
+```bash
+uv run atlantide state unlock                           # who holds what
+uv run atlantide state unlock --owner ci-runner-7 -y    # break a dead run's holds
+uv run atlantide state unlock --node <id> --all         # by node, or everything
+```
+
+Secret *values* can come from a remote store too — the reference in config, IR and
+state stays a name either way:
+
+```toml
+[secrets]
+provider = "ssm"                       # "keyfile" (default) | "env" | "ssm"
+prefix   = "/atlantide/prod/"          # secret `db_password` -> /atlantide/prod/db_password
+region   = "eu-north-1"
+```
+
+> **Sharing a project's keyfile.** The `secrets_key` keyfile does more than
+> encrypt the local value store: it also salts the rotation digests and seals
+> sensitive outputs at rest. With remote state, a teammate without that keyfile
+> cannot unseal those outputs and will see every secret field as rotated — `plan`
+> recognises that pattern (every secret in state mismatching, none intact) and
+> warns instead of rendering a page of spurious updates. Point
+> `secrets_key` at a shared, protected path (or distribute it out-of-band) when
+> state is shared. A KMS-backed key is the better answer and is not implemented
+> yet.
+
 Additional commands:
 
+- **`state check` / `migrate` / `unlock`** — verify the configured backend, copy
+  state between local and remote in either direction, and inspect or break a
+  lock left behind by a dead run.
 - **`build` / `verify` / `deploy`** — portable `.atlas` artifacts (content-hashed,
   provider-version pinned): compile once, promote the same bytes anywhere.
 - **`refresh`** — read live provider state, report drift; `--write` syncs it back.
@@ -219,7 +337,9 @@ flowchart LR
 - **`local`** — `File`, `Null`. Credential-free; runs in CI.
 - **`random`** — `Uuid`, `Password`, `Id`, `Timestamp`. Values generated once at
   apply, then pinned in state.
-- **`aws`** — `S3Bucket`, `S3BucketPolicy`, `SqsQueue`, `IamRole`, `IamPolicy`,
+- **`aws`** — `S3Bucket`, `S3BucketPolicy`, `S3Folder` (sync a local directory to a
+  bucket, mirror with prune; pass `bucket=<S3Bucket>.name` to order it after the
+  bucket), `SqsQueue`, `IamRole`, `IamPolicy`,
   `LambdaFunction`, `SnsTopic`, `SnsSubscription`, `DynamoDbTable`,
   `CloudWatchLogGroup`, `Vpc`, `Subnet`, `SecurityGroup`. Plus IAM policy helpers
   (`allow`, `deny`, `assume_role`, `ServicePrincipal`) and the `SecureBucket` L2
@@ -236,10 +356,10 @@ Layered, with import boundaries enforced by [import-linter](https://import-linte
 | `lang/` | Atlas-lang: subset validator, fuel-bounded interpreter, deterministic builtins |
 | `ir/` | IR model, lowering (Ref → edges), canonical JSON (RFC 8785), content hash, two-phase Merkle, `.atlas` artifacts |
 | `graph/` | Graph build, Tarjan cycle detection, async Kahn scheduler |
-| `state/` | `StateBackend` ABC — sqlite (default) + memory; whole-state lock |
+| `state/` | `StateBackend` ABC — sqlite (default), memory, s3+dynamodb, postgres; per-subgraph lease locks |
 | `reconcile/` | Diff (Merkle NOOP-skip), planner, parallel executor (saga rollback / resume), refresh |
 | `policy/` | Modular per-resource policy engine (`@policy` / `enforce`; mandatory blocks, advisory warns) |
-| `secrets/` | `SecretsProvider` ABC — env + AES-GCM keyfile store; secrets referenced by name, resolved at apply |
+| `secrets/` | `SecretsProvider` ABC — AES-GCM keyfile store, env, SSM Parameter Store; secrets referenced by name, resolved at apply |
 | `engine/` | `Engine` — orchestrates compile → plan → apply/destroy/refresh/build/deploy; owns the state lock |
 | `providers/` | Provider implementations (local, random, aws) |
 | `components/` | Published components: git fetch, `atlantide.lock` pinning, vendored-tree hashing, and the import mount |

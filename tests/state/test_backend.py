@@ -1,49 +1,37 @@
-"""State backend behaviour — identical across memory and sqlite (modularity)."""
+"""State backend behaviour — identical across every backend (modularity).
+
+Parametrized over memory, sqlite, s3 and postgres by ``make_backend``; a backend
+that cannot pass this file unchanged is not a drop-in replacement.
+"""
 
 from __future__ import annotations
 
 from atlantide.core import is_successful
-from atlantide.state import StateNode
 
-from .conftest import BackendFactory, FakeClock
-
-
-def _node(node_id: str, **kw: object) -> StateNode:
-    base = dict(
-        id=node_id,
-        type="test.T",
-        provider="test",
-        provider_version="1.0.0",
-        input_hash="h0",
-        outputs={"arn": f"arn::{node_id}"},
-        dependencies=(),
-    )
-    base.update(kw)
-    return StateNode(**base)  # type: ignore[arg-type]
+from .conftest import BackendFactory, FakeClock, node
 
 
 def test_put_load_roundtrip(make_backend: BackendFactory) -> None:
     backend = make_backend()
-    node = _node("a", dependencies=("x",), outputs={"arn": "arn::a", "n": 3})
-    backend.put(node)
+    written = node("a", dependencies=("x",), outputs={"arn": "arn::a", "n": 3})
+    backend.put(written)
     loaded = backend.load()
     assert len(loaded) == 1
-    got = loaded.get("a")
-    assert got == node
+    assert loaded.get("a") == written
 
 
 def test_upsert_overwrites(make_backend: BackendFactory) -> None:
     backend = make_backend()
-    backend.put(_node("a", input_hash="h1"))
-    backend.put(_node("a", input_hash="h2"))
+    backend.put(node("a", input_hash="h1"))
+    backend.put(node("a", input_hash="h2"))
     assert backend.load().get("a").input_hash == "h2"
     assert len(backend.load()) == 1
 
 
 def test_delete(make_backend: BackendFactory) -> None:
     backend = make_backend()
-    backend.put(_node("a"))
-    backend.put(_node("b"))
+    backend.put(node("a"))
+    backend.put(node("b"))
     backend.delete("a")
     graph = backend.load()
     assert "a" not in graph and "b" in graph
@@ -51,16 +39,27 @@ def test_delete(make_backend: BackendFactory) -> None:
 
 
 def test_serial_bumps_on_mutation(make_backend: BackendFactory) -> None:
+    """The serial advances when stored state changes, and never goes backwards.
+
+    Deliberately an inequality: a backend may skip a write whose node is already
+    stored verbatim (the s3 one does, since every write there rewrites the whole
+    document), and skipping a write that changes nothing is not a mutation.
+    """
     backend = make_backend()
     assert backend.serial() == 0
-    backend.put(_node("a"))
-    assert backend.serial() == 1
-    backend.put(_node("a"))
-    assert backend.serial() == 2
+    backend.put(node("a"))
+    first = backend.serial()
+    assert first == 1
+    backend.put(node("a"))
+    assert backend.serial() >= first
+    backend.put(node("a", input_hash="changed"))
+    changed = backend.serial()
+    assert changed > first
     backend.delete("a")
-    assert backend.serial() == 3
+    assert backend.serial() > changed
+    deleted = backend.serial()
     backend.delete("a")  # no row deleted -> no bump
-    assert backend.serial() == 3
+    assert backend.serial() == deleted
 
 
 def test_outputs_merge_later_applies_win(make_backend: BackendFactory) -> None:
@@ -122,3 +121,38 @@ def test_release_frees_only_owners_holds(make_backend: BackendFactory) -> None:
     # 'a' is free again; bob's hold on 'b' is untouched
     assert is_successful(backend.acquire_lock("carol", 30, {"a"}))
     assert not is_successful(backend.acquire_lock("carol", 30, {"b"}))
+
+
+def test_put_many_stores_every_node(make_backend: BackendFactory) -> None:
+    backend = make_backend()
+    backend.put_many([node("a"), node("b"), node("c")])
+    assert set(backend.load().nodes) == {"a", "b", "c"}
+    backend.put_many([])  # no nodes, no error, no change
+    assert set(backend.load().nodes) == {"a", "b", "c"}
+
+
+def test_put_many_upserts(make_backend: BackendFactory) -> None:
+    backend = make_backend()
+    backend.put(node("a"))
+    backend.put_many([node("a", input_hash="h1"), node("b")])
+    assert backend.load().nodes["a"].input_hash == "h1"
+
+
+def test_locks_are_visible_and_breakable(make_backend: BackendFactory) -> None:
+    """An operator has to be able to see and break a lease a dead run left behind."""
+    backend = make_backend(clock=FakeClock())
+    backend.acquire_lock("alice", 30, {"a", "b"})
+    held = backend.locks()
+    assert set(held) == {"a", "b"}
+    assert held["a"].owner == "alice"
+    assert held["a"].expires_at == held["b"].expires_at > 0
+
+    assert backend.force_unlock({"a"}) == 1
+    assert set(backend.locks()) == {"b"}
+    assert is_successful(backend.acquire_lock("bob", 30, {"a"}))
+    assert not is_successful(backend.acquire_lock("bob", 30, {"b"}))
+
+
+def test_force_unlock_of_an_unheld_node_is_a_no_op(make_backend: BackendFactory) -> None:
+    backend = make_backend()
+    assert backend.force_unlock({"nope"}) == 0

@@ -37,9 +37,9 @@ class Artifact:
     provider_pins: dict[str, str]
     policies: tuple[PolicyBinding, ...] = ()
     outputs: dict[str, Any] = field(default_factory=dict)
-    #: alias -> resolved git commit of each published component the config used, so
-    #: the artifact records exactly which component code produced this IR (provenance;
-    #: integrity of the vendored code itself is enforced by `atlantide component verify`).
+    #: alias -> resolved git commit of each published component the config used,
+    #: recording which component code produced this IR. Integrity of the vendored
+    #: code itself is checked by ``atlantide component verify``.
     component_pins: dict[str, str] = field(default_factory=dict)
     format_version: int = ARTIFACT_FORMAT
 
@@ -54,8 +54,11 @@ def build_artifact(
     outputs: dict[str, Any],
     component_pins: dict[str, str] | None = None,
 ) -> Artifact:
-    """Bundle a compiled IR into an :class:`Artifact` (provider pins derived from the
-    IR; ``component_pins`` recorded as provenance from the project's lock)."""
+    """Bundle a compiled IR into an :class:`Artifact`.
+
+    Provider pins are derived from the IR; ``component_pins`` come from the
+    project's lock.
+    """
     return Artifact(
         ir=ir,
         ir_hash=hash_ir(ir),

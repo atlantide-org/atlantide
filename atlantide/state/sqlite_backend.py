@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import Iterator, Mapping, Set
+from collections.abc import Iterable, Iterator, Mapping, Set
 from contextlib import contextmanager, suppress
 from typing import Any
 
-from pydantic import TypeAdapter
 from returns.result import Failure, Result, Success
 
+from atlantide.core.check import FAIL, OK, Check
 from atlantide.core.errors import LockError, StateError
 from atlantide.state.backend import (
     Clock,
@@ -25,6 +25,17 @@ from atlantide.state.backend import (
     StateGraph,
     StateNode,
     scope_conflict,
+)
+from atlantide.state.codec import (
+    JSON_OBJ,
+    NODE_COLUMNS,
+    node_columns,
+    node_from_row,
+)
+
+_INSERT_NODE = (
+    f"INSERT OR REPLACE INTO nodes ({', '.join(NODE_COLUMNS)})"
+    f" VALUES ({', '.join('?' * len(NODE_COLUMNS))})"
 )
 
 _SCHEMA = """
@@ -48,15 +59,11 @@ CREATE TABLE IF NOT EXISTS locks (
 INSERT OR IGNORE INTO meta(key, value) VALUES ('serial', '0');
 """
 
-# Marshalers for the JSON-encoded columns: validate on load, compact on write.
-_JSON_OBJ: TypeAdapter[dict[str, Any]] = TypeAdapter(dict[str, Any])
-_DEPS: TypeAdapter[tuple[str, ...]] = TypeAdapter(tuple[str, ...])
-_DIGESTS: TypeAdapter[dict[str, str]] = TypeAdapter(dict[str, str])
-
 
 class SqliteStateBackend(StateBackend):
     def __init__(self, path: str, *, clock: Clock = time.time) -> None:
         self._now = clock
+        self._path = path
         try:
             self._conn = sqlite3.connect(path, isolation_level=None)
             self._conn.row_factory = sqlite3.Row
@@ -68,9 +75,10 @@ class SqliteStateBackend(StateBackend):
             raise StateError(f"cannot open state at {path!r}: {exc}") from exc
 
     def _migrate(self) -> None:
-        """Add columns missing from a state db created by an older build."""
-        # No versioned migrations; CREATE TABLE IF NOT EXISTS won't add columns to
-        # an existing table, so add them idempotently (duplicate-column is benign).
+        """Add any columns missing from an existing state database."""
+        # There are no versioned migrations, and CREATE TABLE IF NOT EXISTS does
+        # not add columns to an existing table, so each column is added
+        # idempotently and a duplicate-column error is ignored.
         with suppress(sqlite3.OperationalError):
             self._conn.execute(
                 "ALTER TABLE nodes ADD COLUMN secret_digests_json TEXT NOT NULL DEFAULT '{}'"
@@ -91,25 +99,20 @@ class SqliteStateBackend(StateBackend):
 
     def load(self) -> StateGraph:
         rows = self._conn.execute("SELECT * FROM nodes").fetchall()
-        nodes = {row["id"]: _row_to_node(row) for row in rows}
-        return StateGraph(nodes=nodes)
+        return StateGraph(nodes={row["id"]: node_from_row(row) for row in rows})
 
     def put(self, node: StateNode) -> None:
         with self._transaction(f"put({node.id!r})"):
-            self._conn.execute(
-                "INSERT OR REPLACE INTO nodes"
-                "(id, type, provider, provider_version, input_hash, outputs_json,"
-                " properties_json, deps_json, prevent_destroy, status, secret_digests_json)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    node.id, node.type, node.provider, node.provider_version,
-                    node.input_hash, _JSON_OBJ.dump_json(node.outputs).decode(),
-                    _JSON_OBJ.dump_json(node.properties).decode(),
-                    _DEPS.dump_json(node.dependencies).decode(),
-                    int(node.prevent_destroy), node.status,
-                    _DIGESTS.dump_json(node.secret_digests).decode(),
-                ),
-            )
+            self._conn.execute(_INSERT_NODE, node_columns(node))
+            self._bump_serial()
+
+    def put_many(self, nodes: Iterable[StateNode]) -> None:
+        """Upsert every node in one transaction (one serial bump for the batch)."""
+        rows = [node_columns(node) for node in nodes]
+        if not rows:
+            return
+        with self._transaction(f"put_many({len(rows)} nodes)"):
+            self._conn.executemany(_INSERT_NODE, rows)
             self._bump_serial()
 
     def delete(self, node_id: str) -> None:
@@ -131,12 +134,12 @@ class SqliteStateBackend(StateBackend):
         with self._transaction("set_outputs"):
             self._conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('outputs', ?)",
-                (_JSON_OBJ.dump_json(merged).decode(),),
+                (JSON_OBJ.dump_json(merged).decode(),),
             )
 
     def outputs(self) -> dict[str, Any]:
         row = self._conn.execute("SELECT value FROM meta WHERE key='outputs'").fetchone()
-        return _JSON_OBJ.validate_json(row["value"]) if row else {}
+        return JSON_OBJ.validate_json(row["value"]) if row else {}
 
     def _bump_serial(self) -> None:
         self._conn.execute(
@@ -185,28 +188,47 @@ class SqliteStateBackend(StateBackend):
             for row in rows
         }
 
+    # -- lock administration ----------------------------------------------
+
+    def locks(self) -> dict[str, Lease]:
+        rows = self._conn.execute("SELECT node_id, owner, expires_at FROM locks").fetchall()
+        return {
+            row["node_id"]: Lease(owner=row["owner"], expires_at=row["expires_at"])
+            for row in rows
+        }
+
+    def force_unlock(self, node_ids: Set[str]) -> int:
+        broken = 0
+        with self._transaction("force_unlock"):
+            for node_id in sorted(node_ids):
+                broken += self._conn.execute(
+                    "DELETE FROM locks WHERE node_id = ?", (node_id,)
+                ).rowcount
+        return broken
+
+    # -- preflight ---------------------------------------------------------
+
+    def check(self) -> list[Check]:
+        """A local file is usable when it opens and its directory is writable."""
+        try:
+            self._conn.execute("SELECT 1 FROM nodes LIMIT 1").fetchall()
+        except sqlite3.Error as exc:
+            return [Check("state file", FAIL, f"{self._path} unreadable: {exc}")]
+        nodes = len(self.load())
+        return [
+            Check("state file", OK, f"{self._path} ({nodes} node(s))"),
+            Check(
+                "sharing",
+                OK,
+                "local sqlite — single machine; set [state].backend for a shared one",
+            ),
+        ]
+
     def close(self) -> None:
         self._conn.close()
 
     def __del__(self) -> None:
-        # Close the connection if the caller did not; ``close()`` is the
-        # primary path.
+        # Fallback for callers that did not call ``close()``.
         conn = getattr(self, "_conn", None)
         if conn is not None:
             conn.close()
-
-
-def _row_to_node(row: sqlite3.Row) -> StateNode:
-    return StateNode(
-        id=row["id"],
-        type=row["type"],
-        provider=row["provider"],
-        provider_version=row["provider_version"],
-        input_hash=row["input_hash"],
-        outputs=_JSON_OBJ.validate_json(row["outputs_json"]),
-        properties=_JSON_OBJ.validate_json(row["properties_json"]),
-        dependencies=_DEPS.validate_json(row["deps_json"]),
-        prevent_destroy=bool(row["prevent_destroy"]),
-        status=row["status"],
-        secret_digests=_DIGESTS.validate_json(row["secret_digests_json"]),
-    )
