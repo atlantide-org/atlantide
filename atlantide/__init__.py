@@ -4,4 +4,4 @@
 #: workflow refuses to publish if the two disagree. Read only when the package
 #: is not installed (running from a source tree) — otherwise the CLI reports the
 #: installed distribution's metadata.
-__version__ = "0.3.0"
+__version__ = "0.4.0"
