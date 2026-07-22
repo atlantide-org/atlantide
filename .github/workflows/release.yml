@@ -21,11 +21,10 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      # No `enable-cache` here: this job installs no dependencies, so there is
-      # nothing for uv to cache and the post-run save fails on the missing path.
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
+          enable-cache: false
 
       # Three things have to line up, and all of them are knowable up front: the
       # tag, the two places the version is written, and PyPI's view of what
