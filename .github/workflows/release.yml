@@ -7,8 +7,64 @@ on:
 permissions:
   contents: write
 
+# Ordered by how hard each step is to undo. `verify` is cheap and settles every
+# question that can be answered before anything is produced. `build` uploads
+# binaries to the GitHub release, which can be replaced or deleted. `pypi` runs
+# last because it is the only irreversible step: a published version can be
+# yanked but its filenames are burned forever. A run that fails should fail
+# before that point, not after it.
 jobs:
+  verify:
+    name: Verify the release is publishable
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      # Three things have to line up, and all of them are knowable up front: the
+      # tag, the two places the version is written, and PyPI's view of what
+      # already exists.
+      - name: Assert the tag and both version declarations agree
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(uv version --short)"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag v$tag != pyproject version $version — bump the version before tagging"
+            exit 1
+          fi
+          # atlantide/__init__.py carries its own copy, used by `--version` when
+          # running from a source tree. Drift there ships a binary that lies.
+          init="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' atlantide/__init__.py)"
+          if [ "$init" != "$version" ]; then
+            echo "::error::atlantide/__init__.py says $init but pyproject says $version — update both"
+            exit 1
+          fi
+
+      - name: Refuse to republish a version PyPI already has
+        run: |
+          version="$(uv version --short)"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://pypi.org/pypi/atlantide/$version/json")"
+          case "$code" in
+            404) echo "$version is not on PyPI yet" ;;
+            200)
+              echo "::error::atlantide $version is already on PyPI. Filenames can never be reused there, even after deleting a release — re-running this tag cannot succeed. Bump the version in pyproject.toml and atlantide/__init__.py, then tag again."
+              exit 1
+              ;;
+            *)
+              # A PyPI outage should not block a release that is otherwise fine;
+              # the upload itself still fails safely if the version does exist.
+              echo "::warning::could not confirm whether $version is on PyPI (HTTP $code) — continuing"
+              ;;
+          esac
+
   build:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +109,11 @@ jobs:
 
   pypi:
     name: Publish to PyPI
+    # Last, and only if every binary built: publishing cannot be taken back, so a
+    # release that is going to fail should fail while it still can. `fail-fast:
+    # false` above means one broken platform does not cancel the others, but it
+    # does fail the job — and so blocks this one.
+    needs: [verify, build]
     runs-on: ubuntu-latest
     # Trusted Publishing (OIDC): PyPI verifies this workflow's identity, so no API
     # token is stored anywhere. Requires `id-token: write` and a matching publisher
@@ -69,15 +130,6 @@ jobs:
         with:
           python-version: "3.13"
           enable-cache: true
-
-      - name: Assert tag matches package version
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          version="$(uv version --short)"
-          if [ "$tag" != "$version" ]; then
-            echo "::error::tag v$tag != pyproject version $version — bump the version before tagging"
-            exit 1
-          fi
 
       - name: Build sdist + wheel
         run: uv build
