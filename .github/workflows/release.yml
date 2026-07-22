@@ -20,11 +20,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@v7
+      # No `enable-cache` here: this job installs no dependencies, so there is
+      # nothing for uv to cache and the post-run save fails on the missing path.
+      - uses: astral-sh/setup-uv@v9
         with:
           python-version: "3.13"
-          enable-cache: true
 
       # Three things have to line up, and all of them are knowable up front: the
       # tag, the two places the version is written, and PyPI's view of what
@@ -77,8 +78,8 @@ jobs:
             asset: atlantide-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9
         with:
           python-version: "3.13"
           enable-cache: true
@@ -102,7 +103,7 @@ jobs:
         run: "out/${{ matrix.asset }} --version"
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: out/${{ matrix.asset }}
           fail_on_unmatched_files: true
@@ -125,8 +126,8 @@ jobs:
       name: pypi
       url: https://pypi.org/project/atlantide/
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9
         with:
           python-version: "3.13"
           enable-cache: true

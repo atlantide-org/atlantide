@@ -30,8 +30,8 @@ jobs:
     env:
       ATLANTIDE_TEST_PG_DSN: postgresql://postgres:atlantide@localhost:5432/atlantide
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
