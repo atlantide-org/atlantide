@@ -27,15 +27,31 @@ def test_parse_semver_failure() -> None:
         assert isinstance(result.failure(), RegistryError)
 
 
-def test_check_compatible_same_major() -> None:
+def test_check_compatible_accepts_a_newer_same_major_provider() -> None:
     assert is_successful(check_compatible("1.4.2", "1.9.0"))  # minor/patch drift ok
-    assert is_successful(check_compatible("1.9.0", "1.4.2"))
+    assert is_successful(check_compatible("1.4.2", "1.4.2"))
+
+
+def test_check_compatible_rejects_a_downgrade() -> None:
+    """Compatibility is directional. A plan pinned at 1.9.0 encodes resources and
+    fields 1.4.2 may not have — the exact mismatch the pin exists to catch, and
+    the alternative is a provider crash mid-apply."""
+    result = check_compatible("1.9.0", "1.4.2")
+    assert not is_successful(result)
+    assert "incompatible" in str(result.failure())
 
 
 def test_check_compatible_major_mismatch() -> None:
     result = check_compatible("1.4.2", "2.0.0")
     assert not is_successful(result)
     assert "incompatible" in str(result.failure())
+
+
+def test_check_compatible_requires_an_exact_match_below_1_0() -> None:
+    """0.x carries no compatibility guarantee under semver."""
+    assert is_successful(check_compatible("0.4.0", "0.4.0"))
+    assert not is_successful(check_compatible("0.4.0", "0.9.0"))
+    assert not is_successful(check_compatible("0.9.0", "1.0.0"))
 
 
 def test_register_get_and_duplicates() -> None:

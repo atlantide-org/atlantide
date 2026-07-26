@@ -22,9 +22,7 @@ DEFAULT_STACK = "default"
 
 _active_stack: ContextVar[str] = ContextVar("atlantide_stack", default=DEFAULT_STACK)
 # None default (not {}) avoids a shared mutable default; treated as empty.
-_active_tags: ContextVar[dict[str, str] | None] = ContextVar(
-    "atlantide_stack_tags", default=None
-)
+_active_tags: ContextVar[dict[str, str] | None] = ContextVar("atlantide_stack_tags", default=None)
 _active_region: ContextVar[str | None] = ContextVar("atlantide_stack_region", default=None)
 _active_name_prefix: ContextVar[str | None] = ContextVar(
     "atlantide_stack_name_prefix", default=None
@@ -99,22 +97,34 @@ class Stack:
         self.tags = dict(tags or {})
         self.region = region
         self.name_prefix = name_prefix
-        self._tokens: list[tuple[ContextVar[Any], Any]] = []
+        # One token set per active `with`, and the entry stack itself lives in a
+        # ContextVar: tokens belong to an entry *in one context*. An instance-
+        # level list interleaves across asyncio tasks — task A's `__exit__`
+        # would pop task B's tokens and `reset()` them in the wrong context
+        # (ValueError), leaking A's own settings for the rest of its context.
+        self._entries: ContextVar[tuple[tuple[tuple[ContextVar[Any], Any], ...], ...]] = ContextVar(
+            f"atlantide_stack_entries_{name}_{id(self)}", default=()
+        )
 
     def __enter__(self) -> Stack:
         # name_prefix left as None inherits the enclosing stack's value.
         region = self.region
         prefix = self.name_prefix if self.name_prefix is not None else current_stack_name_prefix()
-        self._tokens = [
+        entry = (
             (_active_stack, _active_stack.set(self.name)),
             (_active_tags, _active_tags.set({**current_stack_tags(), **self.tags})),
             (_active_region, _active_region.set(region)),
             (_active_name_prefix, _active_name_prefix.set(prefix)),
-        ]
+        )
+        self._entries.set((*self._entries.get(), entry))
         return self
 
     def __exit__(self, *exc: object) -> Literal[False]:
-        for var, token in reversed(self._tokens):
+        entries = self._entries.get()
+        if not entries:
+            return False
+        self._entries.set(entries[:-1])
+        for var, token in reversed(entries[-1]):
             var.reset(token)
         return False
 

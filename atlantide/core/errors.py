@@ -21,10 +21,6 @@ class LanguageError(AtlantideError):
         super().__init__(f"{message}{location}")
 
 
-class NonDeterministicError(AtlantideError):
-    """Config reached for a non-deterministic capability."""
-
-
 class FuelExhaustedError(AtlantideError):
     """Atlas-lang evaluation exceeded its step budget."""
 
@@ -93,6 +89,21 @@ class ProviderError(AtlantideError):
         super().__init__(message)
 
 
+class RollbackError(AtlantideError):
+    """A compensation could not complete after a failed apply.
+
+    A compensation is a provider call followed by a state write, so a partial one
+    leaves state describing a resource that is no longer there; the stored hash
+    still matches config, so the next plan reports NOOP. Raised alongside the
+    original failure, not instead of it.
+    """
+
+    def __init__(self, node_id: str, reason: str) -> None:
+        self.node_id = node_id
+        self.op = "rollback"
+        super().__init__(f"rollback of {node_id!r} did not complete: {reason}")
+
+
 class StateError(AtlantideError):
     """State backend operation failed."""
 
@@ -105,8 +116,58 @@ class LockError(AtlantideError):
     """State lock could not be acquired or released."""
 
 
+class LeaseLostError(LockError):
+    """The state lock stopped being held part-way through a run.
+
+    Distinct from :class:`LockError`, which means a run never started. This one
+    means a run *did* start, wrote to the provider, and then found its lease
+    taken by someone else — so another run may now be acting on the same
+    resources. Nothing is rolled back: a compensation is itself a write, and a
+    run that no longer holds the lock must not make one.
+
+    The state store is therefore behind what exists at the provider. Recovery is
+    ``atlantide refresh`` before the next apply.
+    """
+
+
+class InterruptedRunError(AtlantideError):
+    """The operator interrupted a run (Ctrl-C).
+
+    Not a failure of the infrastructure, so it renders and exits differently: the
+    conventional 130 rather than 1, and without the "error:" framing that implies
+    something went wrong. Completed nodes are compensated on the way out where the
+    run still held its lock.
+    """
+
+
+class FencedWriteError(StateError):
+    """A state write was refused because the writer no longer holds the lock.
+
+    The store, not the writer, decides this — which is what makes it different
+    from :class:`LeaseLostError`. A run whose local clock still believes its lease
+    is good can be wrong; a conditional write against the recorded holder cannot.
+    It is the last line between two concurrent runs and a silently merged state.
+    """
+
+
+class PlanDriftError(AtlantideError):
+    """The changeset about to run is not the one that was approved.
+
+    An apply re-diffs once it holds the state lock — it must, or a resource
+    another run created in the meantime would still be planned as a CREATE and
+    get built twice. So the plan a human read and the plan that executes can
+    differ, and the gap between them is exactly where an unreviewed destroy fits.
+    Raised rather than reconciled: which of the two is wanted is the operator's
+    call, not the engine's.
+    """
+
+
 class PreventDestroyError(AtlantideError):
     """A planned destroy hit a resource with ``prevent_destroy`` set."""
+
+
+class PolicyConfigError(AtlantideError):
+    """A policy binding passes arguments the policy cannot use."""
 
 
 class PolicyViolationError(AtlantideError):

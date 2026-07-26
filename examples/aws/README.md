@@ -68,6 +68,50 @@ The `AcmCertificate` and `Route53HostedZone`/`Route53Record` types are also
 supported by the provider (for custom-domain sites) but are not used by this
 example.
 
+## Policies
+
+[`example-one.py`](example-one.py) binds two plan-time policies with `enforce()`:
+
+- **`require-tags`** — every taggable resource carries the keys the binding
+  names:
+
+  ```python
+  enforce("require-tags", keys=["env"])
+  ```
+
+  Each stack sets `env` in its `tags=`, and stack tags merge into every resource
+  in the body, so this holds without repeating the tag per resource. Add a key
+  nothing sets and the plan is refused:
+
+  ```
+  policy DENY require-tags: common:aws.Vpc:network is missing tag(s): owner
+  ```
+
+  Naming no `keys` demands only that a resource is tagged at all.
+- **`deny-destroy-in-protected`** — an apply that would DELETE or REPLACE
+  anything in a protected stack fails the plan. Which stacks those are is an
+  argument to the binding, not inferred from the name:
+
+  ```python
+  enforce("deny-destroy-in-protected", stacks=["prod"])
+  ```
+
+  So editing an immutable field on a `prod` resource — the bucket name, the queue
+  name, a region — is refused, because a replace is a destroy plus a create:
+
+  ```
+  policy DENY deny-destroy-in-protected: prod:aws.S3Bucket:assets: replace not
+  allowed in protected stack 'prod'
+  1 mandatory policy violation(s) block apply
+  ```
+
+  The same edit under `dev` applies normally, and the argument travels in the
+  `.atlas` artifact, so a `deploy` guards the same stacks the build did.
+
+  This guards the **apply** path. `atlantide destroy` runs against an empty
+  config, so it evaluates no bindings; use `Lifecycle(prevent_destroy=True)` on a
+  resource to guard that path.
+
 ## Run against AWS
 
 The `atlantide` CLI wires the AWS provider, so with credentials in your

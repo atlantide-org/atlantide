@@ -8,13 +8,20 @@ config, the IR, or engine state.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import ClassVar
 
+from cryptography.exceptions import InvalidTag
+from typing_extensions import override
+
+from atlantide.core.check import FAIL, OK, Check
 from atlantide.core.errors import SecretsError
-from atlantide.secrets._aesgcm import decrypt, encrypt, load_or_create_key
+from atlantide.secrets._aesgcm import OWNER_ONLY_MODE, decrypt, encrypt, load_or_create_key
 from atlantide.secrets.backend import SecretsProvider
 
 
@@ -32,6 +39,7 @@ class KeyfileValueStore(SecretsProvider):
 
     # -- resolution -------------------------------------------------------
 
+    @override
     def resolve(self, name: str) -> str:
         values = self._load()
         if name not in values:
@@ -44,22 +52,77 @@ class KeyfileValueStore(SecretsProvider):
     # -- management (CLI) -------------------------------------------------
 
     def set(self, name: str, value: str) -> None:
-        values = self._load()
-        values[name] = value
-        self._save(values)
+        with self._locked():
+            values = self._load()
+            values[name] = value
+            self._save(values)
 
     def delete(self, name: str) -> bool:
-        values = self._load()
-        if name not in values:
-            return False
-        del values[name]
-        self._save(values)
-        return True
+        with self._locked():
+            values = self._load()
+            if name not in values:
+                return False
+            del values[name]
+            self._save(values)
+            return True
 
     def names(self) -> list[str]:
         return sorted(self._load())
 
+    # -- preflight --------------------------------------------------------
+
+    @override
+    def check(self) -> Check:
+        """Confirm the store opens with the key this install holds.
+
+        The failure worth catching is a store encrypted under a *different* key —
+        a keyfile not shared with the rest of the team, or one regenerated after
+        being lost. Resolution only happens mid-apply, and the symptom there
+        (every secret unreadable) does not name its cause.
+
+        An absent store is not a failure: a project may simply have no secrets.
+        """
+        if not self._store.exists():
+            return self._check(OK, f"no store yet at {self._store}")
+        try:
+            values = self._load()
+        except SecretsError as exc:
+            return self._check(FAIL, self._why(exc))
+        return self._check(OK, f"{len(values)} secret(s) in {self._store}")
+
+    def _why(self, exc: SecretsError) -> str:
+        """Explain a failed open, in terms of what the operator can act on.
+
+        A decryption failure is identified by what it wraps, not by its wording.
+        AES-GCM authentication cannot say whether the key is wrong or the bytes
+        are damaged — the two are the same failure — so the message names both
+        instead of guessing.
+        """
+        if isinstance(exc.__cause__, InvalidTag | ValueError):
+            return (
+                f"cannot decrypt {self._store} with {self._key_path} — wrong or "
+                f"regenerated keyfile, or a damaged store"
+            )
+        return str(exc)
+
     # -- storage ----------------------------------------------------------
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Hold an exclusive advisory lock around load-modify-save.
+
+        Two concurrent CLI writes are otherwise an unlocked read-modify-write
+        over the store file, and one of them vanishes silently. ``flock`` on a
+        sibling lock file covers darwin and linux; closing the fd releases it.
+        """
+        self._store.parent.mkdir(parents=True, exist_ok=True)
+        lock = self._store.with_suffix(self._store.suffix + ".lock")
+        fd = os.open(str(lock), os.O_WRONLY | os.O_CREAT, OWNER_ONLY_MODE)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
 
     def _load(self) -> dict[str, str]:
         if not self._store.exists():
@@ -73,15 +136,24 @@ class KeyfileValueStore(SecretsProvider):
     def _save(self, values: dict[str, str]) -> None:
         blob = encrypt(self._load_key(), json.dumps(values, sort_keys=True).encode("utf-8"))
         self._store.parent.mkdir(parents=True, exist_ok=True)
-        # Write via a 0600 temp file, then atomically replace, so the plaintext
-        # window is never world-readable and a crash can't leave a half-written store.
+        # Write to an owner-only temp file, fsync, and replace atomically: the
+        # store is never world-readable, a crash cannot leave it half-written,
+        # and — since this file is the only copy of every secret — a power loss
+        # right after the replace cannot leave it empty or truncated.
         tmp = self._store.with_suffix(self._store.suffix + ".tmp")
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, OWNER_ONLY_MODE)
         try:
             os.write(fd, blob)
+            os.fsync(fd)
         finally:
             os.close(fd)
         os.replace(tmp, self._store)
+        with suppress(OSError):  # best-effort durability of the rename itself
+            dir_fd = os.open(str(self._store.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
 
     def _load_key(self) -> bytes:
         if self._key is None:

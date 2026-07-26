@@ -29,24 +29,35 @@ def parse_semver(version: str) -> Result[Semver, RegistryError]:
 def check_compatible(pinned: str, actual: str) -> Result[None, RegistryError]:
     """Success unless ``actual`` cannot satisfy a plan pinned at ``pinned``.
 
-    Same major -> compatible; major mismatch -> Failure.
+    Semver compatibility is directional: same major and not older. A plan built
+    against ``1.5.0`` encodes resources and fields ``1.0.0`` may not have, so a
+    downgrade is the mismatch the pin exists to catch. ``0.x`` carries no
+    compatibility guarantee and must match exactly.
     """
     parsed = parse_semver(pinned).bind(
         lambda pinned_v: parse_semver(actual).map(lambda actual_v: (pinned_v, actual_v))
     )
 
-    def _same_major(versions: tuple[Semver, Semver]) -> Result[None, RegistryError]:
-        pinned_v, actual_v = versions
-        if pinned_v[0] == actual_v[0]:
+    def _requirement(pinned_v: Semver, actual_v: Semver) -> str | None:
+        """What ``actual_v`` fails to satisfy, or ``None`` when it is compatible."""
+        if 0 in (pinned_v[0], actual_v[0]):
+            if pinned_v != actual_v:
+                return "0.x releases are not compatible across versions"
+        elif pinned_v[0] != actual_v[0] or actual_v < pinned_v:
+            return f"needs {pinned_v[0]}.x at or above {pinned}"
+        return None
+
+    def _compatible(versions: tuple[Semver, Semver]) -> Result[None, RegistryError]:
+        why = _requirement(*versions)
+        if why is None:
             return Success(None)
         return Failure(
             RegistryError(
-                f"provider version incompatible: plan pinned {pinned}, "
-                f"registered {actual} (major {pinned_v[0]} != {actual_v[0]})"
+                f"provider version incompatible: plan pinned {pinned}, registered {actual} ({why})"
             )
         )
 
-    return parsed.bind(_same_major)
+    return parsed.bind(_compatible)
 
 
 class ProviderRegistry:

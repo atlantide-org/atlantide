@@ -10,45 +10,60 @@ from __future__ import annotations
 
 from typing import Any
 
-from atlantide.core.errors import ProviderError
-from atlantide.providers.aws.handlers.base import AwsHandler, ignore_missing, known_id
+from typing_extensions import override
+
+from atlantide.providers.aws.handlers.base import (
+    AwsHandler,
+    create_or_adopt,
+    ignore_missing,
+    known_id,
+)
+from atlantide.providers.aws.handlers.faults import absent_ok, not_found
 from atlantide.providers.aws.resources import Route53HostedZone, Route53Record
 
 
 class Route53HostedZoneHandler(AwsHandler[Route53HostedZone]):
     service = "route53"
     resource_type = Route53HostedZone
+    identity_field = "zone_id"
 
+    @override
     def create(self, client: Any, res: Route53HostedZone) -> dict[str, Any]:
-        resp = client.create_hosted_zone(
-            Name=res.domain,
-            CallerReference=res.node_id,  # stable reference; a retried create is idempotent
-            HostedZoneConfig={"Comment": res.comment},
-        )
-        return _zone_outputs(resp["HostedZone"]["Id"], resp["DelegationSet"]["NameServers"])
+        def make() -> dict[str, Any]:
+            # Route53 raises HostedZoneAlreadyExists for a repeated
+            # CallerReference rather than returning the existing zone, so a retry
+            # adopts the zone `read` finds by domain.
+            resp = client.create_hosted_zone(
+                Name=res.domain,
+                CallerReference=res.node_id,
+                HostedZoneConfig={"Comment": res.comment},
+            )
+            return _zone_outputs(resp["HostedZone"]["Id"], resp["DelegationSet"]["NameServers"])
 
+        return create_or_adopt(make, lambda: self.read(client, res))
+
+    @override
     def read(self, client: Any, res: Route53HostedZone) -> dict[str, Any] | None:
-        zid = known_id(res, "zone_id") or self._find(client, res.domain)
+        zid = known_id(res, self.identity_field) or self._find(client, res.domain)
         if zid is None:
             return None
-        try:
-            got = client.get_hosted_zone(Id=zid)
-        except client.exceptions.ClientError:
+        got = absent_ok(lambda: client.get_hosted_zone(Id=zid))
+        if got is None:
             return None
         return _zone_outputs(zid, got["DelegationSet"]["NameServers"])
 
+    @override
     def update(self, client: Any, prior: dict[str, Any], res: Route53HostedZone) -> dict[str, Any]:
-        zid = prior.get("zone_id") or known_id(res, "zone_id")
+        zid = prior.get(self.identity_field) or known_id(res, self.identity_field)
         if zid is None:  # update only runs on an existing (already-created) zone
-            raise ProviderError(
-                "Route53HostedZone not found", op="update", resource_type=res.type_name()
-            )
+            raise not_found(res, "update")
         client.update_hosted_zone_comment(Id=zid, Comment=res.comment)
         got = client.get_hosted_zone(Id=zid)
         return _zone_outputs(zid, got["DelegationSet"]["NameServers"])
 
+    @override
     def delete(self, client: Any, res: Route53HostedZone) -> None:
-        zid = known_id(res, "zone_id")
+        zid = known_id(res, self.identity_field)
         if zid is None:
             return
         with ignore_missing():
@@ -68,18 +83,39 @@ class Route53RecordHandler(AwsHandler[Route53Record]):
     service = "route53"
     resource_type = Route53Record
 
+    @override
     def create(self, client: Any, res: Route53Record) -> dict[str, Any]:
         client.change_resource_record_sets(
             HostedZoneId=res.zone_id, ChangeBatch=_batch("UPSERT", _record_set(res))
         )
         return {}
 
+    @override
     def read(self, client: Any, res: Route53Record) -> dict[str, Any] | None:
-        return None if self._live_set(client, res) is None else {}
+        live = self._live_set(client, res)
+        if live is None:
+            return None
+        # The handler already fetched the record set to answer "does it exist";
+        # reporting what is in it costs nothing and is the difference between
+        # noticing a repointed record and not.
+        observed: dict[str, Any] = {
+            "records": [r["Value"] for r in live.get("ResourceRecords", [])],
+        }
+        if "TTL" in live:
+            observed["ttl"] = int(live["TTL"])
+        if (alias := live.get("AliasTarget")) is not None:
+            observed["alias"] = {
+                "name": alias["DNSName"].rstrip("."),
+                "zone_id": alias["HostedZoneId"],
+                "evaluate_target_health": alias.get("EvaluateTargetHealth", False),
+            }
+        return observed
 
+    @override
     def update(self, client: Any, prior: dict[str, Any], res: Route53Record) -> dict[str, Any]:
         return self.create(client, res)  # UPSERT overwrites the set in place
 
+    @override
     def delete(self, client: Any, res: Route53Record) -> None:
         with ignore_missing():
             live = self._live_set(client, res)
@@ -90,14 +126,15 @@ class Route53RecordHandler(AwsHandler[Route53Record]):
 
     @staticmethod
     def _live_set(client: Any, res: Route53Record) -> dict[str, Any] | None:
-        try:
-            resp = client.list_resource_record_sets(
+        resp = absent_ok(
+            lambda: client.list_resource_record_sets(
                 HostedZoneId=res.zone_id,
                 StartRecordName=res.record_name,
                 StartRecordType=res.record_type,
                 MaxItems="1",
             )
-        except client.exceptions.ClientError:
+        )
+        if resp is None:
             return None
         target = res.record_name.rstrip(".")
         rrsets: list[dict[str, Any]] = resp.get("ResourceRecordSets", [])
@@ -108,6 +145,21 @@ class Route53RecordHandler(AwsHandler[Route53Record]):
 
 
 def _record_set(res: Route53Record) -> dict[str, Any]:
+    """The ``ResourceRecordSet`` for this record.
+
+    An alias carries no ``TTL`` or ``ResourceRecords`` — Route 53 rejects a set
+    with both, since an alias inherits the target's TTL.
+    """
+    if res.alias is not None:
+        return {
+            "Name": res.record_name,
+            "Type": res.record_type,
+            "AliasTarget": {
+                "DNSName": res.alias.name,
+                "HostedZoneId": res.alias.zone_id,
+                "EvaluateTargetHealth": res.alias.evaluate_target_health,
+            },
+        }
     return {
         "Name": res.record_name,
         "Type": res.record_type,

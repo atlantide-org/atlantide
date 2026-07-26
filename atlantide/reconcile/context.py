@@ -11,8 +11,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from returns.pipeline import is_successful
+
 from atlantide.core.actions import Action
 from atlantide.core.errors import AtlantideError, ProviderError
+from atlantide.core.events import ApplyEvent, EventSink, no_sink
 from atlantide.core.provider import Provider
 from atlantide.core.registry import ProviderRegistry
 from atlantide.core.resource import Resource
@@ -21,7 +24,7 @@ from atlantide.graph.model import DiGraph
 from atlantide.graph.schedule import DEFAULT_PARALLELISM
 from atlantide.ir.model import IRGraph, IRNode
 from atlantide.secrets import SecretsRegistry
-from atlantide.state.backend import StateBackend, StateGraph
+from atlantide.state.backend import LeaseGuard, StateBackend, StateGraph
 
 #: Live per-node computed values during a run: node id -> {attr: value}.
 LiveOutputs = dict[str, dict[str, Any]]
@@ -40,6 +43,17 @@ RefreshProgress = Callable[[str, str], None]
 #: concurrent tasks in one asyncio thread.
 ProgressCallback = Callable[[str, Action, str], None]
 
+#: Default ceiling on one node's reconcile, in seconds.
+#:
+#: Sized to clear the slowest legitimate single-node operation: a CloudFront
+#: distribution polls for up to 30 minutes to reach ``Deployed``.
+#:
+#: This cancels the *await*, not the provider call: handlers run in a worker
+#: thread via :func:`asyncio.to_thread`, and a thread cannot be killed, so the
+#: boto call runs until its own socket timeout fires (see
+#: :mod:`atlantide.providers.aws.config`). Together they bound a hang.
+DEFAULT_NODE_TIMEOUT = 2400.0
+
 
 @dataclass(frozen=True, slots=True)
 class ApplyEnv:
@@ -51,6 +65,21 @@ class ApplyEnv:
     secrets: SecretsRegistry
     stack_outputs: dict[str, Any] = field(default_factory=dict)
     parallelism: int = DEFAULT_PARALLELISM
+    #: Checked before every state write. The default guard holds no lease and never
+    #: refuses — correct for unlocked paths (read-only refresh, tests) and for an
+    #: embedding caller that does its own locking.
+    lease: LeaseGuard = field(default_factory=LeaseGuard)
+    #: Where run events go. The default discards, so nothing pays for the
+    #: stream unless a caller wants it. See :mod:`atlantide.core.events`.
+    events: EventSink = no_sink
+    #: Identifies this run in every event it emits. Supplied by the caller
+    #: (the CLI uses the lock owner, which already encodes host + pid + token).
+    run_id: str = ""
+    #: Ceiling on one node's whole reconcile. Without it a hung provider call
+    #: hangs the apply for the life of the process, holding its lease throughout.
+    #: Generous by default: some control-plane operations take many minutes, so
+    #: this is a backstop against "never", not a service-level target.
+    node_timeout: float = DEFAULT_NODE_TIMEOUT
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,8 +94,15 @@ class Desired:
 
 
 def provider_for(providers: ProviderRegistry, name: str) -> Provider:
+    """The registered provider named ``name``, or a `ProviderError` naming it.
+
+    Tested with `is_successful` rather than truthiness: a `Failure` is an ordinary
+    object with no ``__bool__``, so ``if not resolved`` is always false and the
+    message below was unreachable — the operator got `unwrap`'s bare
+    `UnwrapFailedError`, which carries no indication of which provider was missing.
+    """
     resolved = providers.get(name)
-    if not resolved:
+    if not is_successful(resolved):
         raise ProviderError(f"no provider registered for {name!r}")
     return resolved.unwrap()
 
@@ -103,7 +139,9 @@ def ir_from_state(
     ignore = ignore_changes or {}
     nodes = tuple(
         IRNode(
-            id=n.id, type=n.type, provider=n.provider,
+            id=n.id,
+            type=n.type,
+            provider=n.provider,
             provider_version=n.provider_version,
             properties=n.properties if with_properties else {},
             dependencies=tuple(dep for dep in n.dependencies if dep in present),
@@ -118,3 +156,25 @@ def state_digraph(state: StateGraph) -> DiGraph:
     """Rebuild the dependency graph recorded in state (for delete ordering)."""
     # State always came from an acyclic apply, so rebuilding its graph cannot cycle.
     return build_graph(ir_from_state(state)).unwrap()
+
+
+def progress_sink(callback: ProgressCallback) -> EventSink:
+    """Adapt an old-style progress callback onto the event stream.
+
+    The TUI keeps its narrow signature and the executor gains one emission path
+    instead of two. Two would drift: a phase added to one and forgotten in the
+    other is invisible until a display stops updating.
+    """
+    phases = {
+        "node_start": PHASE_START,
+        "node_finish": PHASE_FINISH,
+        "node_fail": PHASE_FAIL,
+    }
+
+    def emit(event: ApplyEvent) -> None:
+        phase = phases.get(event.phase)
+        if phase is None or event.node_id is None or event.action is None:
+            return  # run- and lease-level events have nothing to draw
+        callback(event.node_id, Action(event.action), phase)
+
+    return emit

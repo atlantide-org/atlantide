@@ -52,3 +52,21 @@ def live_apply(actionable: list[tuple[str, Action]]) -> Iterator[ProgressCallbac
             live.update(render())
 
         yield callback
+
+
+@contextmanager
+def maybe_live(
+    actionable: list[tuple[str, Action]], *, enabled: bool
+) -> Iterator[ProgressCallback | None]:
+    """:func:`live_apply` when there is a terminal to draw on, otherwise nothing.
+
+    Without this, every caller writes the branch — and because the engine call
+    sits *inside* the ``with``, both arms have to repeat it in full. Three
+    commands did, at seven keyword arguments each, which is three places for an
+    argument to be added to one arm and forgotten in the other.
+    """
+    if not enabled:
+        yield None
+        return
+    with live_apply(actionable) as progress:
+        yield progress

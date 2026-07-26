@@ -12,6 +12,7 @@ fixed salt and sealing is a no-op, so state is byte-identical to before.
 
 from __future__ import annotations
 
+import hmac
 from typing import Any
 
 from atlantide.core.errors import SecretsError
@@ -30,7 +31,13 @@ class SecretsRegistry:
         self._material = material
 
     def register(self, provider: SecretsProvider, *, default: bool = False) -> None:
-        name = provider.name
+        # ``name`` is a ClassVar the ABC declares but cannot enforce, so a provider
+        # that never set one reaches here. Reported the same way as every other
+        # registration failure — an unhandled AttributeError from deep inside the
+        # registry names neither the offending class nor what it is missing.
+        name = getattr(provider, "name", "")
+        if not name:
+            raise SecretsError(f"secrets provider {type(provider).__name__} declares no name")
         if name in self._providers:
             raise SecretsError(f"duplicate secrets provider {name!r}")
         self._providers[name] = provider
@@ -64,14 +71,17 @@ class SecretsRegistry:
     def digest_matches(self, scope: str, plaintext: str, stored: str | None) -> bool:
         """Whether ``stored`` is a digest of ``plaintext`` under this install.
 
-        Checks the per-install salt, then the fixed legacy salt — so a digest
-        written before per-install salts existed does not read as a rotation.
+        Checks the per-install salt, then the fixed fallback salt, so a digest
+        written without an install salt does not read as a rotation.
         """
         if stored is None:
             return False
-        if stored == self.digest(scope, plaintext):
+        # Constant-time: these are digests of secret plaintext.
+        if hmac.compare_digest(stored, self.digest(scope, plaintext)):
             return True
-        return self._material is not None and stored == secret_digest(scope, plaintext)
+        return self._material is not None and hmac.compare_digest(
+            stored, secret_digest(scope, plaintext)
+        )
 
     # -- sealing sensitive values at rest ---------------------------------
 

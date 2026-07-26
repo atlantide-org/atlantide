@@ -1,13 +1,20 @@
-"""Small builders that remove hand-written boilerplate from tests."""
+"""Small builders that remove hand-written boilerplate from tests.
+
+:func:`make_engine` lives here rather than in ``conftest``: the harness is a
+library the suites import, and a library importing pytest glue points the
+dependency the wrong way round.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
-from atlantide.core import Provider, Resource
+from atlantide.core import Provider, ProviderRegistry, Resource
 from atlantide.engine import Engine
-from atlantide.state.backend import StateNode
-from tests.conftest import make_engine
+from atlantide.policy import PolicyRegistry
+from atlantide.secrets import SecretsRegistry
+from atlantide.state import MemoryStateBackend
+from atlantide.state.backend import DEFAULT_LOCK_POLICY, LockPolicy, StateBackend, StateNode
 from tests.support.providers import FakeProvider
 
 
@@ -56,3 +63,27 @@ def engine_for(
     provider to a bare :class:`FakeProvider`. Multi-provider tests use ``make_engine``.
     """
     return make_engine(types_of(*resource_classes), provider or FakeProvider(), **kw)
+
+
+def make_engine(
+    types: dict[str, type[Resource]],
+    *providers: Provider,
+    backend: StateBackend | None = None,
+    policies: PolicyRegistry | None = None,
+    secrets: SecretsRegistry | None = None,
+    parallelism: int | None = None,
+    lock_policy: LockPolicy = DEFAULT_LOCK_POLICY,
+) -> Engine:
+    """An Engine over the given providers/types with in-memory-state defaults."""
+    registry = ProviderRegistry()
+    for provider in providers:
+        registry.register(provider)
+    return Engine(
+        registry,
+        backend if backend is not None else MemoryStateBackend(),
+        types,
+        policies=policies,
+        secrets=secrets,
+        parallelism=parallelism,
+        lock_policy=lock_policy,
+    )

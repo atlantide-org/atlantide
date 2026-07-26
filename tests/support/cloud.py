@@ -2,16 +2,26 @@
 
 Adding a new cloud provider's suite is three lines — supply the provider's env
 vars and a ``mock_factory`` (e.g. ``moto.mock_aws``); everything else is shared.
+
+:func:`fake_aws_credentials` and :func:`create_state_store` are the pieces the
+remote-state suites compose with ``moto.mock_aws`` directly, since they need no
+``Stack``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
+from typing import Any
 
+import boto3
 import pytest
+from moto import mock_aws
 
 from atlantide.core import Stack
+
+#: Region every AWS-backed test suite runs in unless it says otherwise.
+TEST_REGION = "eu-north-1"
 
 
 def cloud_env_fixture(
@@ -35,3 +45,53 @@ def cloud_env_fixture(
             yield
 
     return _fixture
+
+
+def aws_fixture(
+    *, region: str = TEST_REGION, stack: str = "default"
+) -> Callable[..., Iterator[None]]:
+    """The AWS flavour of :func:`cloud_env_fixture`, which is what every suite wants.
+
+    ``cloud_env_fixture`` stays generic because it is the seam a second cloud
+    provider plugs into. But nine AWS suites were each re-spelling the same
+    credential dict and the same ``mock_factory=mock_aws`` to reach it, which is
+    nine chances to typo an env var into a suite that then quietly talks to a real
+    account. Say what varies — the region, occasionally the stack name — and
+    nothing else::
+
+        aws_env = aws_fixture()
+    """
+    return cloud_env_fixture(
+        {
+            "AWS_ACCESS_KEY_ID": "testing",
+            "AWS_SECRET_ACCESS_KEY": "testing",
+            "AWS_DEFAULT_REGION": region,
+        },
+        region=region,
+        mock_factory=mock_aws,
+        stack=stack,
+    )
+
+
+def fake_aws_credentials(monkeypatch: pytest.MonkeyPatch, *, region: str = TEST_REGION) -> None:
+    """Stop botocore reaching for real credentials or a real region under moto."""
+    for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+        monkeypatch.setenv(key, "testing")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", region)
+
+
+def create_state_store(bucket: str, lock_table: str, *, region: str = TEST_REGION) -> None:
+    """Create the bucket and lock table the s3 state backend expects to exist.
+
+    The backend deliberately does not create them (they are the trust root for
+    shared state), so every suite that exercises it must stand them up first.
+    """
+    s3: Any = boto3.client("s3", region_name=region)
+    s3.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": region})
+    ddb: Any = boto3.client("dynamodb", region_name=region)
+    ddb.create_table(
+        TableName=lock_table,
+        KeySchema=[{"AttributeName": "node_id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "node_id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )

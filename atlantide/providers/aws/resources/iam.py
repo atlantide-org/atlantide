@@ -8,12 +8,12 @@ from pydantic import model_validator
 
 from atlantide.core import computed, immutable, mutable
 from atlantide.providers.aws import validate as v
-from atlantide.providers.aws.resources.base import AwsResource
+from atlantide.providers.aws.resources.base import AwsResource, TaggedResource
 
 _ROLE_NAME_MAX = 64
 
 
-class IamRole(AwsResource):
+class IamRole(TaggedResource):
     """An IAM role (global, no region).
 
     ``role_name`` is immutable; the trust policy, description, and tags update in
@@ -35,15 +35,12 @@ class IamRole(AwsResource):
     assumed_by: str | list[str] | None = mutable(default=None)
     assume_role_policy: str | None = mutable(default=None)
     description: str = mutable(default="")
-    tags: dict[str, str] = mutable(default_factory=dict)
     arn: str = computed()
 
     @model_validator(mode="after")
     def _validate(self) -> IamRole:
         if (self.assumed_by is None) == (self.assume_role_policy is None):
-            raise ValueError(
-                "IamRole needs exactly one of 'assumed_by' or 'assume_role_policy'"
-            )
+            raise ValueError("IamRole needs exactly one of 'assumed_by' or 'assume_role_policy'")
         v.check(self.role_name, v.max_length(_ROLE_NAME_MAX, "role_name"))
         return self
 

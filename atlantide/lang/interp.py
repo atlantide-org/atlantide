@@ -20,6 +20,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from atlantide.core.errors import FuelExhaustedError, LanguageError
+from atlantide.core.provider import Provider
+from atlantide.lang.validate import (
+    DEFAULT_SURFACE,
+    LanguageSurface,
+    import_allowed,
+    private_import_message,
+)
 
 DEFAULT_FUEL = 1_000_000
 
@@ -27,23 +34,46 @@ DEFAULT_FUEL = 1_000_000
 _UNBOUND = object()
 
 _BINOPS: dict[type[ast.operator], Callable[[Any, Any], Any]] = {
-    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
-    ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
-    ast.Mod: operator.mod, ast.Pow: operator.pow, ast.LShift: operator.lshift,
-    ast.RShift: operator.rshift, ast.BitOr: operator.or_,
-    ast.BitAnd: operator.and_, ast.BitXor: operator.xor,
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.LShift: operator.lshift,
+    ast.RShift: operator.rshift,
+    ast.BitOr: operator.or_,
+    ast.BitAnd: operator.and_,
+    ast.BitXor: operator.xor,
 }
 
 _UNARYOPS: dict[type[ast.unaryop], Callable[[Any], Any]] = {
-    ast.UAdd: operator.pos, ast.USub: operator.neg,
-    ast.Invert: operator.invert, ast.Not: operator.not_,
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+    ast.Invert: operator.invert,
+    ast.Not: operator.not_,
+}
+
+#: f-string conversions, keyed by the code `ast` records (`!r`, `!a`, `!s`).
+#: `-1` means "no conversion" and is simply absent.
+_CONVERSIONS: dict[int, Callable[[Any], str]] = {
+    ord("r"): repr,
+    ord("a"): ascii,
+    ord("s"): str,
 }
 
 _COMPARES: dict[type[ast.cmpop], Callable[[Any, Any], Any]] = {
-    ast.Eq: operator.eq, ast.NotEq: operator.ne, ast.Lt: operator.lt,
-    ast.LtE: operator.le, ast.Gt: operator.gt, ast.GtE: operator.ge,
-    ast.Is: operator.is_, ast.IsNot: operator.is_not,
-    ast.In: lambda a, b: a in b, ast.NotIn: lambda a, b: a not in b,
+    ast.Eq: operator.eq,
+    ast.NotEq: operator.ne,
+    ast.Lt: operator.lt,
+    ast.LtE: operator.le,
+    ast.Gt: operator.gt,
+    ast.GtE: operator.ge,
+    ast.Is: operator.is_,
+    ast.IsNot: operator.is_not,
+    ast.In: lambda a, b: a in b,
+    ast.NotIn: lambda a, b: a not in b,
 }
 
 
@@ -59,17 +89,22 @@ _SEQUENCE = (str, bytes, list, tuple)
 
 
 def _native_call_cost(args: list[Any], kwargs: dict[str, Any]) -> int:
-    """Fuel to charge for a native builtin call: one step per argument plus one
-    per element of each sized argument (``sum(range(N))`` costs ~N, so a runaway
-    native loop hits the fuel limit instead of running unbounded)."""
+    """Fuel charged for a native builtin call.
+
+    One step per argument plus one per element of each sized argument, so
+    ``sum(range(N))`` costs about N and a runaway native loop reaches the fuel
+    limit rather than running unbounded.
+    """
     values = [*args, *kwargs.values()]
     return len(values) + sum(_sized_len(v) for v in values)
 
 
 def _binop_cost(op_type: type[ast.operator], left: Any, right: Any) -> int:
-    """Fuel for a value-producing binary op whose result can dwarf its inputs:
-    sequence repetition (``"a" * N``) and integer power (``2 ** N``). Bounds the
-    output size so a single node can't allocate unbounded memory for one tick."""
+    """Fuel for a binary op whose result can be far larger than its inputs.
+
+    Covers sequence repetition (``"a" * N``) and integer power (``2 ** N``),
+    bounding output size so one node cannot allocate unbounded memory per tick.
+    """
     if op_type is ast.Mult:
         # Normalise to (sequence, count) regardless of operand order.
         seq, count = (left, right) if isinstance(left, _SEQUENCE) else (right, left)
@@ -140,15 +175,13 @@ class Closure:
 @dataclass
 class Interpreter:
     fuel: int = DEFAULT_FUEL
+    #: Which modules config may import; see :class:`LanguageSurface`.
+    surface: LanguageSurface = DEFAULT_SURFACE
     _spent: int = field(default=0, init=False)
-
-    # -- public ------------------------------------------------------------
 
     def run(self, module: ast.Module, scope: Scope) -> None:
         for stmt in module.body:
             self._exec(stmt, scope)
-
-    # -- fuel --------------------------------------------------------------
 
     def _tick(self, cost: int = 1) -> None:
         """Charge ``cost`` evaluation steps. ``cost`` is one per interpreter node,
@@ -159,22 +192,22 @@ class Interpreter:
         if self._spent > self.fuel:
             raise FuelExhaustedError(f"evaluation exceeded fuel budget ({self.fuel} steps)")
 
-    # -- iteration (deterministic) ----------------------------------------
-
     @staticmethod
     def _iter(value: Any) -> Iterator[Any]:
         if isinstance(value, frozenset | set):
             return iter(sorted(value, key=repr))
         return iter(value)
 
-    # -- statements --------------------------------------------------------
-
     def _exec(self, node: ast.stmt, scope: Scope) -> None:
         self._dispatch("_st_", "execute", node, scope)
 
-    def _dispatch(
-        self, prefix: str, verb: str, node: ast.stmt | ast.expr, scope: Scope
-    ) -> Any:
+    def _dispatch(self, prefix: str, verb: str, node: ast.stmt | ast.expr, scope: Scope) -> Any:
+        """Route one node to its ``_st_``/``_ex_`` handler.
+
+        The handler lookup is by name — the same table the operator maps
+        (`_BINOPS`, `_COMPARES`) express declaratively — so adding a node type
+        means adding one method and nothing else.
+        """
         self._tick()
         method = getattr(self, prefix + type(node).__name__, None)
         if method is None:
@@ -224,22 +257,55 @@ class Interpreter:
                 self._exec(stmt, scope)
 
     def _st_With(self, node: ast.With, scope: Scope) -> None:
-        # Enter each context manager left-to-right; exit in reverse (try/finally).
-        # __enter__/__exit__ are called from the interpreter, not via config
-        # attribute access, so dunder access stays banned in the language.
+        # Enter each context manager left-to-right; exit in reverse with the
+        # active exception, matching Python: a later __enter__ that raises
+        # unwinds the managers already entered, and a truthy __exit__ suppresses
+        # the error. The interpreter calls __enter__/__exit__ directly, so
+        # dunder access stays banned in the language.
         managers: list[Any] = []
-        for item in node.items:
-            manager = self._eval(item.context_expr, scope)
-            entered = type(manager).__enter__(manager)
-            if item.optional_vars is not None:
-                self._bind(item.optional_vars, entered, scope)
-            managers.append(manager)
         try:
+            for item in node.items:
+                manager = self._eval(item.context_expr, scope)
+                entered = type(manager).__enter__(manager)
+                managers.append(manager)  # entered: unwound even if the bind fails
+                if item.optional_vars is not None:
+                    self._bind(item.optional_vars, entered, scope)
             for stmt in node.body:
                 self._exec(stmt, scope)
-        finally:
-            for manager in reversed(managers):
-                type(manager).__exit__(manager, None, None, None)
+        except (_Break, _Continue, _Return):
+            # Control flow is a non-exceptional exit: __exit__ sees no error.
+            pending = self._exit_managers(managers, None)
+            if pending is not None:
+                raise pending from None
+            raise
+        except BaseException as exc:
+            pending = self._exit_managers(managers, exc)
+            if pending is not None:
+                # `pending` is either `exc` itself or what an __exit__ raised,
+                # with its context already set during unwinding.
+                raise pending from pending.__cause__
+        else:
+            pending = self._exit_managers(managers, None)
+            if pending is not None:
+                raise pending
+
+    @staticmethod
+    def _exit_managers(managers: list[Any], exc: BaseException | None) -> BaseException | None:
+        """Exit ``managers`` in reverse; return the exception still active after.
+
+        ``exc`` is cleared when some ``__exit__`` returns truthy (suppression),
+        and replaced when an ``__exit__`` itself raises — every entered manager
+        is still exited either way.
+        """
+        for manager in reversed(managers):
+            try:
+                if exc is None:
+                    type(manager).__exit__(manager, None, None, None)
+                elif type(manager).__exit__(manager, type(exc), exc, exc.__traceback__):
+                    exc = None
+            except BaseException as raised:
+                exc = raised
+        return exc
 
     def _st_Break(self, node: ast.Break, scope: Scope) -> None:
         raise _Break
@@ -256,7 +322,7 @@ class Interpreter:
     def _st_Import(self, node: ast.Import, scope: Scope) -> None:
         # Binding a whole module would expose its attribute graph (and the stdlib
         # modules it imports) to config — a sandbox escape. Only `from ... import
-        # <name>` of non-module objects is allowed.
+        # <name>` of a non-module object is allowed.
         name = node.names[0].name
         raise LanguageError(
             f"`import {name}` binds a module; use "
@@ -266,8 +332,22 @@ class Interpreter:
 
     def _st_ImportFrom(self, node: ast.ImportFrom, scope: Scope) -> None:
         assert node.module is not None
+        # Re-checked here as well as in `validate`: `import_module` executes the
+        # target and `getattr` yields a live callable, so the allow-list must also
+        # hold on the path that binds the name.
+        if not import_allowed(node.module, self.surface):
+            raise LanguageError(
+                f"import from {node.module!r} is not allowed in Atlas-lang",
+                line=node.lineno,
+            )
         module = importlib.import_module(node.module)
         for alias in node.names:
+            # Leading-underscore helpers are where the IO lives (`_read_content`,
+            # `_git`) and are not part of the config API.
+            if alias.name.startswith("_"):
+                raise LanguageError(
+                    private_import_message(alias.name, node.module), line=node.lineno
+                )
             try:
                 obj = getattr(module, alias.name)
             except AttributeError:
@@ -282,9 +362,15 @@ class Interpreter:
                     "only public classes and functions may be imported",
                     line=node.lineno,
                 )
+            # A Provider carries the boto3/filesystem calls; providers are
+            # registered and driven by the CLI, not by config.
+            if isinstance(obj, type) and issubclass(obj, Provider):
+                raise LanguageError(
+                    f"cannot import provider {alias.name!r} from {node.module!r}; "
+                    "config declares resources, it does not drive providers",
+                    line=node.lineno,
+                )
             scope.assign(alias.asname or alias.name, obj)
-
-    # -- expressions -------------------------------------------------------
 
     def _eval(self, node: ast.expr, scope: Scope) -> Any:
         return self._dispatch("_ex_", "evaluate", node, scope)
@@ -303,14 +389,15 @@ class Interpreter:
 
     def _ex_FormattedValue(self, node: ast.FormattedValue, scope: Scope) -> str:
         value = self._eval(node.value, scope)
+        # Conversion first, then the format spec — Python's order. Returning
+        # `format(value, spec)` before looking at the conversion silently
+        # dropped `!r`/`!a`/`!s` whenever a spec was present, producing values
+        # that differ from real Python and flow into the hashed IR.
+        if (convert := _CONVERSIONS.get(node.conversion)) is not None:
+            value = convert(value)
         if node.format_spec is not None:
             spec = self._eval(node.format_spec, scope)
             return format(value, spec)
-        conv = node.conversion
-        if conv == ord("r"):  # !r
-            return repr(value)
-        if conv == ord("a"):  # !a
-            return ascii(value)
         return str(value)
 
     def _ex_BinOp(self, node: ast.BinOp, scope: Scope) -> Any:
@@ -324,8 +411,7 @@ class Interpreter:
         return _UNARYOPS[type(node.op)](self._eval(node.operand, scope))
 
     def _ex_BoolOp(self, node: ast.BoolOp, scope: Scope) -> Any:
-        # `and` stops at the first falsy operand, `or` at the first truthy one;
-        # either way the deciding (or final) operand's value is returned.
+        # Short-circuit: return the deciding operand's value, or the last one.
         stop_on = not isinstance(node.op, ast.And)
         result: Any = None
         for value_node in node.values:
@@ -379,20 +465,28 @@ class Interpreter:
                 args.extend(self._iter(self._eval(arg.value, scope)))
             else:
                 args.append(self._eval(arg, scope))
+        # `kw.arg is None` marks `**mapping`, which this evaluator cannot apply;
+        # skipping it would silently discard the mapping. Mirrors `_ex_Dict`.
+        for kw in node.keywords:
+            if kw.arg is None:
+                raise LanguageError(
+                    "`**` keyword unpacking is not supported; pass keywords explicitly",
+                    line=node.lineno,
+                )
         kwargs = {kw.arg: self._eval(kw.value, scope) for kw in node.keywords if kw.arg}
         if not isinstance(func, Closure):
-            # Native builtin: it will loop/allocate outside the interpreter, so
-            # meter it by input size up front and normalise set arguments to a
-            # sorted order (native iteration would otherwise leak PYTHONHASHSEED).
+            # Native builtins loop and allocate outside the interpreter, so meter
+            # by input size up front. Set arguments are sorted first: native
+            # iteration would otherwise expose PYTHONHASHSEED ordering.
             args = [self._normalize_arg(a) for a in args]
             kwargs = {k: self._normalize_arg(v) for k, v in kwargs.items()}
             self._tick(_native_call_cost(args, kwargs))
         return func(*args, **kwargs)
 
     def _normalize_arg(self, value: Any) -> Any:
-        """Coerce a top-level set/frozenset argument to a deterministically
-        ordered list so native builtins (``list``, ``str.join``, ``str``) don't
-        expose hash-seed ordering."""
+        """Coerce a top-level set or frozenset argument to a deterministically ordered
+        list, so native builtins (``list``, ``str.join``, ``str``) do not expose
+        hash-seed ordering."""
         if isinstance(value, frozenset | set):
             return list(self._iter(value))
         return value
@@ -426,8 +520,6 @@ class Interpreter:
         self._run_comp(node.generators, 0, scope, lambda s: out.append(self._eval(node.elt, s)))
         return out
 
-    # -- helpers -----------------------------------------------------------
-
     def _make_closure(
         self, args: ast.arguments, body: list[ast.stmt] | ast.expr, scope: Scope, name: str
     ) -> Closure:
@@ -450,6 +542,12 @@ class Interpreter:
                 call_scope.assign(param, closure.defaults[i - n_required])
             else:
                 raise LanguageError(f"{closure.name}() missing argument {param!r}")
+        if len(args) > len(params):
+            # The binding loop consumes one arg per parameter; surplus args would
+            # otherwise be discarded silently.
+            raise LanguageError(
+                f"{closure.name}() takes {len(params)} argument(s) but {len(args)} were given"
+            )
         if kwargs:
             raise LanguageError(f"{closure.name}() got unexpected keyword(s) {list(kwargs)}")
         if isinstance(closure.body, list):
@@ -492,9 +590,7 @@ class Interpreter:
             container, key = self._subscript(target, scope)
             container[key] = value
         else:
-            raise LanguageError(
-                f"cannot assign to {type(target).__name__}", line=target.lineno
-            )
+            raise LanguageError(f"cannot assign to {type(target).__name__}", line=target.lineno)
 
     def _eval_load_target(self, target: ast.expr, scope: Scope) -> Any:
         # For AugAssign: read the current value of a Name/Subscript target.

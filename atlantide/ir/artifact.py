@@ -23,7 +23,7 @@ from atlantide.core.errors import ArtifactError
 from atlantide.core.markers import refs_to_markers
 from atlantide.core.policy import PolicyBinding, PolicyLevel
 from atlantide.ir.hash import hash_ir
-from atlantide.ir.model import IR_VERSION, IRGraph, IRNode
+from atlantide.ir.model import IRGraph
 
 ARTIFACT_FORMAT = 1
 
@@ -37,9 +37,9 @@ class Artifact:
     provider_pins: dict[str, str]
     policies: tuple[PolicyBinding, ...] = ()
     outputs: dict[str, Any] = field(default_factory=dict)
-    #: alias -> resolved git commit of each published component the config used, so
-    #: the artifact records exactly which component code produced this IR (provenance;
-    #: integrity of the vendored code itself is enforced by `atlantide component verify`).
+    #: alias -> resolved git commit of each published component the config used,
+    #: recording which component code produced this IR. Integrity of the vendored
+    #: code itself is checked by ``atlantide component verify``.
     component_pins: dict[str, str] = field(default_factory=dict)
     format_version: int = ARTIFACT_FORMAT
 
@@ -54,8 +54,11 @@ def build_artifact(
     outputs: dict[str, Any],
     component_pins: dict[str, str] | None = None,
 ) -> Artifact:
-    """Bundle a compiled IR into an :class:`Artifact` (provider pins derived from the
-    IR; ``component_pins`` recorded as provenance from the project's lock)."""
+    """Bundle a compiled IR into an :class:`Artifact`.
+
+    Provider pins are derived from the IR; ``component_pins`` come from the
+    project's lock.
+    """
     return Artifact(
         ir=ir,
         ir_hash=hash_ir(ir),
@@ -96,7 +99,7 @@ def loads(text: str) -> Result[Artifact, ArtifactError]:
         )
     try:
         artifact = Artifact(
-            ir=_ir_from_json(data["ir"]),
+            ir=IRGraph.from_stored(data["ir"]),
             ir_hash=data["ir_hash"],
             provider_pins=dict(data["provider_pins"]),
             policies=tuple(_binding_from_json(p) for p in data.get("policies", [])),
@@ -130,7 +133,7 @@ def _to_json(artifact: Artifact) -> dict[str, Any]:
     return {
         "format_version": artifact.format_version,
         "ir_hash": artifact.ir_hash,
-        "ir": artifact.ir.to_canonical(),
+        "ir": artifact.ir.to_stored(),  # the canonical form omits `aliases`
         "provider_pins": artifact.provider_pins,
         "component_pins": artifact.component_pins,
         "policies": [_binding_json(b) for b in artifact.policies],
@@ -143,6 +146,7 @@ def _binding_json(binding: PolicyBinding) -> dict[str, Any]:
         "name": binding.name,
         "level": binding.level.value,
         "types": sorted(binding.types) if binding.types is not None else None,
+        "params": dict(binding.params),
     }
 
 
@@ -152,22 +156,5 @@ def _binding_from_json(data: dict[str, Any]) -> PolicyBinding:
         name=data["name"],
         level=PolicyLevel(data["level"]),
         types=frozenset(types) if types is not None else None,
+        params=dict(data.get("params", {})),
     )
-
-
-def _ir_from_json(data: dict[str, Any]) -> IRGraph:
-    nodes = tuple(
-        IRNode(
-            id=node["id"],
-            type=node["type"],
-            provider=node["provider"],
-            provider_version=node["provider_version"],
-            properties=node["properties"],
-            dependencies=tuple(node["dependencies"]),
-            prevent_destroy=node.get("prevent_destroy", False),
-            create_before_destroy=node.get("create_before_destroy", False),
-            ignore_changes=tuple(node.get("ignore_changes", ())),
-        )
-        for node in data["nodes"]
-    )
-    return IRGraph(nodes=nodes, version=data.get("version", IR_VERSION))

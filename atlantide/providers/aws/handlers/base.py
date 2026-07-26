@@ -8,21 +8,40 @@ is typed ``Any`` to avoid a dependency on per-service type stubs.
 
 from __future__ import annotations
 
-import contextlib
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
 from typing import Any, ClassVar, Generic, TypeVar
-
-from botocore.exceptions import ClientError
 
 from atlantide.core import Resource
 
 R = TypeVar("R", bound=Resource)
 
+# Split by concern; re-exported here because every handler already imports
+# these names from base and the split should not ripple through them.
+from atlantide.providers.aws.handlers.faults import (  # noqa: E402
+    create_or_adopt,
+    error_code,
+    ignore_missing,
+    is_missing,
+)
+from atlantide.providers.aws.handlers.tags import (  # noqa: E402
+    stale_tag_keys,
+    sync_tags,
+    tag_list,
+    tags_from_list,
+)
 
-def tag_list(tags: dict[str, str]) -> list[dict[str, str]]:
-    """AWS ``[{"Key": k, "Value": v}]`` tag shape, deterministically ordered."""
-    return [{"Key": k, "Value": v} for k, v in sorted(tags.items())]
+__all__ = [
+    "AwsHandler",
+    "create_or_adopt",
+    "error_code",
+    "ignore_missing",
+    "is_missing",
+    "known_id",
+    "stale_tag_keys",
+    "sync_tags",
+    "tag_list",
+    "tags_from_list",
+]
 
 
 def known_id(res: Resource, field: str) -> str | None:
@@ -37,28 +56,6 @@ def known_id(res: Resource, field: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-#: Error codes meaning "the resource is already gone" — safe to ignore on delete.
-_MISSING_CODES = frozenset({
-    "NoSuchEntity", "NoSuchEntityException", "NoSuchBucket",
-    "ResourceNotFoundException", "ResourceNotFound", "404",
-    "NoSuchOriginAccessControl", "NoSuchDistribution", "NoSuchHostedZone",
-})
-
-
-@contextlib.contextmanager
-def ignore_missing() -> Iterator[None]:
-    """Swallow a delete's not-found error so destroy is idempotent.
-
-    A 'creating' state row may point at a resource whose create never reached AWS
-    or was already removed; deleting it is then a no-op rather than a hard error.
-    """
-    try:
-        yield
-    except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") not in _MISSING_CODES:
-            raise
-
-
 class AwsHandler(ABC, Generic[R]):
     """CRUD for one AWS resource type ``R`` over one boto3 service.
 
@@ -69,6 +66,20 @@ class AwsHandler(ABC, Generic[R]):
 
     service: ClassVar[str]
     resource_type: ClassVar[type[Resource]]
+
+    #: The computed field holding this resource's provider-assigned id, for the
+    #: types AWS locates by an opaque id rather than by a name — an ACM
+    #: certificate's ``arn``, a VPC's ``vpc_id``. ``None`` means ``read`` finds
+    #: the resource from its declared attributes and needs nothing restored.
+    #:
+    #: Declared rather than derived because it is an *input* to ``read``: nothing
+    #: about a call tells you that ACM keys on an arn and EC2 on a vpc id. (The
+    #: opposite case — which fields a read *observed* — is derivable from its
+    #: return value, and :mod:`atlantide.reconcile.refresh` deliberately derives
+    #: it rather than declaring it.) The names here were already written down as
+    #: ``known_id(res, "arn")`` literals; this collects them in one place, and
+    #: ``tests/providers/test_identity_fields.py`` holds them to the handler.
+    identity_field: ClassVar[str | None] = None
 
     def region(self, res: R) -> str | None:
         """Client region; ``None`` uses the provider default (global services)."""

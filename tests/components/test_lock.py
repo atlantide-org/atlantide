@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from atlantide.components.lock import LockEntry, load_lock, write_lock
+from atlantide.core.errors import ComponentError
 
 
 def test_missing_lock_is_empty(tmp_path: Path) -> None:
@@ -32,9 +35,12 @@ def test_written_lock_is_alias_sorted(tmp_path: Path) -> None:
     assert text.index("[components.alpha]") < text.index("[components.zeta]")
 
 
-def test_malformed_entry_skipped(tmp_path: Path) -> None:
+def test_malformed_entry_raises(tmp_path: Path) -> None:
+    # Skipping a malformed entry would leave its alias mounted with no hash
+    # verification at all, so the load fails loudly instead.
     (tmp_path / "atlantide.lock").write_text(
         '[components.ok]\ngit = "g"\ncommit = "c"\nhash = "h"\n'
-        "[components.bad]\ngit = 5\n"  # non-string git -> skipped
+        "[components.bad]\ngit = 5\n"  # non-string git
     )
-    assert set(load_lock(tmp_path)) == {"ok"}
+    with pytest.raises(ComponentError, match=r"'bad'.*malformed"):
+        load_lock(tmp_path)

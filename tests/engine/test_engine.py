@@ -83,8 +83,7 @@ async def test_immutable_path_change_replaces(tmp_path: Path) -> None:
 
 def _source_config(path: Path) -> str:
     return (
-        "from atlantide.providers.local import SourceFile\n"
-        f"SourceFile('cfg', path={str(path)!r})\n"
+        f"from atlantide.providers.local import SourceFile\nSourceFile('cfg', path={str(path)!r})\n"
     )
 
 
@@ -231,3 +230,46 @@ async def test_destroy_tolerates_dangling_dependency(tmp_path: Path) -> None:
     report = (await engine.destroy()).unwrap()
     assert report.deleted == ["default:local.File:b"]
     assert not target.exists()
+
+
+async def test_replace_forces_only_the_named_node(tmp_path: Path) -> None:
+    engine = _engine()
+    cfg = _config(tmp_path)
+    (await engine.apply(cfg)).unwrap()
+
+    planned = engine.plan(cfg, replace=["default:local.File:b"]).unwrap()
+    actions = {c.node_id: c.action for c in planned.changeset}
+    assert actions["default:local.File:b"] is Action.REPLACE
+    # `--replace` must not close over dependencies: naming b does not recreate a.
+    assert actions["default:local.File:a"] is Action.NOOP
+
+
+async def test_replace_reexamines_dependents(tmp_path: Path) -> None:
+    engine = _engine()
+    cfg = _config(tmp_path)
+    (await engine.apply(cfg)).unwrap()
+
+    planned = engine.plan(cfg, replace=["default:local.File:a"]).unwrap()
+    actions = {c.node_id: c.action for c in planned.changeset}
+    assert actions["default:local.File:a"] is Action.REPLACE
+    # b's content references a.checksum: a's recreation may hand b a new value,
+    # so b must not stay a Merkle-skipped NOOP holding the old resolved value.
+    assert actions["default:local.File:b"] is not Action.NOOP
+
+
+async def test_targeted_apply_tolerates_unresolvable_outputs(tmp_path: Path) -> None:
+    """An output over an unselected CREATE has no value under a targeted apply;
+    the run must succeed and leave the output uncommitted rather than fail after
+    the selected mutations already landed."""
+    engine = _engine()
+    cfg = (
+        "from atlantide.core import output\n"
+        "from atlantide.providers.local import File\n"
+        f"a = File('a', path={str(tmp_path / 'a.txt')!r}, content='alpha')\n"
+        f"b = File('b', path={str(tmp_path / 'b.txt')!r}, content='beta')\n"
+        "output('b_sum', b.checksum)\n"
+    )
+    report = (await engine.apply(cfg, targets=["default:local.File:a"])).unwrap()
+    assert report.created == ["default:local.File:a"]
+    assert "b_sum" not in report.outputs
+    assert (tmp_path / "a.txt").exists() and not (tmp_path / "b.txt").exists()

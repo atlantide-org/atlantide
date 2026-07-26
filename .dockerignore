@@ -1,0 +1,65 @@
+# Everything the image does not need. This file is what keeps the build context
+# small and, more importantly, keeps unrelated edits from invalidating the layer
+# cache: anything sent as context is hashed, whether the Dockerfile reads it or
+# not.
+
+# VCS and CI
+.git/
+.github/
+.gitignore
+.pre-commit-config.yaml
+
+# Local environments and build output
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+atlantide.spec
+
+# Tool caches
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+.import_linter_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.token-savior-cache.json
+
+# Tests and examples: neither is installed, and both change often enough to
+# needlessly bust the cache if they were sent.
+tests/
+examples/
+scripts/
+
+# Docs. README.md is re-included below: pyproject.toml declares it as the
+# project readme, so the wheel build reads it and fails without it.
+*.md
+!README.md
+LICENSE
+
+# Local atlantide artifacts — state, secrets, vendored components. None of this
+# belongs in an image, and the keyfile least of all.
+atlantide.db
+atlantide.db-*
+atlantide.key
+atlantide.secrets
+.atlantis/
+*.atlas
+*.atlas-state
+infra.db
+infra.db-*
+
+# Editor and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Docker's own files
+Dockerfile
+.dockerignore

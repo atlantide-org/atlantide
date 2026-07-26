@@ -79,6 +79,6 @@ with Stack("example", region=Region.UsEast1, name_prefix="atlantide", tags={"app
         ],
     )
 
-    output("site_url", cdn.domain_name)          # https://<id>.cloudfront.net
-    output("bucket", origin.bucket)              # the origin bucket name
+    output("site_url", cdn.domain_name)  # https://<id>.cloudfront.net
+    output("bucket", origin.bucket)  # the origin bucket name
     output("distribution_id", cdn.distribution_id)  # the CloudFront distribution id

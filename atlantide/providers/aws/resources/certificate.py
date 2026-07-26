@@ -11,14 +11,15 @@ from __future__ import annotations
 
 from pydantic import model_validator
 
-from atlantide.core import computed, immutable, mutable
+from atlantide.core import computed, immutable
 from atlantide.providers.aws import validate as v
-from atlantide.providers.aws.resources.base import AwsResource
+from atlantide.providers.aws.resources.base import TaggedResource
 
 _VALIDATION_METHOD = v.one_of(("DNS", "EMAIL"), "ACM validation method")
+_DOMAIN = v.domain_name("certificate domain")
 
 
-class AcmCertificate(AwsResource):
+class AcmCertificate(TaggedResource):
     """An ACM certificate (DNS validation by default).
 
     ``domain_name``, ``subject_alternative_names`` and ``validation_method`` are
@@ -29,7 +30,6 @@ class AcmCertificate(AwsResource):
     domain_name: str = immutable(physical_name=True)
     subject_alternative_names: list[str] = immutable(default_factory=list)
     validation_method: str = immutable(default="DNS")
-    tags: dict[str, str] = mutable(default_factory=dict)
     arn: str = computed()  # CertificateArn (the id)
     validation_name: str = computed()  # the DNS validation record name
     validation_type: str = computed()  # ...its type (CNAME)
@@ -38,4 +38,7 @@ class AcmCertificate(AwsResource):
     @model_validator(mode="after")
     def _validate(self) -> AcmCertificate:
         v.check(self.validation_method, _VALIDATION_METHOD)
+        v.check(self.domain_name, _DOMAIN)
+        for alternative in self.subject_alternative_names:
+            v.check(alternative, _DOMAIN)
         return self

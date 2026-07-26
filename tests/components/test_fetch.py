@@ -44,7 +44,7 @@ def test_fetch_vendors_subdir_and_pins_commit(repo: tuple[str, str], tmp_path: P
 
     assert entry.commit == commit
     assert entry.subdir == "pkg"
-    assert entry.hash.startswith("sha256:")
+    assert entry.hash.startswith("sha256.v2:")
     vendored = components_dir(tmp_path) / "acme"
     assert (vendored / "__init__.py").read_text() == "VALUE = 1\n"
     assert entry.hash == tree_hash(vendored)
@@ -82,3 +82,85 @@ def test_verify_unvendored_errors(tmp_path: Path) -> None:
     entry = LockEntry(git="x", commit="c", hash="sha256:whatever")
     with pytest.raises(ComponentError, match="not vendored"):
         verify("ghost", entry, tmp_path)
+
+
+# -- untrusted inputs -------------------------------------------------------
+#
+# The alias, url, ref, and subdir all come from `atlantide.toml` / `atlantide.lock`
+# — files that arrive with a cloned repo. `_materialize` rmtree's the destination
+# and shells out to git, so none of the four may be taken at face value.
+
+#: Aliases that escape `.atlantis/components` by lexical path joining. `_dest`
+#: feeds the result straight to `shutil.rmtree`.
+TRAVERSING_ALIASES = ["../../../../tmp/victim", "..", "a/b", "/etc", ""]
+
+
+@pytest.mark.parametrize("alias", TRAVERSING_ALIASES)
+def test_alias_outside_the_project_is_rejected(
+    alias: str, repo: tuple[str, str], tmp_path: Path
+) -> None:
+    url, _ = repo
+    with pytest.raises(ComponentError, match="alias"):
+        fetch(alias, _source(url), tmp_path)
+
+
+def test_alias_traversal_does_not_delete_the_target(tmp_path: Path) -> None:
+    """The check must precede `rmtree`, not merely occur somewhere in `fetch`."""
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("important\n")
+
+    project = tmp_path / "project"
+    project.mkdir()
+    with pytest.raises(ComponentError):
+        fetch("../../victim", _source("file:///nonexistent"), project)
+    assert (victim / "keep.txt").read_text() == "important\n"
+
+
+#: `ext::<cmd>` is a git remote helper: git runs the string as a shell command.
+#: A leading `-` makes git parse the "url" as an option (`--upload-pack=<cmd>`).
+HOSTILE_URLS = [
+    "ext::sh -c 'touch /tmp/pwned'",
+    "--upload-pack=/bin/sh",
+    "-c protocol.ext.allow=always",
+    "javascript:alert(1)",
+]
+
+
+@pytest.mark.parametrize("url", HOSTILE_URLS)
+def test_hostile_url_is_rejected(url: str, tmp_path: Path) -> None:
+    with pytest.raises(ComponentError, match="url"):
+        fetch("acme", ComponentSource(git=url), tmp_path)
+
+
+def test_hostile_ref_is_rejected(repo: tuple[str, str], tmp_path: Path) -> None:
+    url, _ = repo
+    with pytest.raises(ComponentError, match="ref"):
+        fetch("acme", ComponentSource(git=url, ref="--upload-pack=/bin/sh"), tmp_path)
+
+
+def test_subdir_cannot_escape_the_clone(repo: tuple[str, str], tmp_path: Path) -> None:
+    url, _ = repo
+    with pytest.raises(ComponentError, match="outside the component repo"):
+        fetch("acme", _source(url, subdir="../../../../etc"), tmp_path)
+
+
+def test_tree_hash_framing_is_injective(tmp_path: Path) -> None:
+    # The pre-v2 `path\0content\0` concatenation collided for these two trees
+    # (embedded NULs let one tree impersonate another); length framing must not.
+    one = tmp_path / "one"
+    one.mkdir()
+    (one / "a").write_bytes(b"1\x00b\x002")
+    two = tmp_path / "two"
+    two.mkdir()
+    (two / "a").write_bytes(b"1")
+    (two / "b").write_bytes(b"2")
+    assert tree_hash(one) != tree_hash(two)
+
+
+def test_verify_rejects_outdated_lock_hash_format(repo: tuple[str, str], tmp_path: Path) -> None:
+    url, commit = repo
+    fetch("acme", _source(url), tmp_path)
+    stale = LockEntry(git=url, commit=commit, hash="sha256:" + "0" * 64, subdir="pkg")
+    with pytest.raises(ComponentError, match="outdated format"):
+        verify("acme", stale, tmp_path)

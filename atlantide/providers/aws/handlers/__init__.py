@@ -15,6 +15,10 @@ from atlantide.providers.aws.handlers.cloudfront import (
     CloudFrontOacHandler,
 )
 from atlantide.providers.aws.handlers.compute import LambdaFunctionHandler
+from atlantide.providers.aws.handlers.data import (
+    AwsAvailabilityZonesHandler,
+    AwsCallerIdentityHandler,
+)
 from atlantide.providers.aws.handlers.database import DynamoDbTableHandler
 from atlantide.providers.aws.handlers.dns import (
     Route53HostedZoneHandler,
@@ -23,19 +27,32 @@ from atlantide.providers.aws.handlers.dns import (
 from atlantide.providers.aws.handlers.iam import IamPolicyHandler, IamRoleHandler
 from atlantide.providers.aws.handlers.messaging import SnsSubscriptionHandler, SnsTopicHandler
 from atlantide.providers.aws.handlers.networking import (
+    ElasticIpHandler,
+    InternetGatewayHandler,
+    NatGatewayHandler,
+    RouteTableHandler,
     SecurityGroupHandler,
     SubnetHandler,
     VpcHandler,
 )
 from atlantide.providers.aws.handlers.observability import CloudWatchLogGroupHandler
-from atlantide.providers.aws.handlers.s3 import S3BucketHandler, S3BucketPolicyHandler
+from atlantide.providers.aws.handlers.s3 import (
+    S3BucketHandler,
+    S3BucketPolicyHandler,
+    S3FolderHandler,
+)
 from atlantide.providers.aws.handlers.sqs import SqsQueueHandler
 
 __all__ = ["HANDLERS", "AwsHandler"]
 
 _HANDLER_CLASSES: list[type[AwsHandler[Any]]] = [
+    # Read-only lookups. Registered here like any other handler — the registry's
+    # rule is "no type without a handler", not "no type without CRUD".
+    AwsCallerIdentityHandler,
+    AwsAvailabilityZonesHandler,
     S3BucketHandler,
     S3BucketPolicyHandler,
+    S3FolderHandler,
     SqsQueueHandler,
     IamRoleHandler,
     IamPolicyHandler,
@@ -45,6 +62,10 @@ _HANDLER_CLASSES: list[type[AwsHandler[Any]]] = [
     DynamoDbTableHandler,
     CloudWatchLogGroupHandler,
     VpcHandler,
+    InternetGatewayHandler,
+    ElasticIpHandler,
+    NatGatewayHandler,
+    RouteTableHandler,
     SubnetHandler,
     SecurityGroupHandler,
     CloudFrontOacHandler,

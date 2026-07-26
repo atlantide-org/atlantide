@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from atlantide.core import computed, immutable, mutable
-from atlantide.providers.aws.resources.base import AwsResource
+from atlantide.core import computed, immutable
+from atlantide.providers.aws.resources.base import RegionalResource, TaggedResource
 
 
-class SnsTopic(AwsResource):
+class SnsTopic(RegionalResource, TaggedResource):
     """An SNS topic. ``name``/``region`` immutable; ``tags`` in place; ``arn`` computed."""
 
     class Action:
@@ -16,12 +16,10 @@ class SnsTopic(AwsResource):
         Subscribe = "sns:Subscribe"
 
     name: str = immutable(physical_name=True)
-    region: str = immutable()  # required (from the stack region)
-    tags: dict[str, str] = mutable(default_factory=dict)
     arn: str = computed()
 
 
-class SnsSubscription(AwsResource):
+class SnsSubscription(RegionalResource):
     """An SNS subscription wiring a topic to an endpoint (e.g. an SQS queue).
 
     All fields are immutable — any change replaces the subscription. Pass
@@ -32,5 +30,4 @@ class SnsSubscription(AwsResource):
     topic_arn: str = immutable()
     protocol: str = immutable(default="sqs")
     endpoint: str = immutable()
-    region: str = immutable()  # required (from the stack region)
     subscription_arn: str = computed()

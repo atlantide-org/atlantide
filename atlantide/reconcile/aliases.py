@@ -104,9 +104,13 @@ def persist_migration(
     Call under the state lock before the executor runs, so the reconcile sees the
     new ids. Idempotent: a re-run whose state is already migrated computes an empty
     ``remap`` and never reaches here.
+
+    A rename is a move, so the delete and the upsert go through one
+    :meth:`~atlantide.state.backend.StateBackend.replace_many`: state must never
+    hold neither id. ``alias_remap`` matches on the old id being present, so a
+    partial write is not recoverable by re-running.
     """
-    for old_id in remap:
-        backend.delete(old_id)
-    for node_id, node in migrated.nodes.items():
-        if prior.nodes.get(node_id) != node:
-            backend.put(node)
+    backend.replace_many(
+        remap,
+        (node for node_id, node in migrated.nodes.items() if prior.nodes.get(node_id) != node),
+    )

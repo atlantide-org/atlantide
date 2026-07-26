@@ -30,17 +30,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-#: Hidden project dir holding vendored component trees (derived; not committed).
-VENDOR_DIR = ".atlantis"
-_COMPONENTS_SUBDIR = "components"
+from atlantide.components._layout import VENDOR_DIR, components_dir
+
+__all__ = ["VENDOR_DIR", "components_dir", "mount", "verify_vendored"]
 
 
-def components_dir(project_root: Path) -> Path:
-    """The dir under which each alias's vendored package tree lives."""
-    return project_root / VENDOR_DIR / _COMPONENTS_SUBDIR
-
-
-def mount(project_root: Path) -> None:
+def mount(project_root: Path, *, verify: bool = True) -> None:
     """Make vendored components importable as ``atlantide.components.<alias>``.
 
     Appends the project's ``.atlantis/components`` dir to this package's
@@ -48,8 +43,51 @@ def mount(project_root: Path) -> None:
     — the interpreter's exact call for ``from atlantide.components.<alias> import
     ...`` — resolves the vendored subpackage. Idempotent, and a no-op when nothing
     has been vendored yet.
+
+    Each locked alias is re-hashed against ``atlantide.lock`` first. Mounting is
+    what makes third-party Python importable, so the pin is checked here rather
+    than only in the opt-in ``atlantide component verify``; otherwise
+    ``plan``/``apply``/``build`` execute a tampered or stale tree. Pass
+    ``verify=False`` from the component commands, which rebuild that tree.
     """
     root = components_dir(project_root)
     entry = str(root)
-    if root.is_dir() and entry not in __path__:
+    if not root.is_dir():
+        return
+    if verify:
+        verify_vendored(project_root)
+    if entry not in __path__:
         __path__.append(entry)
+
+
+def verify_vendored(project_root: Path) -> None:
+    """Re-hash every vendored alias against ``atlantide.lock``.
+
+    An alias in the lock but absent from disk is the "not vendored yet" state and
+    is skipped; the import itself reports it more clearly. The reverse — a
+    directory on disk with no lock entry — is refused: :func:`mount` makes every
+    directory under ``.atlantis/components`` importable, so an unlocked one would
+    be third-party Python that runs with no hash verification at all.
+    """
+    # Imported inside the function: `components.fetch` imports this package's
+    # verify helper, and a module-scope import here would close the loop.
+    from atlantide.components.fetch import verify as verify_alias
+    from atlantide.components.lock import LOCKFILE, load_lock
+    from atlantide.core.errors import ComponentError
+
+    root = components_dir(project_root)
+    locked = load_lock(project_root)
+    unlocked = sorted(
+        p.name
+        for p in (root.iterdir() if root.is_dir() else ())
+        if p.is_dir() and p.name != "__pycache__" and p.name not in locked
+    )
+    if unlocked:
+        names = ", ".join(repr(n) for n in unlocked)
+        raise ComponentError(
+            f"vendored component(s) {names} have no entry in {LOCKFILE}; "
+            "remove the directory or re-run `atlantide component fetch` to pin it"
+        )
+    for alias, entry in locked.items():
+        if (root / alias).is_dir():
+            verify_alias(alias, entry, project_root)

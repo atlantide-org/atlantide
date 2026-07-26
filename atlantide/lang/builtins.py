@@ -18,7 +18,7 @@ import uuid
 from typing import Any
 
 from atlantide.core.errors import LanguageError
-from atlantide.core.types import concat, interpolate, join
+from atlantide.core.types import SecretRef, concat, interpolate, join
 
 # Fixed namespace so uuid5() is stable across machines and runs.
 _ATLAS_NS = uuid.uuid5(uuid.NAMESPACE_URL, "atlantide")
@@ -80,9 +80,7 @@ _SLUG_STRIP = re.compile(r"[^a-z0-9]+")
 def slugify(value: str) -> str:
     """DNS/resource-safe slug: ASCII-fold, lowercase, non-alphanumerics to a
     single ``-``, trimmed. ``"Café Menu!" -> "cafe-menu"``."""
-    ascii_value = (
-        unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
-    )
+    ascii_value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
     return _SLUG_STRIP.sub("-", ascii_value.lower()).strip("-")
 
 
@@ -91,21 +89,48 @@ class ConfigAPI:
 
     def __init__(self, inputs: dict[str, Any]) -> None:
         self._inputs = inputs
+        #: What this evaluation actually read, defaults included. Only these shaped
+        #: the config, so an input passed but never read must not move the plan's
+        #: identity.
+        self.consumed: dict[str, Any] = {}
 
     def input(self, name: str, default: Any = _MISSING) -> Any:
-        """Declared config input; recorded as an explicit (visible) value."""
+        """A declared config input: a per-run value the config may branch on.
+
+        The determinism guarantee is over *(config, inputs)*, not config alone:
+        two runs with the same inputs produce byte-identical IR, and two runs
+        with different ones are supposed to differ. A value that reaches a
+        resource field lands in the hashed IR by the ordinary route, so nothing
+        special is needed to make that work.
+
+        Not for secrets — see :meth:`secret`.
+        """
         if name in self._inputs:
+            self.consumed[name] = self._inputs[name]
             return self._inputs[name]
         if default is _MISSING:
-            raise LanguageError(f"required input {name!r} not provided")
+            raise LanguageError(
+                f"required input {name!r} not provided — pass -var {name}=<value>, "
+                f"put it in [inputs] in atlantide.toml, or give it a default"
+            )
+        self.consumed[name] = default
         return default
 
-    def secret(self, name: str, default: Any = _MISSING) -> Any:
-        """Sanctioned secret input, sourced from ``inputs``.
+    def secret(self, name: str, provider: str | None = None) -> SecretRef:
+        """A handle to a secret in the configured store — never the value.
 
-        Sensitivity/redaction comes from the *field* declaration, not the value.
+        Returns a :class:`~atlantide.core.SecretRef`, so the *name* is what
+        reaches the IR, the artifact and state; the plaintext is resolved
+        in-memory at apply and never written down.
+
+        This deliberately does not read from ``inputs``. It used to, which meant
+        the value a caller passed was substituted straight into a resource field
+        and from there into the hashed IR, the ``.atlas`` artifact, and the state
+        store — a secret committed to three places at once, by the function whose
+        entire purpose is to keep it out of them. Pass secrets to the store
+        (``atlantide secret set``), not to the config.
         """
-        return self.input(name, default)
+        return SecretRef(name, provider=provider)
 
     # dunder access is blocked in-language.
     uuid5 = staticmethod(uuid5)
@@ -122,13 +147,34 @@ class ConfigAPI:
 # Deterministic subset of Python builtins. Ordering-sensitive ones (sorted,
 # min, max) are deterministic; iteration over sets is normalised in the interpreter.
 SAFE_BUILTINS: dict[str, Any] = {
-    "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict,
-    "divmod": divmod, "enumerate": enumerate, "filter": filter, "float": float,
-    "frozenset": frozenset, "int": int, "len": len, "list": list, "map": map,
-    "max": max, "min": min, "range": range, "reversed": reversed, "round": round,
-    "set": set, "sorted": sorted, "str": str, "sum": sum, "tuple": tuple,
+    "abs": abs,
+    "all": all,
+    "any": any,
+    "bool": bool,
+    "dict": dict,
+    "divmod": divmod,
+    "enumerate": enumerate,
+    "filter": filter,
+    "float": float,
+    "frozenset": frozenset,
+    "int": int,
+    "len": len,
+    "list": list,
+    "map": map,
+    "max": max,
+    "min": min,
+    "range": range,
+    "reversed": reversed,
+    "round": round,
+    "set": set,
+    "sorted": sorted,
+    "str": str,
+    "sum": sum,
+    "tuple": tuple,
     "zip": zip,
-    "True": True, "False": False, "None": None,
+    "True": True,
+    "False": False,
+    "None": None,
 }
 
 

@@ -25,7 +25,7 @@ from atlantide.cli.console import console
 from atlantide.cli.errors import fail, fail_error
 from atlantide.cli.project import load_project
 from atlantide.components import fetch as fetch_mod
-from atlantide.components.lock import load_lock, write_lock
+from atlantide.components.lock import load_lock, toml_string, write_lock
 from atlantide.components.source import ComponentSource
 from atlantide.core import ComponentError
 
@@ -35,8 +35,18 @@ _T = TypeVar("_T")
 _ALIAS_RE = re.compile(r"[^0-9a-zA-Z_]+")
 
 
+def _root() -> Path:
+    """The project root, not the working directory.
+
+    ``load_project`` walks up to ``atlantide.toml``, so reads and writes must
+    agree on where that is; writing to cwd from a subdirectory would create a
+    second, shadowed project file.
+    """
+    return load_project(Path.cwd()).directory
+
+
 def _guard(action: Callable[..., _T], *args: object) -> _T:
-    """Run a fetch-layer call, turning any ``ComponentError`` into a clean CLI exit."""
+    """Run a fetch-layer call, turning any ``ComponentError`` into a CLI exit."""
     try:
         return action(*args)
     except ComponentError as exc:
@@ -54,11 +64,11 @@ def _default_alias(git: str) -> str:
 
 def _append_source(root: Path, alias: str, source: ComponentSource) -> None:
     """Append a ``[components.<alias>]`` block to ``atlantide.toml`` (create if absent)."""
-    lines = [f"\n[components.{alias}]", f'git = "{source.git}"']
+    lines = [f"\n[components.{alias}]", f"git = {toml_string(source.git)}"]
     if source.ref:
-        lines.append(f'ref = "{source.ref}"')
+        lines.append(f"ref = {toml_string(source.ref)}")
     if source.subdir:
-        lines.append(f'subdir = "{source.subdir}"')
+        lines.append(f"subdir = {toml_string(source.subdir)}")
     path = root / "atlantide.toml"
     existing = path.read_text() if path.exists() else ""
     path.write_text(existing + "\n".join(lines) + "\n")
@@ -82,12 +92,12 @@ def add(
     Imported from config as ``from atlantide.components.<alias> import ...``.
     """
     alias = alias or _default_alias(git)
-    root = Path.cwd()
+    root = _root()
     if alias in load_project(root).components:
         fail(f"component {alias!r} is already declared in atlantide.toml")
 
     source = ComponentSource(git=git, ref=ref, subdir=subdir)
-    # Fetch first so a bad repo/ref fails before we touch atlantide.toml.
+    # Fetch first so a bad repo/ref fails before touching atlantide.toml.
     entry = _guard(fetch_mod.fetch, alias, source, root)
     _append_source(root, alias, source)
     write_lock(root, {**load_lock(root), alias: entry})
@@ -100,7 +110,7 @@ def add(
 @app.command("lock")
 def lock() -> None:
     """Resolve every declared source's ref to an exact commit + content hash."""
-    root = Path.cwd()
+    root = _root()
     sources = load_project(root).components
     if not sources:
         console.print("[dim]no components declared in atlantide.toml[/]")
@@ -115,7 +125,7 @@ def lock() -> None:
 @app.command("vendor")
 def vendor() -> None:
     """Rematerialize .atlantis/components from atlantide.lock."""
-    root = Path.cwd()
+    root = _root()
     entries = load_lock(root)
     if not entries:
         fail("no atlantide.lock found; run `atlantide component lock` first")
@@ -127,7 +137,7 @@ def vendor() -> None:
 @app.command("verify")
 def verify() -> None:
     """Re-hash the vendored trees and check them against the lock (tamper/drift)."""
-    root = Path.cwd()
+    root = _root()
     entries = load_lock(root)
     if not entries:
         fail("no atlantide.lock found; nothing to verify")

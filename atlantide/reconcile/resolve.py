@@ -26,23 +26,23 @@ from atlantide.core.markers import (
 )
 from atlantide.core.node_id import field_scope, local_name_of, type_name_of
 from atlantide.core.resource import Resource
-from atlantide.core.types import Ref, SecretRef, StackOutputRef, Transform
+from atlantide.core.types import Ref, SecretRef, StackOutputRef, Transform, format_template
 from atlantide.reconcile.context import ApplyEnv, LiveOutputs
 from atlantide.secrets import (
     SecretsRegistry,
     is_secret_ref_marker,
     secret_ref_from_marker,
 )
-from atlantide.state.backend import StateNode
+from atlantide.state.backend import StateGraph, StateNode
 
 
 def resolve_value(value: Any, outputs: LiveOutputs, *, strict: bool = True) -> Any:
     """Replace Ref objects and ``{"$ref": "id#attr"}`` markers with real values.
 
-    ``strict`` (apply): a missing upstream output raises ``KeyError`` — deps always
-    resolve first, so absence is a bug. ``strict=False`` (rebuilding from *partial*
-    state): a missing output leaves the value a ``Ref`` — delete/read don't consume
-    cross-resource refs, so a dependency removed by a partial rollback is harmless.
+    ``strict`` (apply): a missing upstream output raises ``KeyError``; dependencies
+    always resolve first, so absence indicates an internal error. ``strict=False``
+    (rebuilding from partial state): a missing output leaves the value a ``Ref``,
+    which delete and read do not consume.
     """
 
     def lookup(node_id: str, attr: str, fallback: Any) -> Any:
@@ -63,15 +63,17 @@ def resolve_value(value: Any, outputs: LiveOutputs, *, strict: bool = True) -> A
             return lookup(ref.node_id, ref.attr, ref)
         return v
 
-    return tree_map(value, leaf, include_sets=False)
+    return tree_map(value, leaf)
 
 
 def _eval_transform(op: str, args: list[Any], outputs: LiveOutputs, *, strict: bool) -> Any:
     """Evaluate a deferred ``$transform`` once its operand refs resolve.
 
-    Operands are resolved through the same ``resolve_value`` path (so nested refs
-    and transforms work), then reduced by a fixed, pure op allowlist — never
-    arbitrary code, keeping apply deterministic.
+    Operands resolve through ``resolve_value``, so nested refs and transforms are
+    supported, then reduce through a fixed allowlist of pure ops. No arbitrary code
+    runs, so apply stays deterministic: ``interpolate`` reduces through
+    :func:`~atlantide.core.types.format_template` rather than ``str.format``,
+    whose field syntax walks attributes on live objects.
     """
     resolved = [resolve_value(arg, outputs, strict=strict) for arg in args]
     reducer = _TRANSFORM_OPS.get(op)
@@ -80,11 +82,11 @@ def _eval_transform(op: str, args: list[Any], outputs: LiveOutputs, *, strict: b
     return reducer(resolved)
 
 
-#: Pure reducers over already-resolved operands. Mirrors the ``lang`` op-allowlist
-#: pattern; every entry must be deterministic and side-effect free.
+#: Pure reducers over resolved operands. Every entry is deterministic and
+#: side-effect free.
 _TRANSFORM_OPS: dict[str, Callable[[list[Any]], Any]] = {
     "concat": lambda a: "".join(str(x) for x in a),
-    "interpolate": lambda a: str(a[0]).format(*a[1:]),
+    "interpolate": lambda a: format_template(str(a[0]), *a[1:]),
     "join": lambda a: str(a[0]).join(str(x) for x in a[1]),
 }
 
@@ -95,24 +97,37 @@ def needs_resolution(value: Any) -> bool:
     )
 
 
-def resolve_refs(res: Resource, outputs: LiveOutputs) -> Resource:
-    """A copy of ``res`` with every upstream-output Ref field resolved."""
+#: Sentinel a rewrite returns to leave a field untouched (``None`` is a value).
+_KEEP = object()
+
+
+def _updated_inputs(res: Resource, rewrite: Callable[[str, Any], Any]) -> Resource:
+    """A copy of ``res`` with each input field passed through ``rewrite``.
+
+    The shared shape behind the three resolution passes: ``rewrite`` returns the
+    replacement value, or :data:`_KEEP` to leave the field alone; the copy is
+    skipped entirely when nothing changed.
+    """
     updates = {
-        name: resolve_value(value, outputs)
+        name: replaced
         for name, value in res.input_values().items()
-        if needs_resolution(value)
+        if (replaced := rewrite(name, value)) is not _KEEP
     }
     return res.model_copy(update=updates) if updates else res
+
+
+def resolve_refs(res: Resource, outputs: LiveOutputs) -> Resource:
+    """A copy of ``res`` with every upstream-output Ref field resolved."""
+    return _updated_inputs(
+        res, lambda _, value: resolve_value(value, outputs) if needs_resolution(value) else _KEEP
+    )
 
 
 def resolve_secret_refs(res: Resource, secrets: SecretsRegistry) -> Resource:
     """Replace each ``SecretRef``-valued field with its resolved plaintext (in-memory)."""
-    updates = {
-        name: secrets.resolve(value)
-        for name, value in res.input_values().items()
-        if isinstance(value, SecretRef)
-    }
-    return res.model_copy(update=updates) if updates else res
+    return _updated_inputs(
+        res, lambda _, value: secrets.resolve(value) if isinstance(value, SecretRef) else _KEEP
+    )
 
 
 def resolve_stack_refs(
@@ -121,29 +136,32 @@ def resolve_stack_refs(
     """Replace each ``StackOutputRef`` field with the referenced stack's output.
 
     ``strict`` (apply) raises if the referenced output is absent; ``strict=False``
-    (rebuilding from partial state) leaves the handle — delete/read don't consume it.
+    (rebuilding from partial state) leaves the handle in place, which delete and
+    read do not consume.
     """
-    updates: dict[str, Any] = {}
-    for name, value in res.input_values().items():
+
+    def rewrite(_: str, value: Any) -> Any:
         if not isinstance(value, StackOutputRef):
-            continue
+            return _KEEP
         key = f"{value.stack}:{value.name}"
         if key in stack_outputs:
-            updates[name] = stack_outputs[key]
-        elif strict:
+            return stack_outputs[key]
+        if strict:
             raise ProviderError(
                 f"stack output {key!r} not found — apply stack {value.stack!r} first"
             )
-    return res.model_copy(update=updates) if updates else res
+        return _KEEP
+
+    return _updated_inputs(res, rewrite)
 
 
 def reconstruct(node: StateNode, env: ApplyEnv, outputs: LiveOutputs) -> Resource:
     """Rebuild a Resource from persisted state, resolving its handles.
 
-    ``$secret_ref`` and ``$stack_output`` markers become handle objects (which pass
-    validation); ``$ref`` markers resolve against outputs. Handles then resolve via
-    model_copy (secrets to plaintext, stack refs to values) — leniently, since
-    delete/read don't need a missing cross-stack value.
+    ``$secret_ref`` and ``$stack_output`` markers become handle objects, which pass
+    validation; ``$ref`` markers resolve against outputs. Handles then resolve to
+    values (secrets to plaintext, stack refs to committed outputs) leniently, since
+    delete and read do not require a missing cross-stack value.
     """
     cls = env.types.get(node.type)
     if cls is None:
@@ -160,9 +178,8 @@ def reconstruct(node: StateNode, env: ApplyEnv, outputs: LiveOutputs) -> Resourc
         return resolve_value(value, outputs, strict=False)
 
     props: dict[str, Any] = {key: rebuild(value) for key, value in node.properties.items()}
-    # Restore persisted outputs onto their (computed) fields so read/delete can use
-    # them — e.g. a generated value with no external store to re-read. Only fields
-    # the class declares, and not ones already set as inputs.
+    # Restore persisted outputs onto their computed fields so read/delete can use
+    # them. Declared fields only, excluding any already set as inputs.
     for key, value in node.outputs.items():
         if key in cls.model_fields and key not in props:
             props[key] = env.secrets.unseal(value)  # sensitive outputs are sealed at rest
@@ -175,9 +192,9 @@ def seal_outputs(
 ) -> dict[str, Any]:
     """Seal the ``sensitive`` string fields of ``outputs`` for persistence.
 
-    A no-op without install key material, so state stays byte-identical in
-    dev/tests. Only sensitive *computed* outputs (e.g. a generated password)
-    are sealed; ordinary outputs (arns, ids) persist in the clear.
+    A no-op without install key material, leaving state byte-identical. Only
+    sensitive computed outputs are sealed; ordinary outputs such as arns and ids
+    persist in the clear.
     """
     sensitive = set(sensitive_fields(cls))
     if not sensitive:
@@ -193,13 +210,23 @@ def unseal_outputs(outputs: dict[str, Any], secrets: SecretsRegistry) -> dict[st
     return {key: secrets.unseal(value) for key, value in outputs.items()}
 
 
+def live_outputs(prior: StateGraph, secrets: SecretsRegistry) -> LiveOutputs:
+    """Plaintext outputs of every recorded node, the seed ``Ref`` resolution needs.
+
+    Rows are sealed at rest and refs resolve against plaintext, so apply, refresh
+    and adopt each begin by unsealing the whole prior graph. Written once here so
+    that "sealed at rest, plaintext for resolution" is one statement rather than
+    three copies to keep in step.
+    """
+    return {nid: unseal_outputs(node.outputs, secrets) for nid, node in prior.nodes.items()}
+
+
 def sensitive_output_names(output_decls: dict[str, Any], env: ApplyEnv) -> frozenset[str]:
     """Declared-output names whose value derives from a ``sensitive`` field.
 
-    A declared export is sensitive when any Ref (live or marker form) it
-    contains points at a field the resource type marks ``sensitive=True`` —
-    e.g. a generated password's computed ``result``. An unknown type is
-    treated as sensitive (redact rather than leak).
+    A declared export is sensitive when any Ref it contains, in live or marker
+    form, points at a field the resource type marks ``sensitive=True``. An unknown
+    type is treated as sensitive so the value is redacted rather than exposed.
     """
     names: set[str] = set()
     for name, value in output_decls.items():
@@ -212,14 +239,12 @@ def sensitive_output_names(output_decls: dict[str, Any], env: ApplyEnv) -> froze
     return frozenset(names)
 
 
-def secret_digests(
-    res: Resource, node_id: str, secrets: SecretsRegistry
-) -> dict[str, str]:
+def secret_digests(res: Resource, node_id: str, secrets: SecretsRegistry) -> dict[str, str]:
     """Digest each resolved secret field's value for rotation detection.
 
     ``res`` is the apply-time resource with secret handles already resolved to
-    plaintext, so the digest tracks the value actually applied — never stored.
-    Uses the install's per-install salt via ``secrets``.
+    plaintext, so the digest tracks the applied value; the value itself is never
+    stored. Salted with the install salt held by ``secrets``.
     """
     raw = res.input_values()
     digests: dict[str, str] = {}

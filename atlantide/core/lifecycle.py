@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from atlantide.core.node_id import require_sequence
+
 
 @dataclass(frozen=True, slots=True)
 class Lifecycle:
@@ -33,5 +35,12 @@ class Lifecycle:
         # canonical tuple, so equality/hashing stay stable.
         for field in ("ignore_changes", "aliases"):
             value = getattr(self, field)
+            # A bare string would tuple into characters: the alias matches no
+            # state node and the rename lowers to a destroy plus a create.
+            require_sequence(
+                value,
+                f"Lifecycle.{field} must be a sequence of names, not the string {value!r}",
+                f"use a tuple or list, e.g. ({value!r},)",
+            )
             if not isinstance(value, tuple):
                 object.__setattr__(self, field, tuple(value))

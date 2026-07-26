@@ -4,23 +4,14 @@ from __future__ import annotations
 
 import boto3
 import pytest
-from moto import mock_aws
 
 from atlantide.core import Context, Stack, region
 from atlantide.core.errors import ProviderError
 from atlantide.providers.aws import AwsAlias, AwsProvider, S3Bucket
 from atlantide.providers.aws.handlers import HANDLERS
-from tests.support import cloud_env_fixture
+from tests.support import aws_fixture
 
-aws_env = cloud_env_fixture(
-    {
-        "AWS_ACCESS_KEY_ID": "testing",
-        "AWS_SECRET_ACCESS_KEY": "testing",
-        "AWS_DEFAULT_REGION": "us-east-1",
-    },
-    region="us-east-1",
-    mock_factory=mock_aws,
-)
+aws_env = aws_fixture(region="us-east-1")
 
 
 def test_region_subscope_overrides_stack_region() -> None:

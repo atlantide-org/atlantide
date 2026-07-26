@@ -1,5 +1,10 @@
 # Project defaults — run `atlantide plan|apply|destroy` from examples/ with no flags.
-config = "aws/infra.py"
-state = "aws/infra.db"
+#
+# This points at example-two, not the example-one flagship: `LambdaFunction.code_path`
+# resolves against the working directory, so example-one's `code_path = "processor"`
+# only resolves from examples/aws/. That directory has its own atlantide.toml, which
+# shadows this one whenever you run from there — see examples/aws/README.md.
+config = "aws/example-two.py"
+state = "aws/example-two.db"
 secrets_key = "aws/atlantide.key"        # secrets-store encryption keyfile
 secrets_store = "aws/atlantide.secrets"  # encrypted name->value store

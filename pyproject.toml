@@ -4,12 +4,39 @@ build-backend = "hatchling.build"
 
 [project]
 name = "atlantide"
-version = "0.1.0"
+version = "0.2.0"
 description = "Typed Python IaC engine: deterministic Atlas-lang config, graph state, parallel reconciliation"
-readme = "PLAN.md"
+readme = "README.md"
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
+keywords = [
+    "infrastructure-as-code", "iac", "aws", "terraform", "pulumi",
+    "devops", "cloud", "provisioning", "deterministic",
+]
+# PyPI's facets are the only way anyone finds this by browsing rather than by
+# name. "4 - Beta" is a claim about stability, not completeness: the state
+# format has a versioned forward migration, but it can still change between
+# minor releases.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: System :: Installation/Setup",
+    "Topic :: System :: Systems Administration",
+    "Typing :: Typed",
+]
 dependencies = [
     "pydantic>=2.7",
     "typer>=0.12",
@@ -17,13 +44,34 @@ dependencies = [
     "returns>=0.23",
     "boto3>=1.34",
     "cryptography>=42",
+    # `typing.override` is 3.12+; the floor here is 3.11. Declared directly rather
+    # than leaned on transitively through pydantic, because `@override` is load
+    # bearing at runtime import time in every provider handler.
+    "typing-extensions>=4.4",
 ]
+
+[project.urls]
+Homepage = "https://github.com/atlantide-org/atlantide"
+Documentation = "https://atlantide-org.github.io/"
+Repository = "https://github.com/atlantide-org/atlantide"
+# The releases page, not a CHANGELOG.md: `release.yml` cuts a GitHub Release for
+# every `v*` tag, so this is true with no upkeep.
+Changelog = "https://github.com/atlantide-org/atlantide/releases"
+Issues = "https://github.com/atlantide-org/atlantide/issues"
+
+# The built-in providers are discovered exactly as a third-party one is. A door
+# only the shipped providers can walk through is a door nobody tests.
+[project.entry-points."atlantide.providers"]
+aws = "atlantide.providers.aws:PLUGIN"
+local = "atlantide.providers.local:PLUGIN"
+random = "atlantide.providers.random:PLUGIN"
 
 [project.scripts]
 atlantide = "atlantide.cli.main:main"
 
 [project.optional-dependencies]
 build = ["pyinstaller>=6.6"]
+postgres = ["psycopg[binary]>=3.1"]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
@@ -35,6 +83,7 @@ dev = [
     "moto>=5",
     "boto3-stubs[s3]>=1.34",
     "pre-commit>=3",
+    "testcontainers[postgres]>=4.8",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -45,6 +94,50 @@ python_version = "3.11"
 strict = true
 packages = ["atlantide"]
 plugins = ["returns.contrib.mypy.returns_plugin"]
+
+# Beyond `strict`, which leaves these off by default.
+#
+# `warn_unreachable` and `extra_checks` both cost nothing here — the package was
+# already clean under them — and both catch a class of change that otherwise
+# lands silently: a narrowed branch that can no longer be entered, and a
+# variance/TypedDict mistake that only shows up at a call site far away.
+warn_unreachable = true
+extra_checks = true
+
+# `truthy-bool` is the one that paid for itself immediately: a `Result` has no
+#   `__bool__`, so `if not result:` is always false and the error branch behind it
+#   is dead. That is invisible in review and in tests that only cover the happy
+#   path — the failure surfaces as `unwrap`'s bare `UnwrapFailedError`.
+# `explicit-override` makes a subclass say it is overriding, so renaming a base
+#   method turns every stale subclass into an error instead of a method nobody
+#   calls any more. With this many provider handlers that is the likeliest way to
+#   silently lose behaviour.
+# `possibly-undefined`, `truthy-iterable` and `ignore-without-code` were all
+#   already clean; they are here to stay that way.
+#
+# Deliberately NOT enabled:
+# `redundant-expr` — every hit is a defensive `isinstance` guarding a value that
+#   arrives from an untyped source (config evaluation, a state file). The
+#   annotation states the intended contract; the guard enforces it at runtime.
+#   Silencing it would mean widening those signatures and losing the contract.
+# `mutable-override` — handler subclasses narrow `resource_type` from
+#   `ClassVar[type[Resource]]` to their own type, which is the whole point of the
+#   handler being generic over one resource.
+# `unused-awaitable` — fires on `tg.create_task(...)` inside `async with
+#   asyncio.TaskGroup()`, where the group is what awaits the task. Correct code.
+enable_error_code = [
+    "explicit-override",
+    "ignore-without-code",
+    "possibly-undefined",
+    "truthy-bool",
+    "truthy-iterable",
+]
+
+# psycopg ships with the optional `postgres` extra; the backend that imports it
+# guards the import and treats the driver as untyped either way.
+[[tool.mypy.overrides]]
+module = ["psycopg", "psycopg.*"]
+ignore_missing_imports = true
 
 [tool.ruff]
 target-version = "py311"

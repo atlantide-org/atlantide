@@ -12,7 +12,7 @@ from __future__ import annotations
 from returns.pipeline import is_successful
 
 from atlantide.core.registry import ProviderRegistry
-from atlantide.core.resource import ResourceRegistry
+from atlantide.core.resource import DataSource, ResourceRegistry
 from atlantide.ir.model import IRGraph, IRNode
 
 
@@ -40,6 +40,8 @@ def lower(registry: ResourceRegistry, providers: ProviderRegistry | None = None)
                 create_before_destroy=lifecycle.create_before_destroy,
                 ignore_changes=lifecycle.ignore_changes,
                 aliases=lifecycle.aliases,
+                depends_on=resource.depends_on,
+                kind="data" if isinstance(resource, DataSource) else "resource",
             )
         )
     return IRGraph(nodes=tuple(nodes))

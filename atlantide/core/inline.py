@@ -18,6 +18,7 @@ already applied) is left untouched, keeping the committed-outputs path.
 
 from __future__ import annotations
 
+from itertools import chain
 from typing import Any
 
 from returns.result import Failure
@@ -62,6 +63,10 @@ def inline_stack_outputs(registry: ResourceRegistry) -> ResourceRegistry:
         rebuilt.add_output(key, value)
     for binding in registry.policy_bindings:
         rebuilt.add_policy_binding(binding)
+    # Every carried field must survive the rebuild; dropping the consumed
+    # config inputs made `Compiled.inputs` empty for exactly the configs that
+    # use an in-config StackReference.
+    rebuilt.inputs = dict(registry.inputs)
     return rebuilt
 
 
@@ -108,16 +113,12 @@ def _key(ref: StackOutputRef) -> str:
 
 
 def _has_inconfig_ref(value: Any, outputs: dict[str, Any]) -> bool:
-    return tree_any(
-        value, lambda v: isinstance(v, StackOutputRef) and _key(v) in outputs
-    )
+    return tree_any(value, lambda v: isinstance(v, StackOutputRef) and _key(v) in outputs)
 
 
 def _has_any_inconfig_ref(resources: list[Resource], outputs: dict[str, Any]) -> bool:
-    in_inputs = any(
-        _has_inconfig_ref(value, outputs)
-        for res in resources
-        for value in res.input_values().values()
+    values = chain(
+        (value for res in resources for value in res.input_values().values()),
+        outputs.values(),
     )
-    in_outputs = any(_has_inconfig_ref(value, outputs) for value in outputs.values())
-    return in_inputs or in_outputs
+    return any(_has_inconfig_ref(value, outputs) for value in values)

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from atlantide.core.errors import RegistryError
+from atlantide.core.errors import AtlantideError, RegistryError
 
 #: Resource and stack names: a letter, then letters/digits/``_``/``-``.
 IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
@@ -17,9 +17,22 @@ IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 def require_identifier(name: str, kind: str) -> None:
     """Validate a resource/stack name, raising :class:`RegistryError` if invalid."""
     if not IDENTIFIER_RE.match(name):
-        raise RegistryError(
-            f"invalid {kind} name {name!r}: must match {IDENTIFIER_RE.pattern}"
-        )
+        raise RegistryError(f"invalid {kind} name {name!r}: must match {IDENTIFIER_RE.pattern}")
+
+
+def require_sequence(
+    value: object, what: str, hint: str, *, exc: type[AtlantideError] = RegistryError
+) -> None:
+    """Reject a bare string where a sequence of strings is expected.
+
+    ``tuple("abc")`` is ``('a', 'b', 'c')`` — indistinguishable downstream from
+    three deliberate entries, so the mistake must be caught at the boundary.
+    ``what`` is the full "X must be a sequence…" clause and ``hint`` the remedy;
+    they are joined as ``"{what} — {hint}"`` so each call site keeps its exact
+    message text. ``exc`` picks the site's error family (registry vs IR).
+    """
+    if isinstance(value, str):
+        raise exc(f"{what} — {hint}")
 
 
 def format_node_id(stack: str, type_name: str, name: str) -> str:

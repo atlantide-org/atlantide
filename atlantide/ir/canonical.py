@@ -10,9 +10,12 @@ Object keys are sorted by Unicode code point; floats use Python's shortest
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from typing import Any
+
+from pydantic import BaseModel
 
 from atlantide.core.errors import IRError
 
@@ -29,7 +32,7 @@ def _encode(value: Any, path: str) -> str:
     """Encode one value. ``path`` locates ``value`` in the tree for error messages."""
     if value is None:
         return "null"
-    # bool is a subclass of int, so it MUST be checked before the int branch.
+    # bool is a subclass of int, so it must be checked before the int branch.
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
@@ -42,6 +45,13 @@ def _encode(value: Any, path: str) -> str:
         return _encode_object(value, path)
     if isinstance(value, list | tuple):
         return _encode_array(value, path)
+    if isinstance(value, BaseModel):
+        # A nested pydantic model — a structured field such as a security-group
+        # rule. Encoded as the mapping it describes, so a provider author can
+        # give a field a real type instead of an untyped dict and still get a
+        # stable hash. `mode="json"` normalises enums and dates the same way a
+        # plain value would be.
+        return _encode_object(value.model_dump(mode="json"), path)
     raise IRError(f"value of type {type(value).__name__} at {path} is not JSON-encodable")
 
 
@@ -63,3 +73,13 @@ def _encode_object(obj: dict[Any, Any], path: str) -> str:
             raise IRError(f"object key {key!r} at {path} is not a string")
         parts.append(json.dumps(key, ensure_ascii=False) + ":" + _encode(obj[key], f"{path}.{key}"))
     return "{" + ",".join(parts) + "}"
+
+
+def canonical_sha256(value: Any) -> str:
+    """Hex SHA-256 of ``value``'s canonical encoding.
+
+    The one hash both the IR identity (:func:`~atlantide.ir.hash.hash_ir`) and
+    the per-node Merkle digests are built from, so they cannot disagree on what
+    "the canonical bytes" are.
+    """
+    return hashlib.sha256(to_canonical_json(value)).hexdigest()

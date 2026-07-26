@@ -61,3 +61,9 @@ out.atlas
 atlantide.key
 atlantide.secrets
 .atlantis/
+
+# `atlantide state backup` writes here by default when run in the repo root.
+*.atlas-state
+
+# token-savior index
+.token-savior-cache.json

@@ -1,11 +1,18 @@
-# Local gate mirroring CI (ruff -> mypy -> import contracts).
+# Local gate mirroring CI (ruff format -> ruff check -> mypy -> import contracts).
 # Install once with: uv run pre-commit install
-# NOTE: `ruff format` is intentionally NOT enforced — the codebase uses manual
-# alignment in places (e.g. operator tables); adopt it as a deliberate one-time
-# reformat if desired, then add a ruff-format hook here + a --check step in CI.
+#
+# `ruff format` was adopted in one deliberate pass. It had been held back because
+# a few places used manual alignment (operator tables and the like); enforcing it
+# is the cheaper trade than re-arguing the question in every review.
 repos:
   - repo: local
     hooks:
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types: [python]
+        require_serial: true
       - id: ruff-check
         name: ruff check
         entry: uv run ruff check --fix

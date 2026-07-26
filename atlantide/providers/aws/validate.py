@@ -81,6 +81,42 @@ def one_of(options: Iterable[str], label: str) -> Validator:
     return run
 
 
+#: One DNS label: alphanumeric, inner hyphens, 1-63 characters.
+_LABEL = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+
+#: A dotted name of two or more labels, optionally wildcarded (``*.example.com``,
+#: which ACM accepts) and optionally fully qualified with a trailing dot (which
+#: Route53 accepts). Two labels are the minimum that makes it a *domain* rather
+#: than a bare word — which is the shape a composed ``name_prefix`` produces.
+_DOMAIN = re.compile(rf"^(?:\*\.)?{_LABEL}(?:\.{_LABEL})+\.?$")
+
+
+def domain_name(label: str = "domain name") -> Validator:
+    """A dotted DNS name, e.g. ``example.com``, ``*.example.com``, ``example.com.``.
+
+    Worth checking rather than leaving to AWS, because the value can arrive
+    without anyone having typed it: a resource whose name field is
+    ``physical_name`` and omitted under a ``name_prefix`` stack has one composed
+    for it (``{prefix}-{name}-{stack}``), and that composition is a perfectly good
+    *resource* name and never a domain. Caught at plan, it names the field; left
+    to apply, it is an ACM or Route53 error about a name the config does not
+    contain.
+    """
+    pattern = _DOMAIN
+
+    def run(value: str) -> str | None:
+        if len(value) > 253:
+            return f"{label} {value!r} exceeds the 253-character limit"
+        if not pattern.match(value):
+            return (
+                f"invalid {label} {value!r}: expected a dotted name such as "
+                f"'example.com' (a name composed from a stack's name_prefix is not one)"
+            )
+        return None
+
+    return run
+
+
 def ipv4_cidr(label: str = "CIDR") -> Validator:
     """An ``A.B.C.D/M`` block with octets 0-255 and a 0-32 prefix."""
     pattern = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}/(?:\d|[12]\d|3[0-2])$")

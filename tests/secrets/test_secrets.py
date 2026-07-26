@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 
 import pytest
 
@@ -11,6 +12,7 @@ from atlantide.core.errors import SecretsError
 from atlantide.secrets import (
     EnvSecretsProvider,
     KeyfileValueStore,
+    SecretsProvider,
     SecretsRegistry,
     is_secret_ref_marker,
     secret_digest,
@@ -58,6 +60,46 @@ def test_store_reopens_with_same_key(tmp_path: object) -> None:
     paths = (os.path.join(base, "s.enc"), os.path.join(base, "s.key"))
     KeyfileValueStore(*paths).set("k", "v")
     assert KeyfileValueStore(*paths).resolve("k") == "v"  # separate instance, same files
+
+
+def test_store_save_fsyncs_the_temp_file(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The store file is the only copy of every secret: the temp file must hit
+    disk before it replaces the store, or a power loss leaves it empty."""
+    synced: list[int] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        synced.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    store = _store(tmp_path)
+    store.set("k", "v")
+    assert synced  # at least the temp file (and best-effort the directory)
+    assert store.resolve("k") == "v"
+
+
+def test_concurrent_writers_lose_no_secrets(tmp_path: object) -> None:
+    """Two CLI writes racing over load-modify-save must both survive; without
+    the store lock one write silently vanishes."""
+    base = str(tmp_path)  # type: ignore[arg-type]
+    paths = (os.path.join(base, "s.enc"), os.path.join(base, "s.key"))
+    KeyfileValueStore(*paths).set("seed", "0")  # the keyfile exists up front
+
+    barrier = threading.Barrier(2)
+
+    def writer(prefix: str) -> None:
+        store = KeyfileValueStore(*paths)  # separate instance, as two CLIs are
+        barrier.wait()
+        for i in range(10):
+            store.set(f"{prefix}/{i}", str(i))
+
+    threads = [threading.Thread(target=writer, args=(p,)) for p in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(KeyfileValueStore(*paths).names()) == 21  # seed + 2 x 10, none lost
 
 
 # -- env provider ------------------------------------------------------------
@@ -117,3 +159,76 @@ def test_secret_ref_marker_roundtrip() -> None:
     assert is_secret_ref_marker(marker)
     assert not is_secret_ref_marker({"$ref": "a#b"})
     assert secret_ref_from_marker(marker) == ref
+
+
+# -- preflight ---------------------------------------------------------------
+
+
+def test_check_reports_an_empty_project_as_fine(tmp_path: object) -> None:
+    """No store yet is not a failure — a project may simply have no secrets."""
+    result = _store(tmp_path).check()
+    assert result.status == "ok"
+    assert "no store yet" in result.detail
+
+
+def test_check_counts_stored_secrets(tmp_path: object) -> None:
+    store = _store(tmp_path)
+    store.set("a", "1")
+    store.set("b", "2")
+    result = store.check()
+    assert result.status == "ok"
+    assert "2 secret(s)" in result.detail
+
+
+def test_check_catches_a_store_written_under_another_key(tmp_path: object) -> None:
+    """The failure this exists for: a keyfile not shared, or regenerated after loss.
+
+    Resolution only happens mid-apply, where the symptom is every secret being
+    unreadable and nothing naming the cause.
+    """
+    base = str(tmp_path)  # type: ignore[arg-type]
+    original = _store(tmp_path, "shared")
+    original.set("token", "abc")
+    # Same store file, a key that never encrypted it.
+    stranger = KeyfileValueStore(os.path.join(base, "shared.enc"), os.path.join(base, "other.key"))
+    result = stranger.check()
+    assert result.status == "fail"
+    assert "keyfile" in result.detail
+
+
+def test_check_reports_a_corrupt_store(tmp_path: object) -> None:
+    store = _store(tmp_path)
+    store.set("a", "1")
+    with open(os.path.join(str(tmp_path), "s.enc"), "wb") as fh:  # type: ignore[arg-type]
+        fh.write(b"not ciphertext")
+    assert store.check().status == "fail"
+
+
+def test_env_provider_reports_itself_usable() -> None:
+    assert EnvSecretsProvider().check().status == "ok"
+
+
+def test_a_provider_without_a_name_is_rejected_at_registration() -> None:
+    """``name`` is a ClassVar the ABC declares but cannot enforce, so registration
+    is where a provider that never set one has to be caught — and named."""
+
+    class Nameless(SecretsProvider):
+        def resolve(self, name: str) -> str:
+            return "x"
+
+    with pytest.raises(SecretsError, match="declares no name"):
+        SecretsRegistry().register(Nameless())
+
+
+def test_a_provider_without_a_check_says_so() -> None:
+    """The ABC default must not claim a pass it did not earn."""
+
+    class Custom(SecretsProvider):
+        name = "custom"
+
+        def resolve(self, name: str) -> str:
+            return "x"
+
+    result = Custom().check()
+    assert result.status == "skip"
+    assert result.name == "secrets: custom"

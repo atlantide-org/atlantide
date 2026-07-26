@@ -8,10 +8,20 @@ validation record whose name/type/value are surfaced as computed outputs.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
-from atlantide.core.errors import ProviderError
-from atlantide.providers.aws.handlers.base import AwsHandler, ignore_missing, known_id, tag_list
+from typing_extensions import override
+
+from atlantide.providers.aws.handlers.base import (
+    AwsHandler,
+    ignore_missing,
+    known_id,
+    sync_tags,
+    tag_list,
+    tags_from_list,
+)
+from atlantide.providers.aws.handlers.faults import absent_ok, not_found
 from atlantide.providers.aws.region import Region
 from atlantide.providers.aws.resources import AcmCertificate
 
@@ -19,14 +29,22 @@ from atlantide.providers.aws.resources import AcmCertificate
 class AcmCertificateHandler(AwsHandler[AcmCertificate]):
     service = "acm"
     resource_type = AcmCertificate
+    identity_field = "arn"
 
+    @override
     def region(self, res: AcmCertificate) -> str:
         return Region.UsEast1  # CloudFront viewer certificates must live in us-east-1
 
+    @override
     def create(self, client: Any, res: AcmCertificate) -> dict[str, Any]:
+        # A certificate has no name to look it up by, so a retried create cannot
+        # adopt the way the other handlers do; ACM's idempotency token returns the
+        # same certificate instead. The provider's `_retrying` reissues this call
+        # on transient failures.
         request: dict[str, Any] = {
             "DomainName": res.domain_name,
             "ValidationMethod": res.validation_method,
+            "IdempotencyToken": _idempotency_token(res.node_id),
         }
         if res.subject_alternative_names:
             request["SubjectAlternativeNames"] = res.subject_alternative_names
@@ -35,32 +53,52 @@ class AcmCertificateHandler(AwsHandler[AcmCertificate]):
         arn = client.request_certificate(**request)["CertificateArn"]
         return {"arn": arn, **_validation_record(client, arn, res.domain_name)}
 
+    @override
     def read(self, client: Any, res: AcmCertificate) -> dict[str, Any] | None:
-        arn = known_id(res, "arn")
+        arn = known_id(res, self.identity_field)
         if arn is None:
             return None
-        try:
-            client.describe_certificate(CertificateArn=arn)
-        except client.exceptions.ClientError:
+        if absent_ok(lambda: client.describe_certificate(CertificateArn=arn)) is None:
             return None
         return {"arn": arn, **_validation_record(client, arn, res.domain_name)}
 
+    @override
     def update(self, client: Any, prior: dict[str, Any], res: AcmCertificate) -> dict[str, Any]:
-        arn = prior.get("arn") or known_id(res, "arn")
+        arn = prior.get(self.identity_field) or known_id(res, self.identity_field)
         if arn is None:  # update only runs on an existing (already-requested) cert
-            raise ProviderError(
-                "AcmCertificate not found", op="update", resource_type=res.type_name()
-            )
-        if res.tags:
-            client.add_tags_to_certificate(CertificateArn=arn, Tags=tag_list(res.tags))
+            raise not_found(res, "update")
+        # ACM removes tags by whole object rather than by key, which is why the
+        # untag callback is handed the live tags alongside the stale keys.
+        sync_tags(
+            res.tags,
+            live=lambda: tags_from_list(
+                client.list_tags_for_certificate(CertificateArn=arn).get("Tags", [])
+            ),
+            untag=lambda stale, live: client.remove_tags_from_certificate(
+                CertificateArn=arn, Tags=[{"Key": key, "Value": live[key]} for key in stale]
+            ),
+            tag=lambda tags: client.add_tags_to_certificate(
+                CertificateArn=arn, Tags=tag_list(tags)
+            ),
+        )
         return {"arn": arn, **_validation_record(client, arn, res.domain_name)}
 
+    @override
     def delete(self, client: Any, res: AcmCertificate) -> None:
-        arn = known_id(res, "arn")
+        arn = known_id(res, self.identity_field)
         if arn is None:
             return
         with ignore_missing():
             client.delete_certificate(CertificateArn=arn)
+
+
+def _idempotency_token(node_id: str) -> str:
+    """A stable ACM idempotency token for one node.
+
+    ACM allows 1-32 alphanumeric characters, so the node id — which carries colons
+    and dots and is often longer — is hashed rather than passed through.
+    """
+    return hashlib.sha256(node_id.encode("utf-8")).hexdigest()[:32]
 
 
 def _validation_record(client: Any, arn: str, domain: str) -> dict[str, str]:

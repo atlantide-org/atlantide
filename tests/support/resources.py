@@ -17,6 +17,19 @@ from atlantide.core import (
     mutable,
     secret,
 )
+from atlantide.core.resource import Nested
+
+
+class NestedValue(Nested):
+    """A structured value inside a resource field, like a real `SgRule`.
+
+    The walkers have to see through a model boundary to find a `Ref` inside it —
+    that is what makes a route depend on the gateway it points at. Generated
+    trees embed this so the property covers the case a plain dict does not.
+    """
+
+    label: str = ""
+    value: object = None
 
 
 class _TestResource(Resource):
@@ -33,6 +46,16 @@ class Box(_TestResource):
     label: str = mutable(default="")
     ref: str = mutable(default="")
     out: str = computed()
+
+
+class Grouped(_TestResource):
+    """Holds a set-valued property (IR determinism tests).
+
+    A set has no order, so lowering one has to impose one — otherwise the
+    canonical IR, and every hash derived from it, depends on PYTHONHASHSEED.
+    """
+
+    members: set[str] = mutable(default_factory=set)
 
 
 class Bucket(_TestResource):

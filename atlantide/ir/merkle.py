@@ -18,10 +18,9 @@ unchanged; no apply-time recompute is required.
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Sequence
 
-from atlantide.ir.canonical import to_canonical_json
+from atlantide.ir.canonical import canonical_sha256
 from atlantide.ir.model import IRGraph
 
 
@@ -32,7 +31,7 @@ def merkle_hashes(ir: IRGraph, topo_order: Sequence[str]) -> dict[str, str]:
     for node_id in topo_order:
         node = by_id[node_id]
         # ``ignore_changes`` fields are excluded so drift in them never moves the
-        # hash (and thus never triggers UPDATE/REPLACE) — the diff drops them too.
+        # hash, and so never triggers an UPDATE or REPLACE. The diff drops them too.
         ignored = set(node.ignore_changes)
         properties = (
             {k: v for k, v in node.properties.items() if k not in ignored}
@@ -44,5 +43,5 @@ def merkle_hashes(ir: IRGraph, topo_order: Sequence[str]) -> dict[str, str]:
             "properties": properties,
             "deps": [hashes[dep] for dep in sorted(node.dependencies)],
         }
-        hashes[node_id] = hashlib.sha256(to_canonical_json(payload)).hexdigest()
+        hashes[node_id] = canonical_sha256(payload)
     return hashes

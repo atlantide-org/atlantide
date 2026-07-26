@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from atlantide.core import PolicyBinding, PolicyLevel
 from atlantide.ir import Artifact, build_artifact, loads
 from atlantide.ir.model import IRGraph, IRNode
 
@@ -44,3 +45,27 @@ def test_component_pins_default_empty() -> None:
 def test_plain_construction_defaults_pins() -> None:
     artifact = Artifact(ir=_ir(), ir_hash="h", provider_pins={})
     assert artifact.component_pins == {}
+
+
+def _binding(**params: object) -> PolicyBinding:
+    return PolicyBinding(
+        name="deny-destroy-in-protected", level=PolicyLevel.MANDATORY, params=params
+    )
+
+
+def test_policy_params_survive_roundtrip() -> None:
+    """A deploy runs from the artifact alone, so a binding's arguments have to
+    travel with it — otherwise the guard silently protects nothing."""
+    artifact = build_artifact(_ir(), (_binding(stacks=["prod", "staging"]),), {})
+    reloaded = loads(artifact.dumps()).unwrap()
+
+    assert reloaded.policies[0].params == {"stacks": ["prod", "staging"]}
+    assert reloaded == artifact
+
+
+def test_policy_params_default_empty() -> None:
+    artifact = build_artifact(_ir(), (_binding(),), {})
+    assert artifact.policies[0].params == {}
+    # Artifacts written before bindings carried params still load.
+    legacy = artifact.dumps().replace('"params": {},\n      ', "")
+    assert loads(legacy).unwrap().policies[0].params == {}

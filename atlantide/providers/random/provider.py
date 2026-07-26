@@ -14,6 +14,8 @@ from datetime import UTC, datetime
 from secrets import choice, token_hex
 from typing import Any, ClassVar
 
+from typing_extensions import override
+
 from atlantide.core import Context, Provider, Resource
 from atlantide.core.errors import ProviderError
 from atlantide.providers.random.resources import Id, Password, Timestamp, Uuid
@@ -25,18 +27,23 @@ class RandomProvider(Provider):
     name: ClassVar[str] = "random"
     version: ClassVar[str] = "1.0.0"
 
+    @override
     async def create(self, ctx: Context, res: Resource) -> dict[str, Any]:
         return {"result": _generate(res)}
 
+    @override
     async def read(self, ctx: Context, res: Resource) -> dict[str, Any] | None:
         # No external system; echo the pinned value (restored onto res from state).
         result = getattr(res, "result", None)
         return {"result": result} if isinstance(result, str) else None
 
+    @override
     async def update(self, ctx: Context, prior: dict[str, Any], res: Resource) -> dict[str, Any]:
-        # All inputs are immutable, so a change is a REPLACE — update just keeps the value.
+        # All inputs are immutable, so a change is a REPLACE; update returns the
+        # pinned value unchanged.
         return dict(prior)
 
+    @override
     async def delete(self, ctx: Context, res: Resource) -> None:
         return None
 

@@ -6,9 +6,9 @@ and a content hash of the vendored tree. It is the reproducibility contract —
 ``vendor``/``verify`` rematerialize and re-check against it, mirroring how a
 ``.atlas`` artifact pins provider versions.
 
-Generated, not hand-edited. Stdlib reads TOML but cannot write it, so the small,
-fixed shape here is emitted by hand; values (git URLs, hex commits, ``sha256:``
-hashes) never contain a double quote, so no escaping is needed.
+Generated, not hand-edited. Stdlib reads TOML but cannot write it, so the fixed
+shape here is emitted by hand; values (git URLs, hex commits, ``sha256:`` hashes)
+never contain a double quote, so no escaping is needed.
 """
 
 from __future__ import annotations
@@ -16,6 +16,8 @@ from __future__ import annotations
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+
+from atlantide.core.errors import ComponentError
 
 LOCKFILE = "atlantide.lock"
 
@@ -38,8 +40,12 @@ def lock_path(project_root: Path) -> Path:
 
 
 def load_lock(project_root: Path) -> dict[str, LockEntry]:
-    """Read ``atlantide.lock``; returns ``{}`` when absent. Malformed entries are
-    skipped (a partial lock still mounts the entries that are well-formed)."""
+    """Read ``atlantide.lock``; returns ``{}`` when absent.
+
+    A malformed entry raises rather than being skipped: the lock is what pins a
+    vendored tree's hash, and silently dropping an entry would leave that alias
+    mounted and importable with no verification at all.
+    """
     path = lock_path(project_root)
     if not path.is_file():
         return {}
@@ -47,11 +53,13 @@ def load_lock(project_root: Path) -> dict[str, LockEntry]:
         tables = tomllib.load(fh).get("components")
     if not isinstance(tables, dict):
         return {}
-    return {
-        alias: _entry_from_toml(body)
-        for alias, body in tables.items()
-        if _is_lock_entry(body)
-    }
+    for alias, body in tables.items():
+        if not _is_lock_entry(body):
+            raise ComponentError(
+                f"component {alias!r}: malformed entry in {LOCKFILE} (needs string "
+                "git/commit/hash); re-run `atlantide component fetch` to regenerate it"
+            )
+    return {alias: _entry_from_toml(body) for alias, body in tables.items()}
 
 
 def write_lock(project_root: Path, entries: dict[str, LockEntry]) -> None:
@@ -77,13 +85,30 @@ def _entry_from_toml(body: dict[str, object]) -> LockEntry:
     )
 
 
+def toml_string(value: str) -> str:
+    """``value`` as a TOML basic string, escaped.
+
+    Values arrive from a git URL or a ``--ref`` flag; an unescaped quote or
+    newline closes the string early and injects arbitrary TOML, such as a
+    ``[state]`` table redirecting the project at another backend.
+    """
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+    return f'"{escaped}"'
+
+
 def _entry_to_toml(alias: str, entry: LockEntry) -> str:
     lines = [
         f"[components.{alias}]",
-        f'git = "{entry.git}"',
-        f'commit = "{entry.commit}"',
-        f'hash = "{entry.hash}"',
+        f"git = {toml_string(entry.git)}",
+        f"commit = {toml_string(entry.commit)}",
+        f"hash = {toml_string(entry.hash)}",
     ]
     if entry.subdir is not None:
-        lines.append(f'subdir = "{entry.subdir}"')
+        lines.append(f"subdir = {toml_string(entry.subdir)}")
     return "\n".join(lines) + "\n"

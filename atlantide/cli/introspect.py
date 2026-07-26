@@ -7,11 +7,16 @@ Reads off the pydantic model and its atlantide field metadata
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, get_args, get_origin
+from typing import Annotated, Any, get_args, get_origin
 
+import typer
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined
+from rich.table import Table
 
+from atlantide.cli.console import console
+from atlantide.cli.errors import fail
+from atlantide.cli.render import MUT_COLOR
 from atlantide.core.fields import Mutability, field_mutability, is_sensitive
 from atlantide.core.resource import Resource
 from atlantide.providers import aws, local, random
@@ -77,3 +82,52 @@ def schema_rows(cls: type[Resource]) -> list[FieldRow]:
             )
         )
     return rows
+
+
+# -- the commands that render the above ---------------------------------------
+
+app = typer.Typer()
+
+
+@app.command()
+def resources() -> None:
+    """List every resource type across the built-in providers."""
+    types = all_types()
+    table = Table(title="Resource types")
+    table.add_column("type", style="bold")
+    table.add_column("provider")
+    table.add_column("fields", justify="right")
+    for type_name in sorted(types):
+        cls = types[type_name]
+        table.add_row(type_name, cls.provider_name() or "-", str(len(schema_rows(cls))))
+    console.print(table)
+
+
+@app.command()
+def schema(
+    type_name: Annotated[str, typer.Argument(help="Resource type, e.g. aws.S3Bucket.")],
+) -> None:
+    """Show the fields of one resource type (type, mutability, default, sensitivity)."""
+    types = all_types()
+    cls = types.get(type_name)
+    if cls is None:
+        available = ", ".join(sorted(types))
+        fail(f"unknown type {type_name!r}. Available: {available}")
+    table = Table(title=type_name)
+    table.add_column("field", style="bold")
+    table.add_column("type")
+    table.add_column("mutability")
+    table.add_column("required")
+    table.add_column("default")
+    table.add_column("sensitive")
+    for row in schema_rows(cls):
+        color = MUT_COLOR[row.mutability]
+        table.add_row(
+            row.name,
+            row.type,
+            f"[{color}]{row.mutability.value}[/]",
+            "yes" if row.required else "",
+            row.default,
+            "yes" if row.sensitive else "",
+        )
+    console.print(table)

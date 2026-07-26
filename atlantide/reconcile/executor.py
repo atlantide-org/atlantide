@@ -22,17 +22,35 @@ Refs are resolved to concrete upstream outputs just before each provider call.
 
 from __future__ import annotations
 
-import contextlib
+import asyncio
+import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import replace
 from typing import Any
 
 from atlantide.core.context import Context
-from atlantide.core.errors import ProviderError
+from atlantide.core.errors import ProviderError, RollbackError
+from atlantide.core.events import (
+    NODE_FAIL,
+    NODE_FINISH,
+    NODE_START,
+    ROLLBACK_NODE,
+    ROLLBACK_SKIPPED,
+    ROLLBACK_START,
+    RUN_FINISH,
+    RUN_START,
+    ApplyEvent,
+)
+from atlantide.core.node_id import stack_of
 from atlantide.core.provider import Provider
-from atlantide.core.resource import Resource
+from atlantide.core.resource import DataSource, Resource
 from atlantide.graph.model import DiGraph
 from atlantide.graph.schedule import run_graph
+from atlantide.reconcile.compensation import (
+    Compensator,
+    _cbd_old_id,
+    _with_outputs,
+)
 from atlantide.reconcile.context import (
     PHASE_FAIL,
     PHASE_FINISH,
@@ -47,7 +65,9 @@ from atlantide.reconcile.context import (
     state_digraph,
 )
 from atlantide.reconcile.diff import Action, Change, ChangeSet
+from atlantide.reconcile.report import ApplyReport
 from atlantide.reconcile.resolve import (
+    live_outputs,
     reconstruct,
     resolve_refs,
     resolve_secret_refs,
@@ -59,9 +79,9 @@ from atlantide.reconcile.resolve import (
     unseal_outputs,
 )
 from atlantide.state.backend import (
+    NO_INPUT_HASH,
     STATUS_CREATED,
     STATUS_CREATING,
-    StateBackend,
     StateGraph,
     StateNode,
 )
@@ -70,26 +90,30 @@ from atlantide.state.backend import (
 Compensation = tuple[str, Callable[[], Awaitable[None]]]
 
 
+def _reraise_if_cancelled(exc: BaseException) -> None:
+    """Let a cancellation past untouched.
+
+    Wrapping one in a ``ProviderError`` would turn "this task was cancelled" into
+    "this resource failed": the scheduler would stop unwinding, the caller would
+    report a provider fault that never happened, and structured cancellation would
+    be broken for every task above.
+
+    A ``TimeoutError`` is deliberately *not* in this class. `asyncio.timeout`
+    converts its own cancellation into one precisely so it reads as a failure of
+    that node rather than as an interrupt — which is what it is, and which is what
+    lets the saga treat it like any other provider failure.
+    """
+    if isinstance(exc, asyncio.CancelledError):
+        raise exc
+
+
+def _output_stack(key: str) -> str:
+    """The stack half of a committed output key (``"{stack}:{name}"``)."""
+    return key.split(":", 1)[0]
+
+
 def _noop_progress(node_id: str, action: Action, phase: str) -> None:
     pass
-
-
-@dataclass(slots=True)
-class ApplyReport:
-    """What one run did, per action — not to be confused with the other
-    "outputs": ``outputs`` here is the *declared exports* (``output()`` calls),
-    resolved; live per-node values are ``LiveOutputs``; committed cross-stack
-    values are ``StateBackend.outputs()``."""
-
-    created: list[str] = field(default_factory=list)
-    updated: list[str] = field(default_factory=list)
-    replaced: list[str] = field(default_factory=list)
-    deleted: list[str] = field(default_factory=list)
-    noop: list[str] = field(default_factory=list)
-    rolled_back: list[str] = field(default_factory=list)  # compensated on saga rollback
-    outputs: dict[str, Any] = field(default_factory=dict)  # declared exports, resolved
-    #: Output names whose value derives from a sensitive field; renderers redact these.
-    sensitive_outputs: frozenset[str] = frozenset()
 
 
 async def apply(
@@ -144,55 +168,125 @@ class _Applier:
         self.changes = {c.node_id: c for c in changeset.changes}
         self.prior_state = prior
         self.prior_graph = state_digraph(prior)
-        # Live values for ref resolution: prior outputs, with sealed sensitive
-        # values decrypted back to plaintext. Persisted nodes stay sealed.
-        self.live_outputs: LiveOutputs = {
-            nid: unseal_outputs(node.outputs, env.secrets) for nid, node in prior.nodes.items()
+        self.live_outputs: LiveOutputs = live_outputs(prior, env.secrets)
+        # Frozen copy of the prior-state seed: an undo rebuilds the *old*
+        # resource against the upstream values it was applied with, not the
+        # values this run's forward pass writes into ``live_outputs`` before
+        # the failure (the compensations run in reverse, so each upstream's
+        # own rollback restores exactly these values).
+        self.prior_outputs: LiveOutputs = {
+            node_id: dict(outputs) for node_id, outputs in self.live_outputs.items()
         }
         self.report = ApplyReport()
         self.ctx = Context()
         self.delete_ids = {c.node_id for c in changeset.by_action(Action.DELETE)}
-        # Completed-node undos, in completion order (a node completes only after its
-        # dependencies, so reversing this list undoes dependents-first).
+        # Undos in completion order; a node completes after its dependencies, so
+        # reversing undoes dependents first.
         self.compensations: list[Compensation] = []
-        # CBD REPLACEs create the new resource forward and defer destroying the old
-        # (node id -> the old Resource) to a terminal cleanup phase.
+        # node id -> prior Resource, for CBD REPLACEs whose destroy is deferred.
         self.cbd_deferred: dict[str, Resource] = {}
 
     async def run(self) -> ApplyReport:
-        # Phase 1: create/update/replace/noop, dependencies first.
+        self._emit(
+            RUN_START,
+            planned=len(self.changes),
+            actionable=sum(1 for c in self.changes.values() if c.action is not Action.NOOP),
+        )
         try:
-            await run_graph(
-                self.desired.graph, self._apply_node, parallelism=self.env.parallelism
+            return await self._run_phases()
+        finally:
+            # In a `finally` so a failed or interrupted run still closes its record.
+            self._emit(
+                RUN_FINISH,
+                created=len(self.report.created),
+                updated=len(self.report.updated),
+                replaced=len(self.report.replaced),
+                deleted=len(self.report.deleted),
+                rolled_back=len(self.report.rolled_back),
             )
-        except Exception:
+
+    async def _run_phases(self) -> ApplyReport:
+        # Phase 1: create/update/replace/noop, dependencies first.
+        #
+        # `BaseException`, not `Exception`: an interrupt arrives as `CancelledError`,
+        # and a narrower clause would skip the saga on Ctrl-C part-way through an
+        # apply that has already created resources.
+        try:
+            await run_graph(self.desired.graph, self._apply_node, parallelism=self.env.parallelism)
+        except BaseException as exc:
             if self.on_failure == "rollback":
-                await self._rollback()
+                skip = self._rollback_blocker()
+                if skip is not None:
+                    self.report.rollback_skipped = skip
+                    self._emit(ROLLBACK_SKIPPED, reason=skip)
+                else:
+                    self._emit(ROLLBACK_START, nodes=len(self.compensations))
+                    await self._shielded_rollback()
+                if self.report.rollback_failed:
+                    if isinstance(exc, Exception):
+                        # Grouped, not replaced: `run_async` flattens the group and
+                        # renders every leaf.
+                        raise ExceptionGroup(
+                            "apply failed and rollback did not complete",
+                            [exc, *self._rollback_errors()],
+                        ) from None
+                    # A cancellation must stay a cancellation: grouping would hide it
+                    # from every `except CancelledError` above. `render_error` still
+                    # prints the rollback failures from this attribute.
+                    exc._also_failed = self._rollback_errors()  # type: ignore[attr-defined]
             raise
-        # Phase 1b: destroy the old halves of CBD REPLACEs, dependents first (new
-        # resources and rewired dependents already in place). Terminal.
+        # Phase 1b: destroy the prior halves of CBD REPLACEs, dependents first, once
+        # the replacements are in place. Terminal.
         if self.cbd_deferred:
             await self._run(self.desired.graph, self._cbd_cleanup, reverse=True)
-        # Phase 2: deletes, dependents first. Terminal — not rolled back (recreating
-        # a just-destroyed resource would lose its identity/outputs).
+        # Phase 2: deletes, dependents first. Terminal: recreating a destroyed
+        # resource would lose its identity and outputs.
         if self.delete_ids:
             await self._run(self.prior_graph, self._delete_node, reverse=True)
-        # Declared exports resolve against live outputs (refs to unchanged nodes
-        # resolve — their outputs were seeded from prior state at construction).
-        self.report.outputs = {
-            name: resolve_value(value, self.live_outputs)
-            for name, value in self.desired.output_decls.items()
-        }
-        self.report.sensitive_outputs = sensitive_output_names(
-            self.desired.output_decls, self.env
-        )
-        # Persist stack outputs so a StackReference in another config can read them.
-        # Sensitive exports (e.g. a generated password) are sealed at rest; the
-        # in-memory report keeps them in the clear for the caller (redacted only
-        # at the render boundary).
-        if self.report.outputs:
-            self.env.backend.set_outputs(self._persistable_outputs())
+        self._commit_outputs()
         return self.report
+
+    def _commit_outputs(self) -> None:
+        """Resolve the declared exports and persist the committed stack outputs.
+
+        Exports resolve against live outputs; unchanged nodes resolve from the
+        prior-state seed set up at construction. A restricted (targeted) run
+        NOOPs unselected CREATEs, so an output over one has no value anywhere
+        yet — skip it, leaving its committed value untouched, rather than fail
+        after the infrastructure mutations already succeeded. Sensitive exports
+        are sealed at rest; the report holds them in the clear and redacts at
+        the render boundary.
+        """
+        resolved_outputs: dict[str, Any] = {}
+        for name, value in self.desired.output_decls.items():
+            try:
+                resolved_outputs[name] = resolve_value(value, self.live_outputs)
+            except KeyError:
+                continue
+        self.report.outputs = resolved_outputs
+        self.report.sensitive_outputs = sensitive_output_names(self.desired.output_decls, self.env)
+        self.env.backend.set_outputs(self._persistable_outputs(), remove=self._retired_outputs())
+
+    def _retired_outputs(self) -> list[str]:
+        """Committed output keys this run owns but no longer declares.
+
+        ``set_outputs`` merges, so without pruning the store is append-only: a
+        dropped ``output()`` — or a destroyed stack, which declares none at all —
+        keeps its last value, and a dependent stack's ``StackReference`` still
+        resolves to a resource that is gone. Scoped to this run's own stacks;
+        another config's outputs share the store.
+        """
+        mine = {stack_of(node_id) for node_id in self.desired.resources}
+        mine |= {stack_of(node_id) for node_id in self.prior_state.nodes}
+        # Every declared name counts, not only the resolved ones: an output that
+        # could not resolve under a restricted run is still declared, and pruning
+        # it would drop a committed value the config continues to claim.
+        declared = set(self.report.outputs) | set(self.desired.output_decls)
+        return sorted(
+            key
+            for key in self.env.backend.outputs()
+            if _output_stack(key) in mine and key not in declared
+        )
 
     def _persistable_outputs(self) -> dict[str, Any]:
         return {
@@ -209,7 +303,7 @@ class _Applier:
     ) -> None:
         await run_graph(graph, step, parallelism=self.env.parallelism, reverse=reverse)
 
-    # -- per-node phases --------------------------------------------------
+    # Per-node phases
 
     async def _apply_node(self, node_id: str) -> None:
         change = self.changes[node_id]
@@ -217,12 +311,19 @@ class _Applier:
             self.report.noop.append(node_id)
             return
         self.on_progress(node_id, change.action, PHASE_START)
+        self._emit(NODE_START, node_id=node_id, action=change.action)
         try:
-            await self._apply_one(node_id, change)
-        except Exception as exc:
+            async with asyncio.timeout(self.env.node_timeout):
+                await self._apply_one(node_id, change)
+        except BaseException as exc:
+            # A sibling's failure cancels this node mid-CRUD; without this the
+            # progress display leaves it spinning forever.
             self.on_progress(node_id, change.action, PHASE_FAIL)
+            self._emit(NODE_FAIL, node_id=node_id, action=change.action, error=str(exc))
+            _reraise_if_cancelled(exc)
             raise node_failure(node_id, change.action.name.lower(), exc) from exc
         self.on_progress(node_id, change.action, PHASE_FINISH)
+        self._emit(NODE_FINISH, node_id=node_id, action=change.action)
 
     async def _apply_one(self, node_id: str, change: Change) -> None:
         # Resolve upstream-output refs, then secret + stack-output handles (in-memory).
@@ -234,17 +335,13 @@ class _Applier:
             self.env.stack_outputs,
         )
         provider = provider_for(self.env.providers, res.provider_name())
+        undo = self._compensator(provider)
         match change.action:
             case Action.CREATE:
-                self._write_ahead(node_id, res)  # record the attempt before the create
+                self._write_ahead(node_id, res)
                 created = await provider.create(self.ctx, res)
                 self.live_outputs[node_id] = created
-                self._record(
-                    node_id,
-                    _undo_create(
-                        provider, self.ctx, _with_outputs(res, created), node_id, self.env.backend
-                    ),
-                )
+                self._record(node_id, undo.undo_create(_with_outputs(res, created), node_id))
                 self.report.created.append(node_id)
             case Action.UPDATE:
                 prior_node = self.prior_state.get(node_id)
@@ -252,14 +349,12 @@ class _Applier:
                     self.ctx, self.live_outputs.get(node_id, {}), res
                 )
                 if prior_node is not None:
-                    old = reconstruct(prior_node, self.env, self.live_outputs)
+                    # Against the prior-state snapshot: resolving against
+                    # ``live_outputs`` here would bake this run's post-apply
+                    # upstream values into the compensating update.
+                    old = reconstruct(prior_node, self.env, self.prior_outputs)
                     prior_outputs = unseal_outputs(prior_node.outputs, self.env.secrets)
-                    self._record(
-                        node_id,
-                        _undo_update(
-                            provider, self.ctx, old, prior_node, prior_outputs, self.env.backend
-                        ),
-                    )
+                    self._record(node_id, undo.undo_update(old, prior_node, prior_outputs))
                 self.report.updated.append(node_id)
             case Action.REPLACE:
                 await self._replace(node_id, change, res, provider)
@@ -271,38 +366,80 @@ class _Applier:
         self, node_id: str, change: Change, res: Resource, provider: Provider
     ) -> None:
         prior_node = self.prior_state.get(node_id)
-        old = (
-            reconstruct(prior_node, self.env, self.live_outputs) if prior_node else res
-        )
+        old = reconstruct(prior_node, self.env, self.live_outputs) if prior_node else res
+        undo = self._compensator(provider)
         if change.create_before_destroy and prior_node is not None:
-            # create the new resource first; destroy the old in the cleanup phase.
+            # Create the replacement now; the prior resource is destroyed in cleanup.
+            #
+            # The old resource's identity is persisted under a companion id first:
+            # `_write_ahead` overwrites the only row describing the still-live old
+            # resource, and from then until cleanup a crash would otherwise orphan
+            # it with no trace. With the companion row, the next plan reports it
+            # as a DELETE — planned recovery instead of silent loss.
+            self.env.lease.check()
+            self.env.backend.put(replace(prior_node, id=_cbd_old_id(node_id)))
+            self._write_ahead(node_id, res)
             created = await provider.create(self.ctx, res)
             self.live_outputs[node_id] = created
             self.cbd_deferred[node_id] = old
-            self._record(
-                node_id,
-                _undo_cbd_create(
-                    provider, self.ctx, _with_outputs(res, created), prior_node, self.env.backend
-                ),
-            )
-        else:  # destroy-before-create: remove the old, then create the new
+            self._record(node_id, undo.undo_cbd_create(_with_outputs(res, created), prior_node))
+        else:  # destroy-before-create
+            # Written before the destroy, not just before the create: until the
+            # create is persisted, a `created` row would describe an already-deleted
+            # resource and refs to it would resolve to a dead id.
+            self._write_ahead(node_id, res)
             await provider.delete(self.ctx, old)
             created = await provider.create(self.ctx, res)
             self.live_outputs[node_id] = created
             if prior_node is not None:
                 self._record(
                     node_id,
-                    _undo_replace(
-                        provider, self.ctx, _with_outputs(res, created), old, prior_node,
-                        self.env.backend,
+                    undo.undo_replace(
+                        _with_outputs(res, created), old, self._restorer(node_id, prior_node, old)
                     ),
                 )
         self.report.replaced.append(node_id)
 
+    def _compensator(self, provider: Provider) -> Compensator:
+        """Undo factories bound to this run's context and state backend."""
+        return Compensator(provider, self.ctx, self.env.backend)
+
+    def _restorer(
+        self, node_id: str, prior_node: StateNode, old: Resource
+    ) -> Callable[[dict[str, Any]], None]:
+        """Build the callback persisting the outputs of a compensating re-create.
+
+        The row keeps the prior node's shape, notably its ``input_hash``, so the
+        next plan sees the pre-replace inputs; the outputs are the new ones, since
+        the recreated resource is not the one the prior row described.
+        """
+
+        def restore(outputs: dict[str, Any]) -> None:
+            self.env.backend.put(
+                replace(prior_node, outputs=seal_outputs(outputs, type(old), self.env.secrets))
+            )
+
+        return restore
+
     async def _cbd_cleanup(self, node_id: str) -> None:
+        """Destroy the prior half of a create-before-destroy REPLACE.
+
+        Its primary state row was already replaced by the new half; the companion
+        row written in :meth:`_replace` is what still describes it. On success the
+        companion is dropped; on failure it stays, so the next plan reports the
+        leftover as a DELETE — and the report says so loudly as well.
+        """
         old = self.cbd_deferred.get(node_id)
-        if old is not None:
+        if old is None:
+            return
+        try:
             await provider_for(self.env.providers, old.provider_name()).delete(self.ctx, old)
+        except Exception as exc:
+            self.report.orphaned[node_id] = (
+                f"the replaced {old.type_name()} could not be destroyed: {exc}"
+            )
+            raise
+        self.env.backend.delete(_cbd_old_id(node_id))
 
     async def _delete_node(self, node_id: str) -> None:
         if node_id not in self.delete_ids:
@@ -312,15 +449,37 @@ class _Applier:
             prior_node = self.prior_state.get(node_id)
             assert prior_node is not None
             res = reconstruct(prior_node, self.env, self.live_outputs)
-            await provider_for(self.env.providers, prior_node.provider).delete(self.ctx, res)
-            self.env.backend.delete(node_id)
-        except Exception as exc:
+            if not isinstance(res, DataSource):
+                async with asyncio.timeout(self.env.node_timeout):
+                    await provider_for(self.env.providers, prior_node.provider).delete(
+                        self.ctx, res
+                    )
+            # A data source is a lookup, not something atlantide made. Dropping
+            # the row is the whole of "deleting" it; calling the provider would
+            # destroy infrastructure this config only ever read.
+            self._forget(node_id)
+        except BaseException as exc:
             self.on_progress(node_id, Action.DELETE, PHASE_FAIL)
+            _reraise_if_cancelled(exc)
             raise node_failure(node_id, "delete", exc) from exc
         self.report.deleted.append(node_id)
         self.on_progress(node_id, Action.DELETE, PHASE_FINISH)
 
-    # -- state persistence / compensation ---------------------------------
+    def _forget(self, node_id: str) -> None:
+        """Drop a destroyed node's row, marking it stale if the drop fails.
+
+        The provider call has already succeeded by this point, so the resource is
+        gone; a failed ``delete`` leaves a row whose hash still matches config,
+        which the next plan would skip as NOOP. Poisoning it first means the
+        worst case is a spurious re-plan rather than a permanent lie.
+        """
+        try:
+            self.env.backend.delete(node_id)
+        except Exception:
+            self._poison(node_id)
+            raise
+
+    # State persistence / compensation
 
     def _state_node(
         self, node_id: str, res: Resource, outputs: dict[str, Any], status: str
@@ -346,92 +505,116 @@ class _Applier:
         A create that succeeds at the provider but is cancelled or crashes before
         persist stays tracked, so destroy/refresh can still reclaim it.
         """
+        self.env.lease.check()
         self.env.backend.put(self._state_node(node_id, res, {}, STATUS_CREATING))
 
     def _persist(self, node_id: str, res: Resource, outputs: dict[str, Any]) -> None:
+        # Guarded rather than trusted: losing the lease cancels the run, but not
+        # instantly, and a node already inside a provider call would still write.
+        self.env.lease.check()
         self.env.backend.put(self._state_node(node_id, res, outputs, STATUS_CREATED))
 
     def _record(self, node_id: str, undo: Callable[[], Awaitable[None]]) -> None:
         if self.on_failure == "rollback":
             self.compensations.append((node_id, undo))
 
-    async def _rollback(self) -> None:
-        """Undo completed nodes in reverse completion order (best-effort, sequential).
+    def _poison(self, node_id: str) -> None:
+        """Clear a node's ``input_hash`` so the next plan cannot Merkle-skip it.
 
-        Every recorded node is attempted even if one undo fails, so a flaky
-        compensation can't strand the rest; ids undone (whether or not their
-        provider call errored) land in ``report.rolled_back``.
+        A compensation is a provider call followed by a state write, and a failure
+        between the two leaves state describing a resource that is no longer
+        there. Because the diff is symbolic, that row's stored hash still matches
+        config, so the next plan would report NOOP and the divergence would never
+        surface. :data:`NO_INPUT_HASH` is the channel through which it can —
+        ``refresh --write`` already uses it for the same purpose.
+
+        Written *before* the compensation runs, not after: poisoning afterwards
+        only survives an exception, while a process killed mid-rollback leaves
+        the row untouched and the divergence silent. The undo's own state write
+        clears the poison when it succeeds, so the cost of being early is nothing.
+
+        Re-read from the backend rather than from ``prior_state``: an earlier
+        phase of this run may already have rewritten the row, and putting the
+        stale copy back would undo that write.
+        """
+        current = self.env.backend.load().get(node_id)
+        if current is None:  # already gone; nothing to mark
+            return
+        try:
+            self.env.backend.put(replace(current, input_hash=NO_INPUT_HASH))
+        except Exception as exc:
+            self.report.poison_failed[node_id] = str(exc)
+
+    def _emit(
+        self,
+        phase: str,
+        *,
+        node_id: str | None = None,
+        action: Action | None = None,
+        **detail: Any,
+    ) -> None:
+        """Publish one event. Never raises: observation must not break the work."""
+        self.env.events(
+            ApplyEvent(
+                run_id=self.env.run_id,
+                at=time.time(),
+                phase=phase,
+                node_id=node_id,
+                action=action.value if action is not None else None,
+                detail=detail,
+            )
+        )
+
+    def _rollback_blocker(self) -> str | None:
+        """Why the saga must not run, or ``None`` if it may.
+
+        There is exactly one such reason today: this run no longer holds the state
+        lock. A compensation is a provider call *and* a state write, and a run that
+        lost its lease may be racing whoever took it — undoing "its" creates could
+        destroy theirs. Leaving the resources in place is the lesser harm, and the
+        report says so rather than staying quiet about it.
+        """
+        lost = self.env.lease.lost
+        return str(lost) if lost is not None else None
+
+    async def _shielded_rollback(self) -> None:
+        """Run the saga so that a *second* interrupt cannot abandon it half-done.
+
+        The first Ctrl-C is what got us here; a second one during the compensation
+        would otherwise cancel it between a provider call and its state write —
+        the very window :meth:`_poison` exists to make visible. Shielding costs an
+        impatient operator nothing but a second press against the CLI's hard exit.
+        """
+        rollback = asyncio.ensure_future(self._rollback())
+        try:
+            await asyncio.shield(rollback)
+        except asyncio.CancelledError:
+            await rollback  # let it finish; the cancellation is re-raised after
+            raise
+
+    async def _rollback(self) -> None:
+        """Undo completed nodes in reverse completion order, sequentially.
+
+        Every recorded undo is attempted even if an earlier one fails. All
+        attempted ids are recorded in ``report.rolled_back``; those that did not
+        complete are also recorded in ``report.rollback_failed``.
+
+        Each node's row is marked stale before its compensation runs, so a
+        compensation that fails part-way is visible to the next plan rather than
+        reading as NOOP. See :meth:`_poison`.
         """
         for node_id, undo in reversed(self.compensations):
             self.report.rolled_back.append(node_id)
-            with contextlib.suppress(Exception):
+            self._poison(node_id)
+            try:
                 await undo()
+                self._emit(ROLLBACK_NODE, node_id=node_id, undone=True)
+            except Exception as exc:
+                self.report.rollback_failed[node_id] = str(exc)
+                self._emit(ROLLBACK_NODE, node_id=node_id, undone=False, error=str(exc))
 
-
-def _with_outputs(res: Resource, outputs: dict[str, Any]) -> Resource:
-    """``res`` with its freshly-created computed outputs (e.g. the real id) restored.
-
-    A compensation deletes the resource just created; the id lets the provider act
-    on it directly rather than locating it by attributes, which is unsafe when those
-    (e.g. a VPC's CIDR) are shared with an unrelated resource.
-    """
-    fields = type(res).model_fields
-    updates = {key: value for key, value in outputs.items() if key in fields}
-    return res.model_copy(update=updates) if updates else res
-
-
-def _undo_create(
-    provider: Provider, ctx: Context, res: Resource, node_id: str, backend: StateBackend
-) -> Callable[[], Awaitable[None]]:
-    async def undo() -> None:
-        await provider.delete(ctx, res)
-        backend.delete(node_id)
-
-    return undo
-
-
-def _undo_update(
-    provider: Provider,
-    ctx: Context,
-    old: Resource,
-    prior_node: StateNode,
-    prior_outputs: dict[str, Any],
-    backend: StateBackend,
-) -> Callable[[], Awaitable[None]]:
-    async def undo() -> None:
-        await provider.update(ctx, prior_outputs, old)  # plaintext outputs for the provider
-        backend.put(prior_node)  # restore the prior (sealed) state row verbatim
-
-    return undo
-
-
-def _undo_replace(
-    provider: Provider,
-    ctx: Context,
-    new: Resource,
-    old: Resource,
-    prior_node: StateNode,
-    backend: StateBackend,
-) -> Callable[[], Awaitable[None]]:
-    async def undo() -> None:
-        await provider.delete(ctx, new)  # remove the replacement
-        await provider.create(ctx, old)  # recreate the original
-        backend.put(prior_node)
-
-    return undo
-
-
-def _undo_cbd_create(
-    provider: Provider, ctx: Context, new: Resource, prior_node: StateNode, backend: StateBackend
-) -> Callable[[], Awaitable[None]]:
-    """Undo a create-before-destroy REPLACE's forward half.
-
-    The old resource is still live (its deletion is deferred to cleanup), so undo
-    removes the freshly-created replacement and restores the prior state row.
-    """
-
-    async def undo() -> None:
-        await provider.delete(ctx, new)
-        backend.put(prior_node)
-
-    return undo
+    def _rollback_errors(self) -> list[RollbackError]:
+        return [
+            RollbackError(node_id, reason)
+            for node_id, reason in self.report.rollback_failed.items()
+        ]

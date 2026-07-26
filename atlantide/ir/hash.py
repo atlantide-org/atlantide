@@ -6,9 +6,7 @@ config -> identical IR -> identical hash) and the artifact integrity check.
 
 from __future__ import annotations
 
-import hashlib
-
-from atlantide.ir.canonical import to_canonical_json
+from atlantide.ir.canonical import canonical_sha256, to_canonical_json
 from atlantide.ir.model import IRGraph
 
 
@@ -18,4 +16,4 @@ def canonical_bytes(ir: IRGraph) -> bytes:
 
 def hash_ir(ir: IRGraph) -> str:
     """Hex SHA-256 of the IR's canonical encoding (the plan identity)."""
-    return hashlib.sha256(canonical_bytes(ir)).hexdigest()
+    return canonical_sha256(ir.to_canonical())

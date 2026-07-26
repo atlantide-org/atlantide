@@ -11,15 +11,15 @@ Halt-on-failure: the first work error cancels the remaining tasks
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
+from atlantide.core.tuning import DEFAULT_PARALLELISM
 from atlantide.graph.model import DiGraph
 
 T = TypeVar("T")
 
-DEFAULT_PARALLELISM = min(32, (os.cpu_count() or 4) * 4)
+__all__ = ["DEFAULT_PARALLELISM", "run_graph"]
 
 
 async def run_graph(

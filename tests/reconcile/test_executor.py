@@ -125,6 +125,28 @@ def test_rollback_restores_prior_on_failed_update(tmp_path: object) -> None:
         assert backend.load().get(A).outputs == {"out": "a:1"}  # type: ignore[attr-defined]
 
 
+def test_rollback_update_pushes_prior_upstream_values(tmp_path: object) -> None:
+    """The compensating update of a dependent must carry the upstream values it
+    was originally applied with, not the ones this run's forward pass produced —
+    the upstream's own rollback restores exactly the prior values."""
+    baseline = (
+        "a = Box('a', size=1, label='x')\n"
+        "c = Box('c', size=2, ref=a.out, label='x')\n"
+        "Box('d', size=3, ref=c.out, label='x')\n"
+    )
+    changed = baseline.replace("label='x'", "label='y'")
+    for backend in _backends(tmp_path):
+        h = Harness(backend)  # type: ignore[arg-type]
+        h.apply(baseline)
+        h.fake().reset()
+        h.fake().fail_update.add("d")  # fails after a and c committed their updates
+        with pytest.raises(ExceptionGroup):
+            h.apply(changed, on_failure="rollback")
+        # c's compensating update resolved its ref against a's *prior* output
+        # ("a:1"), not the output a's forward update just wrote ("a:1:u").
+        assert h.fake().input("update", "c").ref == "a:1"
+
+
 def test_halt_on_failure_then_resume(tmp_path: object) -> None:
     for backend in _backends(tmp_path):
         h = Harness(backend)  # type: ignore[arg-type]

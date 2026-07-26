@@ -45,5 +45,5 @@ with Stack("example", region=Region.EuNorth1, tags={"app": "showcase"}):
     # --- Output combinators over apply-time refs (arns/domains unknown until
     #     apply): concat two parts, interpolate a template, join a list. ---
     output("site_url", interpolate("https://{}", site.domain_name))
-    output("objects_glob", concat(site.arn, "/*"))            # arn:aws:s3:::web-bucket/*
+    output("objects_glob", concat(site.arn, "/*"))  # arn:aws:s3:::web-bucket/*
     output("bucket_domains", join(", ", [site.domain_name, logs.regional_domain_name]))

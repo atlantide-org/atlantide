@@ -15,16 +15,30 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: atlantide
+          POSTGRES_DB: atlantide
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+    env:
+      ATLANTIDE_TEST_PG_DSN: postgresql://postgres:atlantide@localhost:5432/atlantide
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - name: Lockfile up to date
         run: uv lock --check
       - name: Install
-        run: uv sync --extra dev
+        run: uv sync --extra dev --extra postgres
+      - name: Format
+        run: uv run ruff format --check .
       - name: Lint
         run: uv run ruff check .
       - name: Types

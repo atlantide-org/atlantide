@@ -7,21 +7,34 @@ a ``PolicyRegistry``.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from typing import Any, TypeVar
 
 from atlantide.core import PolicyLevel, Resource
 from atlantide.core.actions import Action
 
+T = TypeVar("T")
+
 
 @dataclass(frozen=True, slots=True)
 class PolicyContext:
-    """What a policy sees: the node, its pending action, and its desired state."""
+    """What a policy sees: the node, its pending action, and its desired state.
+
+    ``params`` are the binding's arguments (see
+    :class:`~atlantide.core.policy.PolicyBinding`), so one policy evaluated
+    through two bindings sees each binding's own configuration.
+    """
 
     node_id: str
     action: Action
     stack: str
     resource: Resource | None  # desired resource; None for a pure DELETE
+    params: Mapping[str, Any] = field(default_factory=dict)
+
+    def param(self, name: str, default: T) -> Any:
+        """This binding's ``name`` argument, or ``default`` when unset."""
+        return self.params.get(name, default)
 
 
 @dataclass(frozen=True, slots=True)

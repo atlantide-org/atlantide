@@ -12,12 +12,12 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from typer.testing import CliRunner
 
 import atlantide.components as components
-from atlantide.cli.main import app
+from tests.support import Cli
 
-runner = CliRunner()
+cli = Cli()
+
 
 _COMPONENT = (
     "from atlantide.core import Component, child\n"
@@ -61,10 +61,7 @@ def clean_mount() -> Iterator[None]:
 
 
 def test_add_lock_vendor_verify_then_plan(
-    tmp_path: Path,
-    component_repo: str,
-    monkeypatch: pytest.MonkeyPatch,
-    clean_mount: None,
+    tmp_path: Path, component_repo: str, monkeypatch: pytest.MonkeyPatch, clean_mount: None
 ) -> None:
     project = tmp_path / "proj"
     project.mkdir()
@@ -76,51 +73,84 @@ def test_add_lock_vendor_verify_then_plan(
 
     # add: fetches, writes the toml source + lock, vendors the tree.
     add_args = ["component", "add", component_repo, "--ref", "v1", "--as", "nullbox"]
-    added = runner.invoke(app, [*add_args, "--subdir", "nullbox"])
-    assert added.exit_code == 0, added.output
+    added = cli.ok(*add_args, "--subdir", "nullbox")
     assert "atlantide.components.nullbox" in added.output
     lock_text = (project / "atlantide.lock").read_text()
-    assert "[components.nullbox]" in lock_text and "sha256:" in lock_text
+    assert "[components.nullbox]" in lock_text and "sha256.v2:" in lock_text
     assert (project / ".atlantis" / "components" / "nullbox" / "__init__.py").exists()
     assert "[components.nullbox]" in (project / "atlantide.toml").read_text()
 
     # verify: clean tree matches the lock.
-    assert runner.invoke(app, ["component", "verify"]).exit_code == 0
+    assert cli.run("component", "verify").exit_code == 0
 
     # tamper -> verify fails.
     vendored = project / ".atlantis" / "components" / "nullbox" / "__init__.py"
     vendored.write_text(_COMPONENT + "\n# tampered\n")
-    tampered = runner.invoke(app, ["component", "verify"])
+    tampered = cli.run("component", "verify")
     assert tampered.exit_code == 1
     assert "tampered or drifted" in tampered.output
 
     # vendor: rematerializes clean from the lock, verify passes again.
-    assert runner.invoke(app, ["component", "vendor"]).exit_code == 0
-    assert runner.invoke(app, ["component", "verify"]).exit_code == 0
+    assert cli.run("component", "vendor").exit_code == 0
+    assert cli.run("component", "verify").exit_code == 0
 
     # plan: the config imports the vendored component and gets its namespaced child.
-    planned = runner.invoke(app, ["plan"])
-    assert planned.exit_code == 0, planned.output
+    planned = cli.run("plan")
     assert "mybox-thing" in planned.output
+
+
+def test_tampered_component_fails_plan_not_just_verify(
+    tmp_path: Path, component_repo: str, monkeypatch: pytest.MonkeyPatch, clean_mount: None
+) -> None:
+    """`plan` imports and executes the vendored tree, so it must consult the lock;
+    leaving that to the opt-in `component verify` never checks the pin on the
+    commands that run the third-party code."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "atlantide.toml").write_text('config = "infra.py"\n')
+    (project / "infra.py").write_text(
+        "from atlantide.components.nullbox import NullBox\n\nNullBox('mybox')\n"
+    )
+    monkeypatch.chdir(project)
+    cli.ok(
+        "component",
+        "add",
+        component_repo,
+        "--ref",
+        "v1",
+        "--as",
+        "nullbox",
+        "--subdir",
+        "nullbox",
+    )
+    assert cli.run("plan").exit_code == 0
+
+    vendored = project / ".atlantis" / "components" / "nullbox" / "__init__.py"
+    vendored.write_text(_COMPONENT.replace("count=1", "count=99"))
+
+    planned = cli.run("plan")
+    assert planned.exit_code == 1
+    assert "tampered or drifted" in planned.output
+
+    # `component vendor` must still be reachable — it is the way back to a clean
+    # tree, so it cannot be gated on the tree already being clean.
+    assert cli.run("component", "vendor").exit_code == 0
+    assert cli.run("plan").exit_code == 0
 
 
 def test_add_duplicate_alias_is_rejected(
     tmp_path: Path, component_repo: str, monkeypatch: pytest.MonkeyPatch, clean_mount: None
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    (tmp_path / "atlantide.toml").write_text(
-        '[components.nullbox]\ngit = "x"\n'
-    )
-    result = runner.invoke(
-        app, ["component", "add", component_repo, "--as", "nullbox", "--subdir", "nullbox"]
-    )
+    (tmp_path / "atlantide.toml").write_text('[components.nullbox]\ngit = "x"\n')
+    result = cli.run("component", "add", component_repo, "--as", "nullbox", "--subdir", "nullbox")
     assert result.exit_code == 1
     assert "already declared" in result.output
 
 
 def test_verify_without_lock_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
-    result = runner.invoke(app, ["component", "verify"])
+    result = cli.run("component", "verify")
     assert result.exit_code == 1
     assert "no atlantide.lock" in result.output
 
@@ -132,12 +162,11 @@ def test_lock_resolves_declared_sources(
     (tmp_path / "atlantide.toml").write_text(
         f'[components.nullbox]\ngit = "{component_repo}"\nref = "v1"\nsubdir = "nullbox"\n'
     )
-    result = runner.invoke(app, ["component", "lock"])
-    assert result.exit_code == 0, result.output
+    result = cli.run("component", "lock")
     assert "locked nullbox" in result.output
     assert "[components.nullbox]" in (tmp_path / "atlantide.lock").read_text()
     # vendored, so a follow-up verify passes.
-    assert runner.invoke(app, ["component", "verify"]).exit_code == 0
+    assert cli.run("component", "verify").exit_code == 0
 
 
 def test_default_alias_derived_from_url(
@@ -145,6 +174,5 @@ def test_default_alias_derived_from_url(
 ) -> None:
     # repo dir is named "repo", so the derived alias is "repo".
     monkeypatch.chdir(tmp_path)
-    result = runner.invoke(app, ["component", "add", component_repo, "--subdir", "nullbox"])
-    assert result.exit_code == 0, result.output
+    result = cli.run("component", "add", component_repo, "--subdir", "nullbox")
     assert "atlantide.components.repo" in result.output

@@ -11,6 +11,7 @@ from atlantide.core import (
     FuelExhaustedError,
     LanguageError,
     Resource,
+    SecretRef,
     immutable,
     is_successful,
     mutable,
@@ -79,11 +80,51 @@ def test_closure_passed_to_builtin() -> None:
     assert reg.get("default:test.Widget:w").unwrap().size == 3
 
 
-def test_inputs_and_secret() -> None:
-    src = "Widget('w', size=atlantide.input('n'), label=atlantide.secret('tok'))"
-    reg = _eval(src, inputs={"n": 7, "tok": "hunter2"}).unwrap()
-    w = reg.get("default:test.Widget:w").unwrap()
-    assert w.size == 7 and w.label == "hunter2"
+def test_an_input_reaches_the_config_as_its_value() -> None:
+    src = "Widget('w', size=atlantide.input('n'), label='x')"
+    reg = _eval(src, inputs={"n": 7}).unwrap()
+    assert reg.get("default:test.Widget:w").unwrap().size == 7
+
+
+def test_a_secret_is_a_handle_not_a_value() -> None:
+    """`atlantide.secret()` used to read from `inputs` and return the plaintext.
+
+    That put the value straight into a resource field, and from there into the
+    hashed IR, the `.atlas` artifact and the state store — a secret written down
+    in three places by the one function whose purpose is to keep it out of them.
+    It now returns a `SecretRef`: the *name* travels, the value is resolved
+    in-memory at apply.
+    """
+    src = "Widget('w', size=1, label=atlantide.secret('tok'))"
+    reg = _eval(src, inputs={"tok": "hunter2"}).unwrap()
+
+    label = reg.get("default:test.Widget:w").unwrap().label
+    assert isinstance(label, SecretRef)
+    assert label.name == "tok"
+    assert "hunter2" not in repr(label), "the value never enters the config graph"
+
+
+def test_a_secret_ignores_a_same_named_input_entirely() -> None:
+    """Not even as a fallback: an input is a visible, recorded value, and letting
+    one satisfy a `secret()` would reintroduce the leak by another route."""
+    src = "Widget('w', size=1, label=atlantide.secret('tok'))"
+    reg = _eval(src, inputs={"tok": "hunter2"}).unwrap()
+    assert reg.inputs == {}, "a secret handle consumes no input"
+
+
+def test_only_the_inputs_the_config_read_are_recorded() -> None:
+    """An input passed but never read must not look like part of the plan's
+    identity — otherwise a stray variable set for another tool changes what the
+    run appears to be."""
+    src = "Widget('w', size=atlantide.input('n'), label='x')"
+    reg = _eval(src, inputs={"n": 7, "unused": "whatever"}).unwrap()
+    assert reg.inputs == {"n": 7}
+
+
+def test_a_taken_default_is_recorded_too() -> None:
+    """It shaped the config just as much as a passed value did."""
+    src = "Widget('w', size=atlantide.input('n', 3), label='x')"
+    assert _eval(src).unwrap().inputs == {"n": 3}
 
 
 def test_pure_derived_builtins() -> None:
@@ -109,6 +150,65 @@ def test_with_stack_namespaces_resources() -> None:
         "dev:test.Widget:w",
         "prod:test.Widget:w",
     }
+
+
+class _Recorder:
+    """A context manager recording what its ``__exit__`` was handed."""
+
+    def __init__(self, *, suppress: bool = False) -> None:
+        self.suppress = suppress
+        self.exits: list[tuple[object, object]] = []
+
+    def __enter__(self) -> _Recorder:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        self.exits.append((exc_type, exc))
+        return self.suppress
+
+
+class _FailingEnter:
+    def __enter__(self) -> None:
+        raise RuntimeError("enter failed")
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        return False
+
+
+def test_with_passes_the_exception_to_exit() -> None:
+    cm = _Recorder()
+    result = evaluate_source("with cm:\n    x = 1 // 0\n", extra_globals={"cm": cm})
+    assert not is_successful(result)
+    [(exc_type, exc)] = cm.exits
+    assert exc_type is ZeroDivisionError
+    assert isinstance(exc, ZeroDivisionError)
+
+
+def test_with_honours_a_suppressing_exit() -> None:
+    cm = _Recorder(suppress=True)
+    src = "with cm:\n    x = 1 // 0\nWidget('w', size=1)\n"
+    reg = evaluate_source(src, extra_globals={"cm": cm, "Widget": Widget}).unwrap()
+    assert len(reg) == 1  # execution continued past the with block
+    [(exc_type, _)] = cm.exits
+    assert exc_type is ZeroDivisionError
+
+
+def test_with_unwinds_entered_managers_when_a_later_enter_fails() -> None:
+    first = _Recorder()
+    result = evaluate_source(
+        "with a, b:\n    pass\n", extra_globals={"a": first, "b": _FailingEnter()}
+    )
+    assert not is_successful(result)
+    [(exc_type, exc)] = first.exits  # the already-entered manager was exited
+    assert exc_type is RuntimeError
+    assert "enter failed" in str(exc)
+
+
+def test_with_exits_cleanly_on_break() -> None:
+    cm = _Recorder()
+    src = "for i in range(3):\n    with cm:\n        break\n"
+    evaluate_source(src, extra_globals={"cm": cm}).unwrap()
+    assert cm.exits == [(None, None)]  # control flow is a non-exceptional exit
 
 
 def test_undefined_nondeterministic_names() -> None:
@@ -260,3 +360,10 @@ def test_plain_import_module_is_rejected() -> None:
     result = _eval("import atlantide\nWidget('w', size=1)")
     assert not is_successful(result)
     assert isinstance(result.failure(), LanguageError)
+
+
+def test_fstring_conversion_composes_with_format_spec() -> None:
+    """`!r` applies before the spec, exactly as Python: f"{v!r:>6}"."""
+    src = "Widget('w', size=1, label=f\"{'ab'!r:>6}\")"
+    reg = _eval(src).unwrap()
+    assert reg.get("default:test.Widget:w").unwrap().label == f"{'ab'!r:>6}"

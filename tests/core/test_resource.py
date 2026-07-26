@@ -115,3 +115,21 @@ def test_duplicate_output_rejected() -> None:
     with collecting(), pytest.raises(RegistryError, match="duplicate output"):
         output("dup", 1)
         output("dup", 2)
+
+
+def test_handles_are_accepted_in_nested_positions() -> None:
+    """A SecretRef/StackOutputRef/Transform nested inside a dict field must defer
+    validation exactly as a nested Ref does — the value is only known at apply."""
+    from atlantide.core import SecretRef
+    from atlantide.core.types import StackOutputRef, concat
+
+    res = Bucket(
+        "t",
+        bucket_name="b",
+        tags={
+            "token": SecretRef("api/token"),
+            "vpc": StackOutputRef("common", "vpc_id"),
+            "url": concat("https://", "example.test"),
+        },
+    )
+    assert "token" in res.tags

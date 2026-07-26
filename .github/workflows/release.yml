@@ -1,32 +1,108 @@
 name: Release
 
-# Build the standalone CLI on every platform and attach the binaries to a
-# GitHub Release when a version tag (e.g. v0.1.0) is pushed.
 on:
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write  # required to create the release and upload assets
+  contents: write
 
+# Ordered by how hard each step is to undo. `verify` is cheap and settles every
+# question that can be answered before anything is produced. `build` uploads
+# binaries to the GitHub release, which can be replaced or deleted. `pypi` runs
+# last because it is the only irreversible step: a published version can be
+# yanked but its filenames are burned forever. A run that fails should fail
+# before that point, not after it.
 jobs:
+  verify:
+    name: Verify the release is publishable
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: atlantide
+          POSTGRES_DB: atlantide
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+    env:
+      ATLANTIDE_TEST_PG_DSN: postgresql://postgres:atlantide@localhost:5432/atlantide
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Assert the tag and both version declarations agree
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(uv version --short)"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag v$tag != pyproject version $version — bump the version before tagging"
+            exit 1
+          fi
+          # atlantide/__init__.py carries its own copy, used by `--version` when
+          # running from a source tree. Drift there ships a binary that lies.
+          init="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' atlantide/__init__.py)"
+          if [ "$init" != "$version" ]; then
+            echo "::error::atlantide/__init__.py says $init but pyproject says $version — update both"
+            exit 1
+          fi
+
+      - name: Refuse to republish a version PyPI already has
+        run: |
+          version="$(uv version --short)"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://pypi.org/pypi/atlantide/$version/json")"
+          case "$code" in
+            404) echo "$version is not on PyPI yet" ;;
+            200)
+              echo "::error::atlantide $version is already on PyPI. Filenames can never be reused there, even after deleting a release — re-running this tag cannot succeed. Bump the version in pyproject.toml and atlantide/__init__.py, then tag again."
+              exit 1
+              ;;
+            *)
+              # A PyPI outage should not block a release that is otherwise fine;
+              # the upload itself still fails safely if the version does exist.
+              echo "::warning::could not confirm whether $version is on PyPI (HTTP $code) — continuing"
+              ;;
+          esac
+
+      - name: Lockfile up to date
+        run: uv lock --check
+      - name: Install
+        run: uv sync --extra dev --extra postgres
+      - name: Format
+        run: uv run ruff format --check .
+      - name: Lint
+        run: uv run ruff check .
+      - name: Types
+        run: uv run mypy
+      - name: Import contracts
+        run: uv run lint-imports
+      - name: Tests
+        run: uv run pytest -q
+
   build:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             asset: atlantide-linux-x86_64
-          - os: macos-14        # Apple Silicon
+          - os: macos-14
             asset: atlantide-macos-arm64
-          - os: macos-13        # Intel
-            asset: atlantide-macos-x86_64
           - os: windows-latest
             asset: atlantide-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
           enable-cache: true
@@ -45,12 +121,31 @@ jobs:
             chmod +x "out/${{ matrix.asset }}"
           fi
 
-      - name: Smoke test
-        shell: bash
-        run: "out/${{ matrix.asset }} --version"
-
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: out/${{ matrix.asset }}
           fail_on_unmatched_files: true
+
+  pypi:
+    name: Publish to PyPI
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    environment:
+      name: pypi
+      url: https://pypi.org/project/atlantide/
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Publish to PyPI (Trusted Publishing, no token)
+        uses: pypa/gh-action-pypi-publish@release/v1

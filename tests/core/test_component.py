@@ -45,6 +45,31 @@ def test_two_instances_do_not_collide() -> None:
     ]
 
 
+class Extended(Pair):
+    """Subclass whose ``__init__`` chains to the parent's via ``super()``."""
+
+    def __init__(self, name: str, *, size: int) -> None:
+        super().__init__(name, size=size)
+        self.c = _Thing("c", size=size + 2)
+
+
+def test_super_init_pushes_the_prefix_once() -> None:
+    """Both inits are wrapped, so without the re-entrancy guard the chained call
+    would push the name twice and children would land at ``web-web-a``."""
+    with collecting() as reg, Stack("prod", region="eu-north-1"):
+        ext = Extended("web", size=1)
+        after = _Thing("standalone", size=9)
+    ids = sorted(r.node_id for r in reg.all())
+    assert ids == [
+        "prod:test._Thing:standalone",
+        "prod:test._Thing:web-a",
+        "prod:test._Thing:web-b",
+        "prod:test._Thing:web-c",
+    ]
+    assert ext.name == "web"
+    assert after.node_id == "prod:test._Thing:standalone"  # prefix fully restored
+
+
 def test_prefix_is_restored_after_component() -> None:
     with collecting() as reg, Stack("prod", region="eu-north-1"):
         Pair("web", size=1)

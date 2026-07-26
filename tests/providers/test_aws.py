@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
+from typing import Any
 
 import boto3
 import pytest
-from moto import mock_aws
+from botocore.exceptions import ClientError
 
 from atlantide.core import Context, Stack
-from atlantide.core.errors import ProviderError
+from atlantide.core.errors import LanguageError, ProviderError
 from atlantide.core.resource import Resource
 from atlantide.engine import Engine
 from atlantide.providers import aws, local
@@ -29,6 +31,7 @@ from atlantide.providers.aws import (
     Route53Record,
     S3Bucket,
     S3BucketPolicy,
+    S3Folder,
     SecurityGroup,
     ServicePrincipal,
     SnsSubscription,
@@ -39,9 +42,11 @@ from atlantide.providers.aws import (
     allow,
     deny,
 )
+from atlantide.providers.aws.handlers.observability import CloudWatchLogGroupHandler
+from atlantide.providers.aws.resources.compute import package_bytes
 from atlantide.providers.local import LocalProvider
 from tests.conftest import make_engine
-from tests.support import cloud_env_fixture
+from tests.support import aws_fixture
 
 _TRUST_POLICY = (
     '{"Version": "2012-10-17", "Statement": [{"Effect": "Allow",'
@@ -51,15 +56,7 @@ _TRUST_POLICY = (
 # Autouse: moto + AWS creds + a "default" stack (resources require a region; the
 # stack supplies it and keeps the node-id prefix "default"). The cloud-test kit
 # makes this reusable — a second provider swaps env + mock_factory.
-aws_env = cloud_env_fixture(
-    {
-        "AWS_ACCESS_KEY_ID": "testing",
-        "AWS_SECRET_ACCESS_KEY": "testing",
-        "AWS_DEFAULT_REGION": "us-east-1",
-    },
-    region="us-east-1",
-    mock_factory=mock_aws,
-)
+aws_env = aws_fixture(region="us-east-1")
 
 
 def _exists(bucket: str) -> bool:
@@ -71,6 +68,7 @@ async def test_create_bucket_and_outputs() -> None:
     provider = AwsProvider()
     out = await provider.create(Context(), S3Bucket("b", bucket="my-logs"))
     assert out == {
+        "name": "my-logs",
         "arn": "arn:aws:s3:::my-logs",
         "objects_arn": "arn:aws:s3:::my-logs/*",
         "bucket": "my-logs",
@@ -134,6 +132,151 @@ async def test_delete_bucket() -> None:
     assert not _exists("gone")
 
 
+# -- S3Folder ----------------------------------------------------------------
+
+
+def _site(root: Path, files: dict[str, str]) -> Path:
+    for rel, body in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+    return root
+
+
+def _objects(bucket: str, prefix: str = "") -> dict[str, str]:
+    client = boto3.client("s3")
+    resp = client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+    return {
+        obj["Key"]: client.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read().decode()
+        for obj in resp.get("Contents", [])
+    }
+
+
+def test_s3folder_manifest_is_deterministic_and_excludes_caches(tmp_path: Path) -> None:
+    root = _site(tmp_path, {"index.html": "hi", "css/app.css": "body{}"})
+    (root / "__pycache__").mkdir()
+    (root / "__pycache__" / "x.pyc").write_text("junk")
+
+    folder = S3Folder("assets", bucket="b", source_path=str(root))
+    assert set(folder.manifest) == {"index.html", "css/app.css"}  # posix rels, no caches
+    # Re-reading the same tree yields an identical manifest.
+    assert S3Folder("a2", bucket="b", source_path=str(root)).manifest == folder.manifest
+
+
+def test_s3folder_source_path_must_be_literal() -> None:
+    ref_path = S3Bucket("b", bucket="some-bucket").regional_domain_name  # a Ref
+    with pytest.raises(LanguageError, match="literal directory"):
+        S3Folder("assets", bucket="b", source_path=ref_path)
+
+
+def test_s3folder_pinned_manifest_skips_disk() -> None:
+    # A rehydrate (deploy) passes a pinned manifest and must not touch disk.
+    folder = S3Folder(
+        "assets", bucket="b", source_path="/does/not/exist", manifest={"a.txt": "abc123"}
+    )
+    assert folder.manifest == {"a.txt": "abc123"}
+
+
+def test_s3folder_bucket_name_creates_dependency_edge(tmp_path: Path) -> None:
+    from atlantide.core import collecting
+    from atlantide.ir import lower
+
+    root = _site(tmp_path, {"index.html": "hi"})
+    with collecting() as reg, Stack("s", region=Region.UsEast1):
+        b = S3Bucket("site", bucket="dep-site")
+        folder = S3Folder("assets", bucket=b.name, source_path=str(root))
+    node = lower(reg).node(folder.node_id)
+    assert node is not None
+    assert b.node_id in node.dependencies  # b.name (a Ref) orders folder after bucket
+
+
+async def test_s3folder_create_uploads_all(tmp_path: Path) -> None:
+    root = _site(tmp_path, {"index.html": "<h1>hi</h1>", "css/app.css": "body{}"})
+    provider = AwsProvider()
+    boto3.client("s3").create_bucket(Bucket="site")
+
+    out = await provider.create(
+        Context(), S3Folder("assets", bucket="site", source_path=str(root), prefix="web/")
+    )
+    assert set(out["uploaded"]) == {"web/index.html", "web/css/app.css"}
+    assert _objects("site") == {"web/index.html": "<h1>hi</h1>", "web/css/app.css": "body{}"}
+    # Content-Type is inferred from the key's extension.
+    head = boto3.client("s3").head_object(Bucket="site", Key="web/index.html")
+    assert head["ContentType"] == "text/html"
+
+
+async def test_s3folder_update_syncs_delta_and_prunes(tmp_path: Path) -> None:
+    provider = AwsProvider()
+    boto3.client("s3").create_bucket(Bucket="site")
+    root = _site(tmp_path, {"index.html": "v1", "app.css": "body{}", "old.txt": "bye"})
+    prior = await provider.create(
+        Context(), S3Folder("assets", bucket="site", source_path=str(root), prefix="web/")
+    )
+
+    # Change index.html, add main.js, remove old.txt.
+    (root / "index.html").write_text("v2")
+    (root / "main.js").write_text("console.log(1)")
+    (root / "old.txt").unlink()
+    updated = S3Folder("assets", bucket="site", source_path=str(root), prefix="web/")
+
+    out = await provider.update(Context(), prior, updated)
+    assert set(out["uploaded"]) == {"web/index.html", "web/app.css", "web/main.js"}
+    assert _objects("site") == {
+        "web/index.html": "v2",
+        "web/app.css": "body{}",
+        "web/main.js": "console.log(1)",
+    }  # old.txt pruned
+
+
+async def test_s3folder_delete_removes_objects(tmp_path: Path) -> None:
+    provider = AwsProvider()
+    boto3.client("s3").create_bucket(Bucket="site")
+    root = _site(tmp_path, {"index.html": "hi", "a.css": "x"})
+    res = S3Folder("assets", bucket="site", source_path=str(root), prefix="web/")
+    out = await provider.create(Context(), res)
+
+    # State restores the computed ``uploaded`` map onto the resource for delete.
+    res.uploaded = out["uploaded"]  # type: ignore[misc]
+    await provider.delete(Context(), res)
+    assert _objects("site") == {}
+
+
+async def test_s3folder_read_missing_bucket_is_none() -> None:
+    provider = AwsProvider()
+    res = S3Folder("assets", bucket="ghost", source_path="/tmp", manifest={})
+    assert await provider.read(Context(), res) is None
+
+
+async def test_s3folder_through_engine_noop_update_replace(tmp_path: Path) -> None:
+    engine = _mixed_engine()
+    root = _site(tmp_path, {"index.html": "v1"})
+    config = (
+        "from atlantide.providers.aws import S3Bucket, S3Folder\n"
+        "b = S3Bucket('site', bucket='eng-site')\n"
+        # bucket=b.name orders the folder after the bucket (a literal name would not).
+        f"S3Folder('assets', bucket=b.name, source_path={str(root)!r}, prefix='web/')\n"
+    )
+
+    report = (await engine.apply(config)).unwrap()
+    assert len(report.created) == 2
+    assert _objects("eng-site") == {"web/index.html": "v1"}
+
+    # Re-apply unchanged -> Merkle NOOP for both nodes.
+    report2 = (await engine.apply(config)).unwrap()
+    assert len(report2.noop) == 2
+
+    # Edit a file on disk -> manifest changes -> S3Folder UPDATE (bucket unchanged).
+    (root / "index.html").write_text("v2")
+    report3 = (await engine.apply(config)).unwrap()
+    assert "default:aws.S3Folder:assets" in report3.updated
+    assert _objects("eng-site") == {"web/index.html": "v2"}
+
+    # Change the immutable prefix -> REPLACE.
+    replaced = config.replace("prefix='web/'", "prefix='static/'")
+    report4 = (await engine.apply(replaced)).unwrap()
+    assert "default:aws.S3Folder:assets" in report4.replaced
+
+
 # -- SQS ---------------------------------------------------------------------
 
 
@@ -179,6 +322,18 @@ async def test_sqs_fifo_name_gets_suffix() -> None:
 async def test_sqs_read_missing_is_none() -> None:
     provider = AwsProvider()
     assert await provider.read(Context(), SqsQueue("q", queue_name="nope")) is None
+
+
+async def test_sqs_create_with_changed_attributes_adopts_the_existing_queue() -> None:
+    """A re-run create (state row never persisted) whose attributes differ from
+    the live queue's answers QueueAlreadyExists; it adopts by name rather than
+    failing the apply."""
+    provider = AwsProvider()
+    out = await provider.create(Context(), SqsQueue("q", queue_name="jobs", visibility_timeout=30))
+    again = await provider.create(
+        Context(), SqsQueue("q", queue_name="jobs", visibility_timeout=60)
+    )
+    assert again == out
 
 
 # -- plan-time input validation ----------------------------------------------
@@ -458,12 +613,28 @@ async def test_iam_policy_with_queue_ref_through_engine() -> None:
 _LAMBDA_TRUST = _TRUST_POLICY.replace("ec2.amazonaws.com", "lambda.amazonaws.com")
 
 
-async def test_lambda_create_read_update_delete() -> None:
+@pytest.fixture
+def package(tmp_path: Path) -> str:
+    """A real deployment package on disk. Lambda has no placeholder any more:
+    a function with no code is refused rather than silently shipped empty."""
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "index.py").write_text("def handler(event, context):\n    return {}\n")
+    return str(source)
+
+
+async def test_lambda_create_read_update_delete(package: str) -> None:
     provider = AwsProvider()
     role_out = await provider.create(
         Context(), IamRole("r", role_name="fn-role", assume_role_policy=_LAMBDA_TRUST)
     )
-    res = LambdaFunction("f", function_name="fn", role_arn=role_out["arn"], tags={"env": "t"})
+    res = LambdaFunction(
+        "f",
+        function_name="fn",
+        role_arn=role_out["arn"],
+        tags={"env": "t"},
+        code_path=package,
+    )
     out = await provider.create(Context(), res)
     assert out["arn"].endswith(":function:fn")
     assert await provider.read(Context(), res) is not None
@@ -471,7 +642,13 @@ async def test_lambda_create_read_update_delete() -> None:
     await provider.update(
         Context(),
         out,
-        LambdaFunction("f", function_name="fn", role_arn=role_out["arn"], runtime="python3.11"),
+        LambdaFunction(
+            "f",
+            function_name="fn",
+            role_arn=role_out["arn"],
+            runtime="python3.11",
+            code_path=package,
+        ),
     )
     cfg = boto3.client("lambda").get_function(FunctionName="fn")["Configuration"]
     assert cfg["Runtime"] == "python3.11"
@@ -498,6 +675,22 @@ async def test_sns_topic_and_subscription() -> None:
 async def test_sns_read_missing_is_none() -> None:
     provider = AwsProvider()
     assert await provider.read(Context(), SnsTopic("t", name="ghost")) is None
+
+
+async def test_sns_subscription_survives_its_topic_deleted_out_of_band() -> None:
+    """Listing subscriptions of a deleted topic raises NotFound; that is absence
+    (the subscriptions died with the topic), so read reports None and delete is
+    a no-op — not a raised apply."""
+    provider = AwsProvider()
+    topic_out = await provider.create(Context(), SnsTopic("t", name="doomed"))
+    queue_out = await provider.create(Context(), SqsQueue("q", queue_name="doomed-q"))
+    sub = SnsSubscription("s", topic_arn=topic_out["arn"], endpoint=queue_out["arn"])
+    await provider.create(Context(), sub)
+
+    boto3.client("sns").delete_topic(TopicArn=topic_out["arn"])
+
+    assert await provider.read(Context(), sub) is None
+    await provider.delete(Context(), sub)  # idempotent, like every other handler
 
 
 async def test_dynamodb_table_crud() -> None:
@@ -586,6 +779,66 @@ async def test_delete_targets_state_id_not_shared_cidr() -> None:
     live = {v["VpcId"] for v in ec2.describe_vpcs()["Vpcs"]}
     assert ours not in live  # ours (by its id) was deleted
     assert bystander in live  # the shared-CIDR VPC was left untouched
+
+
+# -- create idempotency -----------------------------------------------------
+#
+# A create is re-run whenever its state row never reached `created`: the process
+# was killed between the AWS call and the persist, or a sibling node failed and
+# cancelled the task. By then the resource may exist with nothing recording it,
+# so an unconditional create either duplicates it or fails on a name clash.
+
+
+async def test_ec2_create_adopts_its_own_interrupted_create() -> None:
+    provider = AwsProvider()
+    vpc = Vpc("v", cidr_block="10.0.0.0/16")
+    first = (await provider.create(Context(), vpc))["vpc_id"]
+
+    again = (await provider.create(Context(), vpc))["vpc_id"]
+    assert again == first, "the retry must adopt, not make a second VPC"
+
+
+async def test_ec2_create_does_not_adopt_a_stranger_sharing_a_cidr() -> None:
+    """EC2 attributes are not unique, so adoption is keyed on the node tag."""
+    provider = AwsProvider()
+    boto3.client("ec2").create_vpc(CidrBlock="10.0.0.0/16")  # someone else's
+
+    ours = (await provider.create(Context(), Vpc("v", cidr_block="10.0.0.0/16")))["vpc_id"]
+    vpcs = boto3.client("ec2").describe_vpcs()["Vpcs"]
+    assert sum(1 for v in vpcs if v["CidrBlock"] == "10.0.0.0/16") == 2
+    assert ours in {v["VpcId"] for v in vpcs}
+
+
+#: Built inside the test, not at collection time: a resource's region comes from
+#: the active stack, which the `aws_env` fixture sets up.
+#:
+#: Route53 is deliberately absent — moto lets a repeated CallerReference create a
+#: second zone, where real Route53 raises HostedZoneAlreadyExists, so a test here
+#: would be asserting moto's behaviour rather than the handler's.
+_NAMED = {
+    "iam_role": lambda: IamRole("r", role_name="atl-role", assumed_by=ServicePrincipal.Lambda),
+    "dynamodb_table": lambda: DynamoDbTable("t", table_name="atl-table", hash_key="pk"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_NAMED))
+async def test_named_create_adopts_instead_of_erroring(kind: str) -> None:
+    """A second create raises AlreadyExists/Conflict; adoption keyed on the name
+    resolves to the resource this node declares."""
+    provider = AwsProvider()
+    resource = _NAMED[kind]()
+    first = await provider.create(Context(), resource)
+    assert await provider.create(Context(), resource) == first
+
+
+async def test_lambda_create_adopts_instead_of_erroring(package: str) -> None:
+    provider = AwsProvider()
+    role = await provider.create(
+        Context(), IamRole("r", role_name="adopt-role", assume_role_policy=_LAMBDA_TRUST)
+    )
+    fn = LambdaFunction("f", function_name="adopt-fn", role_arn=role["arn"], code_path=package)
+    first = await provider.create(Context(), fn)
+    assert await provider.create(Context(), fn) == first
 
 
 async def test_new_resources_read_missing_is_none() -> None:
@@ -725,6 +978,27 @@ async def test_cloudfront_distribution_crud() -> None:
     assert await provider.read(ctx, tracked) is None
 
 
+async def test_cloudfront_distribution_rerun_create_adopts_by_caller_reference() -> None:
+    """The stable CallerReference makes a re-run create answer
+    DistributionAlreadyExists; the handler adopts the distribution holding the
+    reference instead of surfacing the conflict."""
+    provider = AwsProvider()
+    ctx = Context()
+    oac = await provider.create(ctx, OriginAccessControl("o", oac_name="dup-oac"))
+    origin = "b.s3.us-east-1.amazonaws.com"
+    first = await provider.create(
+        ctx, CloudFrontDistribution("cdn", origin_domain=origin, oac_id=oac["oac_id"])
+    )
+
+    again = await provider.create(
+        ctx, CloudFrontDistribution("cdn", origin_domain=origin, oac_id=oac["oac_id"])
+    )
+
+    assert again["distribution_id"] == first["distribution_id"]
+    listing = boto3.client("cloudfront").list_distributions()["DistributionList"]
+    assert len(listing.get("Items", [])) == 1, "adopted, not duplicated"
+
+
 async def test_acm_certificate_crud() -> None:
     provider = AwsProvider()
     ctx = Context()
@@ -813,3 +1087,328 @@ async def test_static_site_graph_through_engine() -> None:
     # re-apply -> NOOP; destroy removes all four (exercises CloudFront disable-then-delete)
     assert len((await engine.apply(config)).unwrap().noop) == 4
     assert len((await engine.destroy()).unwrap().deleted) == 4
+
+
+def test_a_log_group_is_found_past_the_first_page() -> None:
+    """`describe_log_groups` filters by prefix and pages at 50.
+
+    A single unpaginated request only finds the group when fewer than 50 others
+    share its prefix — which no config controls and nothing warns about. Missing
+    it does not degrade gracefully: `read` returns None, refresh calls the node
+    MISSING, and `refresh --write` deletes the state row for a log group that is
+    sitting there perfectly healthy.
+
+    Driven against a stub rather than moto, which does not enforce the page
+    limit — so a moto-only test passes whether or not the handler pages at all,
+    which is precisely the bug.
+    """
+
+    class PagingLogs:
+        """A `logs` client that pages the way the real API does."""
+
+        def __init__(self) -> None:
+            first = [{"logGroupName": f"/svc/shared-{i:03d}", "arn": "a"} for i in range(50)]
+            second = [{"logGroupName": "/svc/shared-target", "arn": "arn::target"}]
+            self.pages = [{"logGroups": first}, {"logGroups": second}]
+
+        def describe_log_groups(self, **_kw: Any) -> dict[str, Any]:
+            return self.pages[0]  # one request only ever sees page one
+
+        def get_paginator(self, _name: str) -> Any:
+            pages = self.pages
+
+            class Paginator:
+                def paginate(self, **_kw: Any) -> Any:
+                    return iter(pages)
+
+            return Paginator()
+
+    found = CloudWatchLogGroupHandler._find(PagingLogs(), "/svc/shared-target")
+
+    assert found is not None, "the group exists but was not found past page one"
+    assert found["arn"] == "arn::target"
+
+
+async def test_a_log_group_read_reports_the_inputs_it_can_check() -> None:
+    """A read returning only the arn makes refresh say "in sync" about a retention
+    policy it never looked at."""
+    provider = AwsProvider()
+    res = CloudWatchLogGroup(
+        "l", log_group_name="/svc/observed", retention_days=14, tags={"env": "prod"}
+    )
+    await provider.create(Context(), res)
+
+    live = await provider.read(Context(), res)
+
+    assert live is not None
+    assert live["retention_days"] == 14
+    assert live["tags"] == {"env": "prod"}
+
+
+async def test_a_log_group_that_is_really_gone_still_reads_as_missing() -> None:
+    """The pagination fix must not turn every read into a false positive."""
+    provider = AwsProvider()
+    res = CloudWatchLogGroup("l", log_group_name="/svc/never-made", retention_days=7)
+    assert await provider.read(Context(), res) is None
+
+
+async def test_a_denied_dynamodb_update_is_reported_not_swallowed() -> None:
+    """`update_table` used to be wrapped in a blanket `suppress(ClientError)`.
+
+    An AccessDenied or a throttle then read as success: the apply reported the
+    table updated, state recorded the new billing mode, and the table kept the
+    old one — with nothing anywhere saying so. Only the genuine "nothing to
+    change" response is tolerable here.
+    """
+    provider = AwsProvider()
+    res = DynamoDbTable("t", table_name="denied", hash_key="id")
+    out = await provider.create(Context(), res)
+
+    # The client the dispatcher will actually hand the handler, not a
+    # look-alike from a different (alias, service, region) cache entry.
+    _handler, client = provider._dispatch(res, "update")
+
+    def denied(**_kw: Any) -> None:
+        raise ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "not authorized"}},
+            "UpdateTable",
+        )
+
+    client.update_table = denied
+    with pytest.raises(ProviderError):
+        await provider.update(Context(), out, res)
+
+
+async def test_an_unchanged_dynamodb_billing_mode_is_still_a_no_op() -> None:
+    """The one response that must stay tolerated: an update touching only tags
+    legitimately reports that there is nothing to change."""
+    provider = AwsProvider()
+    res = DynamoDbTable("t", table_name="unchanged", hash_key="id", tags={"a": "1"})
+    out = await provider.create(Context(), res)
+
+    updated = await provider.update(
+        Context(), out, DynamoDbTable("t", table_name="unchanged", hash_key="id", tags={"a": "2"})
+    )
+    assert updated["arn"] == out["arn"]
+
+
+# -- lambda code source -------------------------------------------------------
+
+
+async def test_a_lambda_with_no_code_is_refused(package: str) -> None:
+    """The trap this replaces: the handler used to ship a hardcoded placeholder
+    zip for *every* function.
+
+    That deploys, reports success, and then fails at the first invocation running
+    code nobody wrote — the worst shape a failure can take, because every signal
+    up to that point says it worked.
+    """
+    provider = AwsProvider()
+    role = await provider.create(
+        Context(), IamRole("r", role_name="nocode-role", assume_role_policy=_LAMBDA_TRUST)
+    )
+    fn = LambdaFunction("f", function_name="nocode", role_arn=role["arn"])
+
+    with pytest.raises(ProviderError, match="has no code"):
+        await provider.create(Context(), fn)
+
+
+async def test_the_deployed_bytes_are_the_ones_on_disk(package: str) -> None:
+    """The point of the whole change."""
+    provider = AwsProvider()
+    role = await provider.create(
+        Context(), IamRole("r", role_name="real-role", assume_role_policy=_LAMBDA_TRUST)
+    )
+    (Path(package) / "index.py").write_text("def handler(e, c):\n    return 'mine'\n")
+    fn = LambdaFunction("f", function_name="real", role_arn=role["arn"], code_path=package)
+    await provider.create(Context(), fn)
+
+    import zipfile as _zip
+
+    shipped = boto3.client("lambda").get_function(FunctionName="real")
+    assert shipped["Configuration"]["FunctionName"] == "real"
+    # The package the resource fingerprinted is a zip of what is on disk.
+    archive = _zip.ZipFile(io.BytesIO(package_bytes(Path(package))))
+    assert archive.read("index.py").decode() == "def handler(e, c):\n    return 'mine'\n"
+
+
+def test_the_fingerprint_changes_with_the_code(tmp_path: Path) -> None:
+    """`code_sha256` is the input the diff watches, so it has to move when a byte
+    does — otherwise a code change plans as NOOP and never ships."""
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "index.py").write_text("one")
+    first = LambdaFunction(
+        "f", function_name="fp", role_arn="arn:x", region="eu-north-1", code_path=str(source)
+    ).code_sha256
+
+    (source / "index.py").write_text("two")
+    second = LambdaFunction(
+        "f", function_name="fp", role_arn="arn:x", region="eu-north-1", code_path=str(source)
+    ).code_sha256
+
+    assert first != second
+
+
+def test_the_fingerprint_is_stable_for_identical_trees(tmp_path: Path) -> None:
+    """Two checkouts of the same code must fingerprint alike, or every plan on a
+    fresh clone shows a spurious update. File mtimes differ between checkouts,
+    which is why the zip pins its timestamps."""
+    contents = {"index.py": "def handler(e, c): pass\n", "lib/util.py": "X = 1\n"}
+    digests = []
+    for nth in ("a", "b"):
+        root = tmp_path / nth
+        for name, text in contents.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        digests.append(
+            LambdaFunction(
+                "f",
+                function_name="fp",
+                role_arn="arn:x",
+                region="eu-north-1",
+                code_path=str(root),
+            ).code_sha256
+        )
+    assert digests[0] == digests[1]
+
+
+def test_a_missing_code_path_is_caught_at_config_time(tmp_path: Path) -> None:
+    """Before any provider call, so the error names the config rather than
+    arriving half-way through an apply."""
+    with pytest.raises(LanguageError, match="does not exist"):
+        LambdaFunction(
+            "f",
+            function_name="fp",
+            role_arn="arn:x",
+            region="eu-north-1",
+            code_path=str(tmp_path / "nope"),
+        )
+
+
+def test_code_path_and_s3_bucket_are_mutually_exclusive(tmp_path: Path) -> None:
+    with pytest.raises(LanguageError, match="not both"):
+        LambdaFunction(
+            "f",
+            function_name="fp",
+            role_arn="arn:x",
+            region="eu-north-1",
+            code_path=str(tmp_path),
+            s3_bucket="b",
+            s3_key="k",
+        )
+
+
+def test_an_s3_source_needs_a_key() -> None:
+    with pytest.raises(LanguageError, match="s3_key"):
+        LambdaFunction(
+            "f", function_name="fp", role_arn="arn:x", region="eu-north-1", s3_bucket="b"
+        )
+
+
+async def test_a_lambda_read_reports_the_config_it_can_check(package: str) -> None:
+    provider = AwsProvider()
+    role = await provider.create(
+        Context(), IamRole("r", role_name="obs-role", assume_role_policy=_LAMBDA_TRUST)
+    )
+    fn = LambdaFunction(
+        "f",
+        function_name="observed",
+        role_arn=role["arn"],
+        code_path=package,
+        memory_size=512,
+        timeout=42,
+    )
+    await provider.create(Context(), fn)
+
+    live = await provider.read(Context(), fn)
+
+    assert live is not None
+    assert live["memory_size"] == 512
+    assert live["timeout"] == 42
+    assert live["handler"] == "index.handler"
+
+
+# -- s3 bucket safety ---------------------------------------------------------
+
+
+async def test_destroying_a_bucket_with_objects_fails_without_force_destroy() -> None:
+    """S3 refuses to delete a non-empty bucket. Without `force_destroy` there is
+    no way through it from config, so the whole stack wedges on teardown."""
+    provider = AwsProvider()
+    res = S3Bucket("b", bucket="has-stuff")
+    await provider.create(Context(), res)
+    boto3.client("s3").put_object(Bucket="has-stuff", Key="a.txt", Body=b"x")
+
+    with pytest.raises(ProviderError, match="not empty"):
+        await provider.delete(Context(), res)
+
+
+async def test_force_destroy_empties_the_bucket_first() -> None:
+    provider = AwsProvider()
+    res = S3Bucket("b", bucket="disposable", force_destroy=True)
+    await provider.create(Context(), res)
+    client = boto3.client("s3")
+    for index in range(5):
+        client.put_object(Bucket="disposable", Key=f"k{index}.txt", Body=b"x")
+
+    await provider.delete(Context(), res)
+
+    assert await provider.read(Context(), res) is None
+
+
+async def test_force_destroy_clears_versions_and_delete_markers() -> None:
+    """On a versioned bucket, deleting objects only adds delete markers — the
+    bucket is still not empty and `delete_bucket` still refuses."""
+    provider = AwsProvider()
+    res = S3Bucket("b", bucket="versioned-disposable", versioning=True, force_destroy=True)
+    await provider.create(Context(), res)
+    client = boto3.client("s3")
+    client.put_object(Bucket="versioned-disposable", Key="k.txt", Body=b"one")
+    client.put_object(Bucket="versioned-disposable", Key="k.txt", Body=b"two")
+    client.delete_object(Bucket="versioned-disposable", Key="k.txt")  # a delete marker
+
+    await provider.delete(Context(), res)
+
+    assert await provider.read(Context(), res) is None
+
+
+async def test_a_bucket_is_private_and_encrypted_unless_told_otherwise() -> None:
+    """The defaults are the safe ones: a public or unencrypted bucket should be
+    something someone wrote down, not something they forgot."""
+    provider = AwsProvider()
+    res = S3Bucket("b", bucket="safe-by-default")
+    await provider.create(Context(), res)
+
+    live = await provider.read(Context(), res)
+
+    assert live is not None
+    assert live["block_public_access"] is True
+    assert live["encryption"] == "AES256"
+
+
+async def test_the_safe_defaults_can_be_turned_off_explicitly() -> None:
+    provider = AwsProvider()
+    res = S3Bucket("b", bucket="deliberately-open", block_public_access=False, encryption=None)
+    await provider.create(Context(), res)
+
+    live = await provider.read(Context(), res)
+
+    assert live is not None
+    assert live["block_public_access"] is False
+    assert live["encryption"] is None
+
+
+async def test_bucket_drift_on_the_safety_settings_is_observable() -> None:
+    """A bucket opened up in the console has to show as drift, which means the
+    read must report these fields rather than only the arn."""
+    provider = AwsProvider()
+    res = S3Bucket("b", bucket="opened-later")
+    await provider.create(Context(), res)
+    boto3.client("s3").delete_public_access_block(Bucket="opened-later")
+
+    live = await provider.read(Context(), res)
+
+    assert live is not None
+    assert live["block_public_access"] is False, "the change is visible to refresh"

@@ -25,6 +25,7 @@ def assemble_compiled(
     resources: dict[str, Resource],
     bindings: tuple[PolicyBinding, ...],
     outputs: dict[str, Any],
+    inputs: dict[str, Any] | None = None,
 ) -> Result[Compiled, AtlantideError]:
     """Build a :class:`Compiled` from an IR graph and its (source- or artifact-sourced) parts."""
     return build_graph(ir).map(
@@ -35,13 +36,12 @@ def assemble_compiled(
             resources=resources,
             policy_bindings=bindings,
             outputs=outputs,
+            inputs=dict(inputs or {}),
         )
     )
 
 
-def rehydrate_resources(
-    ir: IRGraph, types: dict[str, type[Resource]]
-) -> dict[str, Resource]:
+def rehydrate_resources(ir: IRGraph, types: dict[str, type[Resource]]) -> dict[str, Resource]:
     """Rebuild live ``Resource`` objects from IR (for deploy — there is no source).
 
     ``{"$ref": "id#attr"}`` markers become ``Ref`` objects so validation passes
@@ -61,8 +61,15 @@ def rehydrate_resources(
             prevent_destroy=node.prevent_destroy,
             create_before_destroy=node.create_before_destroy,
             ignore_changes=node.ignore_changes,
+            # Without this a deploy re-lowers a rename as a destroy plus a
+            # create against the target state.
+            aliases=node.aliases,
         )
-        resources[node.id] = cls(name, lifecycle=lifecycle, **properties)
+        # Explicit edges travel too: a deploy that lost them would schedule
+        # the resources in an order the config deliberately ruled out.
+        resources[node.id] = cls(
+            name, lifecycle=lifecycle, depends_on=list(node.depends_on), **properties
+        )
     return resources
 
 
@@ -74,4 +81,4 @@ def _markers_to_refs(value: Any) -> Any:
             return secret_ref_from_marker(v)
         return v
 
-    return tree_map(value, leaf, include_sets=False)
+    return tree_map(value, leaf)

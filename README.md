@@ -1,36 +1,53 @@
 # Atlantide
 
-Typed, deterministic Infrastructure-as-Code for Python.
+**Typed, deterministic Infrastructure-as-Code for Python.**
 
-Atlantide is an IaC engine built on three ideas:
+Write infrastructure in real Python — type-checked by your IDE and `mypy`, not a
+templating language — and get the guarantees a config language exists to provide:
+the same config always produces the same plan, and the engine can prove it.
 
-- **Enforced determinism.** Configs are written in plain Python but executed by
-  **Atlas-lang** — a bounded interpreter with no clock, randomness, environment,
-  or network access. Two runs of the same config produce byte-identical
-  intermediate representation and a stable content hash.
+Atlantide rests on three ideas:
+
+- **Enforced determinism.** Configs are plain Python, but executed by *Atlas-lang*:
+  a bounded interpreter with no clock, no randomness, no environment, no network.
+  Two runs of the same config produce a byte-identical intermediate representation
+  and a stable content hash. Not a convention — the interpreter cannot do otherwise.
 - **Graph state with Merkle skip.** Resources form a dependency graph. A two-phase
-  Merkle `input_hash` lets `apply` skip unchanged nodes with **zero provider
-  calls**, and independent nodes reconcile in parallel.
-- **Typed resources with per-field mutability.** Each field is declared
-  `mutable()`, `immutable()`, or `computed()`. Changing a mutable field is an
-  in-place UPDATE; changing an immutable one is a REPLACE (destroy + create);
-  computed fields never diff.
+  Merkle `input_hash` lets `apply` skip unchanged nodes with *zero* provider calls,
+  and reconcile independent nodes in parallel.
+- **Per-field mutability.** Every field is declared `mutable()`, `immutable()`, or
+  `computed()`. Changing a mutable field is an in-place UPDATE; changing an
+  immutable one is a REPLACE; computed fields never diff. What a change costs is
+  visible in the type, before you run anything.
+
+---
 
 ## Install
 
-Requires Python ≥ 3.11. Uses [uv](https://docs.astral.sh/uv/).
-
 ```bash
-uv sync
+pip install atlantide          # or: uv add atlantide
 ```
 
-## Quickstart
+Python ≥ 3.11.
 
-Write a config in Python — valid for your IDE and `mypy`, run by Atlas-lang:
+```bash
+atlantide init myproject       # scaffold a project that already compiles
+cd myproject && atlantide plan
+```
+
+`init` writes an `atlantide.toml`, a starter config, and a `.gitignore` that keeps
+the state database and the secrets keyfile out of git. The default template uses the
+local provider, so it applies with no cloud credentials at all.
+
+## A quick look
 
 ```python
 from atlantide.core import Stack, output
+from atlantide.policy import enforce
 from atlantide.providers.aws import S3Bucket, SqsQueue
+
+enforce("require-tags", keys=["env"])
+enforce("deny-destroy-in-protected", stacks=["prod"])
 
 for env in ["dev", "prod"]:
     with Stack(env, region="eu-north-1", name_prefix="atlantide", tags={"env": env}):
@@ -39,223 +56,146 @@ for env in ["dev", "prod"]:
         output("assets_arn", assets.arn)
 ```
 
-Reading another resource's output (`assets.arn`) returns a lazy `Ref` — it wires
-the dependency and resolves to the real value at apply time.
+```bash
+atlantide plan  infra.py     # preview
+atlantide apply infra.py     # reconcile, in parallel
+atlantide apply infra.py     # again: all NOOP, zero provider calls
+```
 
-### Authoring helpers
+Reading another resource's output (`assets.arn`) returns a lazy `Ref`. That is what
+wires the dependency edge — no explicit `depends_on`, no string addresses — and it
+resolves to the real value at apply time.
 
-- **Output combinators** — `concat`, `interpolate`, `join` build a value *from* an
-  apply-time `Ref` without knowing it yet (the language isn't re-run at apply, so
-  they serialize as data, not closures):
+### Infrastructure that already exists
 
-  ```python
-  S3BucketPolicy("p", bucket=assets.bucket, statements=[
-      allow("s3:GetObject", on=concat(assets.arn, "/*"), principal="*"),
-  ])
-  ```
-- **Rename without replace** — give a renamed resource its old id (or bare old
-  name) so it maps to the existing state node instead of destroy + create:
-
-  ```python
-  S3Bucket("assets_v2", lifecycle=Lifecycle(aliases=("assets",)), ...)
-  ```
-- **Per-block region** — `with region("us-east-1"):` overrides the stack's region
-  for the resources inside (e.g. an ACM cert for CloudFront).
-- **Components** — library-authored L2 groups (e.g. `aws.SecureBucket`) bundle
-  several resources behind one parameterized object; children auto-namespace so a
-  component used twice never collides. They can also be **published** in a git repo
-  and imported by anyone — see [Components](#components).
-
-## CLI
+Declare it as above, then bind it to what is already running rather than building a
+second copy:
 
 ```bash
-uv run atlantide plan    infra.py                    # preview changes
-uv run atlantide apply   infra.py                    # reconcile (parallel)
-uv run atlantide apply   infra.py                    # re-run: all NOOP, zero provider calls
-uv run atlantide refresh                             # detect drift vs live state
-uv run atlantide graph   infra.py --format mermaid   # dependency graph
-uv run atlantide destroy                             # tear down
+atlantide import                              # what is declared but not tracked
+atlantide import prod:aws.S3Bucket:assets     # found by name
+atlantide import prod:aws.Vpc:main vpc-0abc   # located by an id AWS assigned
+atlantide plan                                # no changes
 ```
 
-State defaults to `atlantide.db`; override with `--state`. Mutating commands
-(`apply` / `deploy` / `destroy` / `refresh`) take `--confirm/-y`, `--region`,
-`--parallelism/-p`, and — where they change state — `--on-failure rollback|halt`
-(**default `rollback`**: undo completed nodes on failure). `plan` and `refresh`
-support `--json` and `--detailed-exitcode` (0 = no change, 2 = changes, 1 = error).
-
-Config path, state db, and defaults can be fixed once in `atlantide.toml` so
-commands take no flags inside a project:
-
-```toml
-config      = "infra.py"
-state       = "atlantide.db"
-parallelism = 8
-aws_region  = "eu-north-1"
-aws_profile = "default"
-aws_endpoint = "http://localhost:4566"   # e.g. LocalStack
-secrets_key   = ".atlantide.key"
-secrets_store = ".atlantide.secrets"
-
-[aws.aliases.prod]                       # alternate account (multi-account)
-profile  = "prod-account"                # a resource selects it via provider_alias="prod"
-endpoint = "http://localhost:4566"
-```
-
-Additional commands:
-
-- **`build` / `verify` / `deploy`** — portable `.atlas` artifacts (content-hashed,
-  provider-version pinned): compile once, promote the same bytes anywhere.
-- **`refresh`** — read live provider state, report drift; `--write` syncs it back.
-- **`secret`** — manage the local AES-GCM encrypted name→value store; resources
-  reference secrets by name (`SecretRef`), resolved at apply:
-
-  ```bash
-  uv run atlantide secret set app/signing-key       # value prompted (hidden) if omitted
-  uv run atlantide secret get app/signing-key -r    # print plaintext (--reveal required)
-  uv run atlantide secret list                       # names only, no values
-  uv run atlantide secret rm  app/signing-key        # remove
-  ```
-- **`component`** — `add` / `lock` / `vendor` / `verify` components published in
-  public git repos; imported as `atlantide.components.<alias>`. See
-  [Components](#components).
-- **`resources` / `schema`** — discover resource types and inspect a type's fields.
-
-## Components
-
-L2 constructs — several resources behind one parameterized object, like Pulumi's
-`ComponentResource` or a CDK Construct. Config *uses* components but can't *define*
-them: Atlas-lang bans `class`, so a component is ordinary Python written by a
-library or provider author.
-
-```python
-from atlantide.core import Component, child
-from atlantide.providers.aws import S3Bucket
-
-class SecureBucket(Component):
-    def __init__(self, name, *, bucket):
-        self.bucket = child(S3Bucket, "assets", bucket=bucket)
-        # ...plus a TLS-only hardening policy wired to self.bucket
-```
-
-A component owns no IR node of its own — its children lower as normal flat
-resources, and each child's logical name is namespaced under the instance
-(`{component}-{child}`), so instantiating a component twice never collides.
-
-### Publishing & consuming
-
-Components can be shared in a public git repo and imported by anyone. There is **no
-live URL import** (Node-style): config is a deterministic sandbox — it may import
-only `atlantide.*` and cannot touch the network — so a fetch at eval time would
-break both. Instead you fetch once, pinned to a commit + content hash (the
-`terraform init` model), and import the vendored code locally under the
-`atlantide.components.*` namespace, which the sandbox already permits.
-
-```bash
-# fetch, pin (commit + content hash) into atlantide.lock, vendor into .atlantis/
-uv run atlantide component add https://github.com/acme/secure-bucket --ref v1.2.0 --as acme --subdir src
-uv run atlantide component verify   # re-hash vendored trees vs the lock (tamper/drift)
-uv run atlantide component vendor    # rebuild .atlantis/ from the lock alone (e.g. fresh checkout)
-uv run atlantide component lock      # re-resolve declared refs -> commits
-```
-
-```python
-# infra.py — imported and used like any other resource
-from atlantide.components.acme import SecureBucket
-SecureBucket("assets", bucket="acme-assets")
-```
-
-`add` records the source under `[components.acme]` in `atlantide.toml` and the
-resolved pin in `atlantide.lock`. **Commit `atlantide.lock`; git-ignore `.atlantis/`**
-(it's derived — `vendor` rebuilds it from the lock). A `build` artifact also records
-each component's commit as provenance.
-
-**Trust:** a published component runs as trusted Python, like a provider — vet what
-you add. After that, integrity rests on the pin, and `verify` fails on any tamper or
-drift. See [`examples/components/`](examples/components/) for a runnable
-publish-and-consume walkthrough.
+A resource whose live settings differ from what the config declares is *not*
+imported — importing it would mean the next apply quietly changes it. `import` prints
+what differs so the config can be reconciled first, or `--allow-drift` adopts it and
+lets the next plan show the update. Nothing about `import` creates, changes or
+deletes anything; the undo is `atlantide state rm`, which forgets a row and leaves
+the resource alone.
 
 ## How it works
 
-Every `plan`/`apply` runs the same pipeline — pure, deterministic stages first,
-then the effectful reconcile:
+Every `plan` and `apply` runs one pipeline. Everything before the diff is pure and
+deterministic; everything after it touches the world.
 
 ```mermaid
-flowchart LR
-    A[Config .py] --> B[Atlas-lang<br/>+ IR + hash]
-    B --> C[Graph<br/>+ Merkle]
-    C --> D[Diff vs<br/>prior state]
-    D --> E[Plan<br/>+ policy]
-    E -->|plan| F[Changeset]
-    E -->|apply| G[Parallel apply<br/>skip unchanged]
+flowchart TB
+    subgraph pure["Deterministic — no I/O; same input, same bytes"]
+        direction LR
+        cfg["infra.py"] --> lang["Atlas-lang<br/>subset check + fuel-bounded eval"]
+        lang --> ir["IR + canonical JSON (RFC 8785)<br/>stable content hash"]
+        ir --> dag["Dependency graph<br/>Refs become edges, cycles rejected"]
+        dag --> merkle["Two-phase Merkle<br/>input_hash per node"]
+    end
+
+    merkle --> diff{"Diff"}
+    store[("State backend<br/>sqlite · s3+dynamodb · postgres")] -.->|prior hashes| diff
+    diff --> plan["Plan<br/>ordered, policy-checked"]
+
+    plan -->|plan| changeset["Changeset<br/>NOOP · CREATE · UPDATE · REPLACE · DELETE"]
+    plan -->|apply| exec["Executor<br/>parallel, under a renewed lease"]
+
+    exec -->|unchanged hash| skip["Skipped<br/>no provider call"]
+    exec <-->|create · read · update · delete| prov["Providers<br/>aws · local · random · yours"]
+    exec -->|fenced writes| store
 ```
 
-**Steps**
+1. **Atlas-lang** validates the config against a Python subset — no `while`,
+   `class`, dunder access, `eval`, or non-allowlisted imports — then evaluates it
+   with a fuel budget and deterministic builtins only.
+2. **Lowering** turns evaluated resources, `Ref`s and `output()`s into an IR graph.
+   `Ref`s become dependency edges.
+3. **Canonicalization** serializes that IR to RFC 8785 JSON and hashes it. Two runs
+   are byte-identical, which is what makes a `.atlas` artifact portable.
+4. **Graph + Merkle**: cycles are rejected (Tarjan), then each node gets a
+   two-phase `input_hash` in topological order — so a change to one resource
+   propagates to everything downstream of it, and nothing else.
+5. **Diff** compares desired hashes against prior state, yielding a per-node action.
+   Per-field mutability is what decides UPDATE versus REPLACE.
+6. **Plan** orders the actions (creates and updates topologically, deletes in
+   reverse; a REPLACE is destroy-before-create), then policy bindings run against
+   the changeset — a mandatory violation blocks `apply` before anything happens.
+7. **Apply** takes a lease over the reachable graph, reconciles independent nodes
+   in parallel, skips Merkle-unchanged nodes entirely, and persists incrementally.
+   On failure it rolls back completed nodes as a saga.
 
-1. **Atlas-lang** — the config is validated (Python subset — no `while`, `class`,
-   dunder, `eval`, or non-allowlisted imports) and evaluated by a fuel-bounded
-   interpreter with deterministic builtins only.
-2. **Registry → IR** — evaluated resources, `Ref`s, and `output()`s lower into an
-   IR graph; `Ref`s become dependency edges.
-3. **Canonicalize** — IR serializes to canonical JSON (RFC 8785) and gets a stable
-   content hash; two runs are byte-identical.
-4. **Graph** — the dependency graph is built and checked for cycles (Tarjan).
-5. **Merkle** — each node gets a two-phase `input_hash` in topological order.
-6. **Diff** — desired hashes compare against prior state → per-node action
-   (NOOP / CREATE / UPDATE / REPLACE / DELETE); per-field mutability decides
-   UPDATE vs REPLACE.
-7. **Plan** — actions ordered (creates/updates topo, deletes reversed; REPLACE =
-   destroy-before-create); `prevent_destroy` blocks protected deletes.
-8. **Policy** — plan-time bindings evaluate against the changeset; mandatory
-   violations block `apply`.
-9. **Apply** — under a whole-state lock, the executor reconciles independent nodes
-   in parallel, calls providers, skips Merkle-unchanged nodes (zero calls), and
-   persists incrementally. On failure it rolls back completed nodes as a saga by
-   default (`--on-failure halt` instead leaves state as-is, resumable). Outputs print.
+The pure half is why `plan` needs no credentials, why `validate` runs in a
+pre-commit hook, and why the same compiled artifact can be promoted from staging
+to production without re-executing the config.
 
-## Providers
+## Main features
 
-- **`local`** — `File`, `Null`. Credential-free; runs in CI.
-- **`random`** — `Uuid`, `Password`, `Id`, `Timestamp`. Values generated once at
-  apply, then pinned in state.
-- **`aws`** — `S3Bucket`, `S3BucketPolicy`, `SqsQueue`, `IamRole`, `IamPolicy`,
-  `LambdaFunction`, `SnsTopic`, `SnsSubscription`, `DynamoDbTable`,
-  `CloudWatchLogGroup`, `Vpc`, `Subnet`, `SecurityGroup`. Plus IAM policy helpers
-  (`allow`, `deny`, `assume_role`, `ServicePrincipal`) and the `SecureBucket` L2
-  component. Any resource may set `provider_alias=` to target an alternate
-  account. LocalStack-friendly via `--region` / `aws_endpoint`.
+**Determinism**
+- No clock, environment, or network in config — the interpreter has no such builtins.
+- Content-hashed IR; `build` emits a portable `.atlas` artifact with provider
+  versions pinned, `verify` re-checks it.
+- Determinism is over *(config, inputs)* — only inputs the config actually **read**.
 
-## Architecture
+**Plans**
+- Unchanged nodes cost zero provider calls.
+- `apply` re-diffs under the lock and **refuses** if the executed set differs from
+  the approved one (`--allow-plan-drift` opts out).
+- `refresh` reports which fields it actually checked; an unchecked field is never
+  claimed in sync.
+- A resource the provider cannot find is reported but **kept**.
 
-Layered, with import boundaries enforced by [import-linter](https://import-linter.readthedocs.io/):
+**State**
+- Backends: sqlite (default), memory, S3 + DynamoDB, Postgres.
+- Per-node leases, renewed for as long as a run lives.
+- **Fenced writes** — the store refuses a write from a lease that is no longer the
+  holder.
+- Versioned schema, forward migration, refuse-newer. `state backup` / `restore`.
+- Ctrl-C rolls back rather than abandoning the run mid-graph.
 
-| Layer | Responsibility |
-|---|---|
-| `core/` | `Resource`, field helpers, `Output`/`Ref`, `Provider` ABC, registry, `Stack` |
-| `lang/` | Atlas-lang: subset validator, fuel-bounded interpreter, deterministic builtins |
-| `ir/` | IR model, lowering (Ref → edges), canonical JSON (RFC 8785), content hash, two-phase Merkle, `.atlas` artifacts |
-| `graph/` | Graph build, Tarjan cycle detection, async Kahn scheduler |
-| `state/` | `StateBackend` ABC — sqlite (default) + memory; whole-state lock |
-| `reconcile/` | Diff (Merkle NOOP-skip), planner, parallel executor (saga rollback / resume), refresh |
-| `policy/` | Modular per-resource policy engine (`@policy` / `enforce`; mandatory blocks, advisory warns) |
-| `secrets/` | `SecretsProvider` ABC — env + AES-GCM keyfile store; secrets referenced by name, resolved at apply |
-| `engine/` | `Engine` — orchestrates compile → plan → apply/destroy/refresh/build/deploy; owns the state lock |
-| `providers/` | Provider implementations (local, random, aws) |
-| `components/` | Published components: git fetch, `atlantide.lock` pinning, vendored-tree hashing, and the import mount |
-| `cli/` | Typer app; console/render/json/diagram/progress output, project config |
+**Secrets**
+- `atlantide.secret("name")` is a *handle*; plaintext resolves in memory at apply.
+- Sensitive outputs sealed at rest; logs and audit records redact by construction.
+- Value stores: AES-GCM keyfile, environment, SSM Parameter Store.
 
-## Examples
+**Escape hatches**
+- `--target` narrows to a resource and its closure, `--replace` forces a recreate —
+  both printed in the plan.
+- A targeted apply leaves unselected state byte-identical.
+- `state rm` forgets a row without touching the provider; `state unlock` breaks a
+  dead run's lease.
 
-- [`examples/aws/`](examples/aws/) — a per-environment stack of ~14 resources each,
-  wiring cross-resource and cross-provider dependencies automatically.
-- [`examples/components/`](examples/components/) — authoring a publishable component
-  and consuming it from another project (git-pinned, vendored).
+**CI**
+- `--json`: stdout is exactly one JSON document, success or failure.
+- `--detailed-exitcode`: 0 no changes, 2 changes pending, 1 error.
+- `--audit-log` appends every run to JSONL, no-ops included.
+- Prompts are refused without a terminal; pass `--confirm/-y`.
 
-## Development
+**Extensibility**
+- Providers are ordinary Python packages discovered by entry point — the built-ins
+  included.
+- Components (L2 constructs) publishable from a git repo, pinned to a commit and
+  content hash, vendored locally.
 
-```bash
-uv sync --extra dev
-uv run pytest            # tests (memory + sqlite backends), 90% coverage floor
-uv run mypy              # strict type check
-uv run ruff check
-uv run lint-imports      # architecture contracts
-```
+<!-- docs:start -->
+## Documentation
+
+**<https://atlantide-org.github.io/>**
+
+- [CLI](https://atlantide-org.github.io/reference/cli/) — every command, targeting, exit codes
+- [Configuration](https://atlantide-org.github.io/reference/configuration/) — `atlantide.toml`, inputs, profiles
+- [Remote state](https://atlantide-org.github.io/reference/remote-state/) — S3 and Postgres backends, concurrency, secrets
+- [Authoring](https://atlantide-org.github.io/reference/authoring/) — output combinators, explicit ordering, renames
+- [Providers](https://atlantide-org.github.io/reference/providers/) — what ships, and writing your own
+- [Components](https://atlantide-org.github.io/reference/components/) — L2 constructs, publishing, consuming
+- [API reference](https://atlantide-org.github.io/api/) — `atlantide.core` and `atlantide.engine`
+- [Architecture](https://atlantide-org.github.io/architecture/) — what each package is for
+
+Runnable examples: [`examples/aws/`](examples/aws/) and [`examples/components/`](examples/components/).
+<!-- docs:end -->

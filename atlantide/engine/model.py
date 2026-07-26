@@ -20,6 +20,9 @@ class Compiled:
     resources: dict[str, Resource]
     policy_bindings: tuple[PolicyBinding, ...] = ()
     outputs: dict[str, Any] = field(default_factory=dict)
+    #: The config inputs this evaluation actually read. Shown above the plan, so a
+    #: plan that differs from yesterday's can be accounted for.
+    inputs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

@@ -41,11 +41,11 @@ def _adjacency(
     dependents_acc: dict[str, list[str]] = {nid: [] for nid in node_ids}
 
     for node in ir.nodes:
-        for dep in node.dependencies:
+        for dep in node.edges():
             if dep not in known:
                 raise IRError(f"node {node.id!r} depends on unknown node {dep!r}")
             dependents_acc[dep].append(node.id)
-        deps[node.id] = tuple(sorted(node.dependencies))
+        deps[node.id] = node.edges()
 
     dependents = {nid: tuple(sorted(v)) for nid, v in dependents_acc.items()}
     return deps, dependents

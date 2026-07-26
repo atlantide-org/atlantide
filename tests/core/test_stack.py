@@ -7,10 +7,12 @@ from typing import ClassVar
 import pytest
 
 from atlantide.core import (
+    Ref,
     RegistryError,
     Resource,
     Stack,
     collecting,
+    computed,
     current_stack,
     immutable,
     mutable,
@@ -101,6 +103,26 @@ def test_stack_tags_ignored_when_no_tags_field() -> None:
 def test_no_stack_tags_leaves_resource_untouched() -> None:
     t = Tagged("a", size=1, tags={"app": "web"})
     assert t.tags == {"app": "web"}
+
+
+def test_stack_tags_tolerate_a_computed_tags_field() -> None:
+    """A provider-owned `tags` output has nothing to merge at config time.
+
+    The stored UNSET reads as a Ref through ``__getattribute__``, so the merge
+    must inspect the raw stored value — otherwise it misdiagnoses the field as
+    an unmergeable handle and raises."""
+
+    class Reported(Resource):
+        class Meta:
+            provider: ClassVar[str] = "test"
+
+        size: int = immutable()
+        tags: dict[str, str] = computed()
+
+    with Stack("prod", region="us-east-1", tags={"env": "prod"}):
+        t = Reported("a", size=1)
+    # Still unset until apply: reading yields the Ref, not the stack's tags.
+    assert isinstance(t.tags, Ref)
 
 
 # -- region inheritance ----------------------------------------------------

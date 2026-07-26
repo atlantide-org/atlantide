@@ -23,7 +23,5 @@ def plan(changeset: ChangeSet, protected: Set[str]) -> Result[ChangeSet, Prevent
     ]
     if blocked:
         joined = ", ".join(sorted(blocked))
-        return Failure(
-            PreventDestroyError(f"prevent_destroy blocks destroying: {joined}")
-        )
+        return Failure(PreventDestroyError(f"prevent_destroy blocks destroying: {joined}"))
     return Success(changeset)

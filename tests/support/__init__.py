@@ -14,19 +14,29 @@ Drive scenarios through :class:`Harness` or :func:`engine_for`.
 
 from __future__ import annotations
 
+from tests.support.backends import Call, SpyBackend, StateWriteRefused
+from tests.support.cli import Cli
 from tests.support.clock import FakeClock
-from tests.support.cloud import cloud_env_fixture
+from tests.support.cloud import (
+    TEST_REGION,
+    aws_fixture,
+    cloud_env_fixture,
+    create_state_store,
+    fake_aws_credentials,
+)
 from tests.support.factories import (
     engine_for,
     globals_of,
     state_node,
     types_of,
 )
-from tests.support.harness import Harness
+from tests.support.harness import Harness, box_harness
 from tests.support.providers import FakeProvider, OutputSpec, default_outputs
 from tests.support.resources import (
     Box,
     Bucket,
+    Grouped,
+    NestedValue,
     Notifier,
     Server,
     Tagged,
@@ -36,21 +46,32 @@ from tests.support.resources import (
 )
 
 __all__ = [
+    "TEST_REGION",
     "Box",
     "Bucket",
+    "Call",
+    "Cli",
     "FakeClock",
     "FakeProvider",
+    "Grouped",
     "Harness",
+    "NestedValue",
     "Notifier",
     "OutputSpec",
     "Server",
+    "SpyBackend",
+    "StateWriteRefused",
     "Tagged",
     "Thing",
     "Vault",
     "Widget",
+    "aws_fixture",
+    "box_harness",
     "cloud_env_fixture",
+    "create_state_store",
     "default_outputs",
     "engine_for",
+    "fake_aws_credentials",
     "globals_of",
     "state_node",
     "types_of",

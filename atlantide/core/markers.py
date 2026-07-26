@@ -25,19 +25,61 @@ from collections.abc import Mapping
 from typing import Any
 
 from atlantide.core._tree import tree_any, tree_collect, tree_map
-from atlantide.core.types import HANDLES, Ref, StackOutputRef, Transform
+from atlantide.core.types import (
+    HANDLES,
+    REF_KEY,
+    STACK_OUTPUT_KEY,
+    TRANSFORM_KEY,
+    Ref,
+    StackOutputRef,
+    Transform,
+    _to_markers,
+)
 
-REF_KEY = "$ref"
-STACK_OUTPUT_KEY = "$stack_output"
-TRANSFORM_KEY = "$transform"
+__all__ = [
+    "REF_KEY",
+    "STACK_OUTPUT_KEY",
+    "TRANSFORM_KEY",
+    "canonicalize",
+    "collect_ref_targets",
+    "collect_refs",
+    "contains_handle",
+    "contains_ref",
+    "has_ref_key",
+    "is_ref_marker",
+    "is_ref_or_marker",
+    "is_stack_output_marker",
+    "is_transform_marker",
+    "ref_from_marker",
+    "refs_to_markers",
+    "remap_refs",
+    "single_key_marker",
+    "stack_output_from_marker",
+    "transform_from_marker",
+]
 
 
-# -- strict single-marker predicates and parsers ------------------------------
+def single_key_marker(value: Any, key: str) -> Any | None:
+    """The payload of a strict single-key ``{key: payload}`` marker, or ``None``.
+
+    Every ``$…`` marker shares this shape; each predicate adds only its own
+    payload test on top. Centralised so "strict" means the same thing for all
+    of them — exactly one key, and that key is the marker's.
+    """
+    if isinstance(value, dict) and len(value) == 1:
+        return value.get(key)
+    return None
 
 
 def is_ref_marker(value: Any) -> bool:
-    """A strict ``{"$ref": "node_id#attr"}`` marker (single key, str value)."""
-    return isinstance(value, dict) and isinstance(value.get(REF_KEY), str) and len(value) == 1
+    """A strict ``{"$ref": "node_id#attr"}`` marker (single key, str value).
+
+    The ``"#"`` is part of the shape: a dict whose ``$ref`` value cannot split
+    into ``node_id#attr`` is data that happens to carry the key, and treating it
+    as a marker would send a raw ``ValueError`` up from ``ref_from_marker``.
+    """
+    target = single_key_marker(value, REF_KEY)
+    return isinstance(target, str) and "#" in target
 
 
 def ref_from_marker(value: dict[str, Any]) -> Ref:
@@ -48,11 +90,7 @@ def ref_from_marker(value: dict[str, Any]) -> Ref:
 
 def is_stack_output_marker(value: Any) -> bool:
     """A strict ``{"$stack_output": "stack:name"}`` marker (single key, str value)."""
-    return (
-        isinstance(value, dict)
-        and isinstance(value.get(STACK_OUTPUT_KEY), str)
-        and len(value) == 1
-    )
+    return isinstance(single_key_marker(value, STACK_OUTPUT_KEY), str)
 
 
 def stack_output_from_marker(value: dict[str, Any]) -> StackOutputRef:
@@ -68,13 +106,8 @@ def is_ref_or_marker(value: Any) -> bool:
 
 def is_transform_marker(value: Any) -> bool:
     """A strict ``{"$transform": {"op": ..., "args": [...]}}`` marker."""
-    return (
-        isinstance(value, dict)
-        and len(value) == 1
-        and isinstance(value.get(TRANSFORM_KEY), dict)
-        and "op" in value[TRANSFORM_KEY]
-        and "args" in value[TRANSFORM_KEY]
-    )
+    body = single_key_marker(value, TRANSFORM_KEY)
+    return isinstance(body, dict) and "op" in body and "args" in body
 
 
 def transform_from_marker(value: dict[str, Any]) -> tuple[str, list[Any]]:
@@ -83,12 +116,19 @@ def transform_from_marker(value: dict[str, Any]) -> tuple[str, list[Any]]:
     return body["op"], list(body["args"])
 
 
-# -- tree-level predicates -----------------------------------------------------
-
-
 def contains_ref(value: Any) -> bool:
     """True if a live ``Ref`` object occurs anywhere in ``value``."""
     return tree_any(value, lambda v: isinstance(v, Ref))
+
+
+def contains_handle(value: Any) -> bool:
+    """True if any live handle occurs anywhere in ``value``.
+
+    The validator's test: a nested ``SecretRef``/``StackOutputRef``/``Transform``
+    (e.g. inside a ``tags`` dict) defers validation exactly as a nested ``Ref``
+    does — the value is only known once the handle resolves at apply.
+    """
+    return tree_any(value, lambda v: isinstance(v, HANDLES))
 
 
 def collect_refs(value: Any) -> list[Ref]:
@@ -105,21 +145,28 @@ def has_ref_key(value: Any) -> bool:
     return tree_any(value, lambda v: isinstance(v, dict) and REF_KEY in v, include_sets=False)
 
 
-# -- tree-level conversions ----------------------------------------------------
+def collect_ref_targets(value: Any) -> frozenset[str]:
+    """Node ids every ``$ref`` key anywhere in ``value`` points at.
+
+    The loose-match companion of :func:`has_ref_key`, for the same canonicalized
+    IR/state trees: the diff uses it to attribute a field's change to the
+    specific upstream nodes it references.
+    """
+    found = tree_collect(
+        value,
+        lambda v: isinstance(v, dict) and isinstance(v.get(REF_KEY), str),
+        include_sets=False,
+    )
+    return frozenset(str(v[REF_KEY]).partition("#")[0] for v in found)
 
 
 def canonicalize(value: Any) -> Any:
     """Resource-input canonical form: every handle type becomes a marker.
 
     Matches ``Resource.canonical_inputs`` semantics exactly (keys stringified,
-    sets lowered to sorted lists) — the bytes feed the IR canonical hash.
+    sets lowered to sorted lists); the bytes feed the IR canonical hash.
     """
-    return tree_map(
-        value,
-        lambda v: v.canonical() if isinstance(v, HANDLES) else v,
-        stringify_keys=True,
-        sort_sets=True,
-    )
+    return _to_markers(value, HANDLES, stringify_keys=True)
 
 
 def remap_refs(value: Any, remap: Mapping[str, str]) -> Any:
@@ -138,18 +185,13 @@ def remap_refs(value: Any, remap: Mapping[str, str]) -> Any:
                 return {REF_KEY: f"{remap[ref.node_id]}#{ref.attr}"}
         return v
 
-    return tree_map(value, leaf, include_sets=False)
+    return tree_map(value, leaf)
 
 
 def refs_to_markers(value: Any) -> Any:
     """Artifact-output form: only ``Ref`` objects become markers.
 
-    Matches the ``.atlas`` artifact's stored-output semantics exactly (sets not
-    traversed, keys stringified); other handle types are left as-is.
+    Matches the ``.atlas`` artifact's stored-output semantics exactly (keys
+    stringified, sets lowered to sorted lists); other handle types are left as-is.
     """
-    return tree_map(
-        value,
-        lambda v: v.canonical() if isinstance(v, Ref | Transform) else v,
-        include_sets=False,
-        stringify_keys=True,
-    )
+    return _to_markers(value, (Ref, Transform), stringify_keys=True)

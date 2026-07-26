@@ -1,0 +1,41 @@
+# The property suite at a thousand examples per law, nightly.
+#
+# `ci.yml` runs the same properties at a hundred examples and derandomized. That
+# is a regression gate: it answers "did this pull request break a law we already
+# know about", quickly and identically every time. It is deliberately not a
+# search, and it cannot be one — a gate that explored new inputs would fail on
+# pull requests that did not cause the failure.
+
+name: Soak
+
+on:
+  schedule:
+    - cron: "17 3 * * *" 
+  workflow_dispatch:
+
+concurrency:
+  group: soak
+  cancel-in-progress: false
+
+jobs:
+  properties:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      HYPOTHESIS_PROFILE: soak
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install
+        run: uv sync --extra dev
+      - name: Restore the example database
+        uses: actions/cache@v4
+        with:
+          path: .hypothesis
+          key: hypothesis-soak-${{ github.run_id }}
+          restore-keys: hypothesis-soak-
+      - name: Properties
+        run: uv run pytest -q --no-cov

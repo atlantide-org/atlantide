@@ -117,38 +117,47 @@ def secret(
     )
 
 
-def _extra_of(model: type[BaseModel], name: str) -> dict[str, Any]:
-    extra = model.model_fields[name].json_schema_extra
-    if isinstance(extra, dict):
-        meta = extra.get(_ATL_KEY)
-        if isinstance(meta, dict):
-            return meta
-    return {}
+#: Per-class field-metadata cache. Keyed by the model class itself; pydantic
+#: model classes never change their ``model_fields`` after creation, so a
+#: cached scan is safe — and every diff/plan/refresh consults these maps per
+#: node, which made the repeated per-call re-parse the hottest cold code here.
+_META_CACHE: dict[type[BaseModel], dict[str, dict[str, Any]]] = {}
+
+
+def _atl_meta(model: type[BaseModel]) -> dict[str, dict[str, Any]]:
+    """Field name -> atlantide metadata for every field, scanned once per class."""
+    cached = _META_CACHE.get(model)
+    if cached is None:
+        cached = {}
+        for name, info in model.model_fields.items():
+            extra = info.json_schema_extra
+            meta = extra.get(_ATL_KEY) if isinstance(extra, dict) else None
+            cached[name] = meta if isinstance(meta, dict) else {}
+        _META_CACHE[model] = cached
+    return cached
 
 
 def field_mutability(model: type[BaseModel]) -> dict[str, Mutability]:
     """Field name -> declared mutability (MUTABLE when undeclared)."""
-    result: dict[str, Mutability] = {}
-    for name in model.model_fields:
-        meta = _extra_of(model, name)
-        raw = meta.get("mutability", Mutability.MUTABLE.value)
-        result[name] = Mutability(raw)
-    return result
+    return {
+        name: Mutability(meta.get("mutability", Mutability.MUTABLE.value))
+        for name, meta in _atl_meta(model).items()
+    }
 
 
 def is_sensitive(model: type[BaseModel], name: str) -> bool:
     """Whether a field was declared ``sensitive=True`` (redacted in plan/logs)."""
-    return bool(_extra_of(model, name).get("sensitive", False))
+    return bool(_atl_meta(model)[name].get("sensitive", False))
 
 
 def sensitive_fields(model: type[BaseModel]) -> list[str]:
     """Names of every field declared ``sensitive`` (its value is sealed in state)."""
-    return [name for name in model.model_fields if is_sensitive(model, name)]
+    return [name for name, meta in _atl_meta(model).items() if meta.get("sensitive", False)]
 
 
 def physical_name_field(model: type[BaseModel]) -> str | None:
     """The field declared ``physical_name=True`` (the cloud name), or ``None``."""
-    for name in model.model_fields:
-        if _extra_of(model, name).get("physical_name", False):
-            return name
-    return None
+    return next(
+        (name for name, meta in _atl_meta(model).items() if meta.get("physical_name", False)),
+        None,
+    )

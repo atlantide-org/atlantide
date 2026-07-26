@@ -47,7 +47,22 @@ from atlantide.providers.aws import (
 )
 from atlantide.providers.random import Id
 
-enforce("require-tags")  # plan-time policy: every taggable resource must carry tags
+# Plan-time policy: every taggable resource must carry an `env` tag. Each stack
+# below sets one, and stack tags merge into every resource in the body, so this
+# holds without repeating the tag per resource. Naming no `keys` would demand
+# only that a resource is tagged at all.
+enforce("require-tags", keys=["env"])
+
+# Plan-time guard on *apply*: an apply that would DELETE or REPLACE anything in
+# one of these stacks fails the plan. That covers editing an immutable field (a
+# replace is a destroy plus a create) and removing a resource from this file.
+# The stacks it guards are an argument to the binding, so what is protected is
+# declared right here alongside the stacks themselves.
+#
+# It does not cover `atlantide destroy`, which runs against an empty config and
+# so evaluates no bindings; `Lifecycle(prevent_destroy=True)` is the per-resource
+# guard for that path.
+enforce("deny-destroy-in-protected", stacks=["prod"])
 
 # A shared `common` stack owning one VPC that every environment builds on. Its
 # `vpc_id` output is read cross-stack by dev/prod (below) rather than each defining
@@ -92,13 +107,19 @@ for env in ["dev", "prod"]:
         # the provider builds the trust document from these principals.
         worker = IamRole("worker", assumed_by=[ServicePrincipal.Ec2, ServicePrincipal.Lambda])
 
-        # A processor Lambda assuming the worker role. `signing_secret` is a
-        # SecretRef: it names the secret, and the value is resolved from the
-        # secrets store at apply — never present in this file, the IR, or state.
+        # A processor Lambda assuming the worker role. `code_path` points at a
+        # local directory, fingerprinted at config-evaluation time into
+        # `code_sha256` — edit the handler and the digest moves, so the next plan
+        # shows an update and apply ships the new package.
+        #
+        # `signing_secret` is a SecretRef: it names the secret, and the value is
+        # resolved from the secrets store at apply — never present in this file,
+        # the IR, or state.
         processor = LambdaFunction(
             "processor",
             role_arn=worker.arn,
             handler="app.handler",
+            code_path="processor",
             signing_secret=SecretRef(f"app/signing-key-{env}"),
         )
 
@@ -117,12 +138,12 @@ for env in ["dev", "prod"]:
 
         # Exported per stack — the CLI prints them after apply. Values are computed
         # Refs (resolved at apply) or plain literals; both show up under Outputs.
-        output("assets_arn", assets.arn)          # computed bucket ARN
-        output("assets_bucket", assets.bucket)    # the resolved bucket name
-        output("jobs_url", jobs.url)              # computed queue URL
-        output("jobs_arn", jobs.arn)              # computed queue ARN
-        output("worker_role_arn", worker.arn)    # computed IAM role ARN
-        output("processor_arn", processor.arn)   # computed Lambda ARN
-        output("build_id", build.result)         # the pinned random id
-        output("edge_sg_id", edge.group_id)      # computed SG id (on the shared VPC)
-        output("region", Region.EuNorth1)        # a literal
+        output("assets_arn", assets.arn)  # computed bucket ARN
+        output("assets_bucket", assets.bucket)  # the resolved bucket name
+        output("jobs_url", jobs.url)  # computed queue URL
+        output("jobs_arn", jobs.arn)  # computed queue ARN
+        output("worker_role_arn", worker.arn)  # computed IAM role ARN
+        output("processor_arn", processor.arn)  # computed Lambda ARN
+        output("build_id", build.result)  # the pinned random id
+        output("edge_sg_id", edge.group_id)  # computed SG id (on the shared VPC)
+        output("region", Region.EuNorth1)  # a literal

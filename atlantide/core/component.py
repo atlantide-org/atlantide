@@ -27,6 +27,8 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from typing_extensions import override
+
 from atlantide.core.node_id import require_identifier
 
 if TYPE_CHECKING:
@@ -64,7 +66,11 @@ class Component:
     ``__init__``; expose their handles as attributes for downstream wiring."""
 
     name: str
+    #: True while this instance's outermost wrapped ``__init__`` runs, so a
+    #: ``super().__init__`` chain pushes the name prefix exactly once.
+    _atlas_in_init: bool = False
 
+    @override
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         init = cls.__dict__.get("__init__")
@@ -77,13 +83,22 @@ def _scoped_init(init: Callable[..., None]) -> Callable[..., None]:
 
     @functools.wraps(init)
     def scoped(self: Component, name: str, /, *args: Any, **kwargs: Any) -> None:
+        # Re-entrancy guard: a subclass calling `super().__init__(name, ...)`
+        # runs the parent's wrapped init on the same instance, and pushing the
+        # prefix again would double it (`name-name-child`). Only the outermost
+        # init owns the scope.
+        if getattr(self, "_atlas_in_init", False):
+            init(self, name, *args, **kwargs)
+            return
         require_identifier(name, "component")
         self.name = name
+        self._atlas_in_init = True
         token = _push(name)
         try:
             init(self, name, *args, **kwargs)
         finally:
             _active_prefix.reset(token)
+            self._atlas_in_init = False
 
     scoped._atlas_scoped = True  # type: ignore[attr-defined]
     return scoped

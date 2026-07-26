@@ -18,7 +18,7 @@ from atlantide.core.errors import (
     IRError,
     LanguageError,
     LockError,
-    NonDeterministicError,
+    PolicyConfigError,
     PolicyViolationError,
     PreventDestroyError,
     ProviderError,
@@ -44,6 +44,8 @@ from atlantide.core.policy import PolicyBinding, PolicyLevel
 from atlantide.core.provider import Provider
 from atlantide.core.registry import ProviderRegistry, check_compatible, parse_semver
 from atlantide.core.resource import (
+    DataSource,
+    Nested,
     Resource,
     ResourceRegistry,
     active_registry,
@@ -81,6 +83,7 @@ __all__ = [
     "ComponentError",
     "Context",
     "CycleError",
+    "DataSource",
     "Failure",
     "FuelExhaustedError",
     "IRError",
@@ -89,8 +92,9 @@ __all__ = [
     "Lifecycle",
     "LockError",
     "Mutability",
-    "NonDeterministicError",
+    "Nested",
     "PolicyBinding",
+    "PolicyConfigError",
     "PolicyLevel",
     "PolicyViolationError",
     "PreventDestroyError",

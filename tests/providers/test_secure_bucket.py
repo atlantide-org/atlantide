@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 
 import boto3
-from moto import mock_aws
 
 from atlantide.core import Stack
 from atlantide.core.resource import collecting
@@ -13,17 +12,9 @@ from atlantide.providers import aws
 from atlantide.providers.aws import AwsProvider, SecureBucket
 from atlantide.reconcile import Action
 from tests.conftest import make_engine
-from tests.support import cloud_env_fixture
+from tests.support import aws_fixture
 
-aws_env = cloud_env_fixture(
-    {
-        "AWS_ACCESS_KEY_ID": "testing",
-        "AWS_SECRET_ACCESS_KEY": "testing",
-        "AWS_DEFAULT_REGION": "us-east-1",
-    },
-    region="us-east-1",
-    mock_factory=mock_aws,
-)
+aws_env = aws_fixture(region="us-east-1")
 
 _SITE = (
     "from atlantide.providers.aws import SecureBucket\n"
