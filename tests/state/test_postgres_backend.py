@@ -15,6 +15,12 @@ from atlantide.state.postgres_backend import PostgresStateBackend
 
 from .conftest import drop_postgres_schemas, node
 
+# Not every test here takes `pg_dsn` — `test_unreachable_server_is_a_state_error`
+# needs no server at all — so the driver is checked for the module rather than
+# left to the fixture. Without it that test still raises `StateError`, but for
+# the wrong reason, and reads as a real failure.
+pytest.importorskip("psycopg", reason="postgres tests need the postgres extra")
+
 
 def test_unreachable_server_is_a_state_error() -> None:
     with pytest.raises(StateError, match="cannot connect"):

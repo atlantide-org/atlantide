@@ -19,11 +19,15 @@ from atlantide.cli.errors import fail
 from atlantide.cli.render import MUT_COLOR
 from atlantide.core.fields import Mutability, field_mutability, is_sensitive
 from atlantide.core.resource import Resource
-from atlantide.providers import aws, local, random
 
 
 def all_types() -> dict[str, type[Resource]]:
     """Every resource type registered across the built-in providers, by type_name."""
+    # Imported here, not at module scope: `main` imports this module only to
+    # register the `resources`/`schema` commands, so a module-level import made
+    # every other command — `--help` included — pay for the whole aws package.
+    from atlantide.providers import aws, local, random
+
     return {**local.TYPES, **random.TYPES, **aws.TYPES}
 
 

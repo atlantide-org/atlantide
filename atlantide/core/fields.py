@@ -137,12 +137,25 @@ def _atl_meta(model: type[BaseModel]) -> dict[str, dict[str, Any]]:
     return cached
 
 
+#: Derived views of :data:`_META_CACHE`, cached for the same reason it is: both
+#: are read once per node per run — ``field_mutability`` from ``Resource``'s
+#: ``input_values``, on every attribute pass over every resource — and rebuilding
+#: the mapping each time was pure repeat work over an input that cannot change.
+#: Returned by reference, so callers must treat them as read-only.
+_MUTABILITY_CACHE: dict[type[BaseModel], dict[str, Mutability]] = {}
+_SENSITIVE_CACHE: dict[type[BaseModel], list[str]] = {}
+
+
 def field_mutability(model: type[BaseModel]) -> dict[str, Mutability]:
-    """Field name -> declared mutability (MUTABLE when undeclared)."""
-    return {
-        name: Mutability(meta.get("mutability", Mutability.MUTABLE.value))
-        for name, meta in _atl_meta(model).items()
-    }
+    """Field name -> declared mutability (MUTABLE when undeclared). Do not mutate."""
+    cached = _MUTABILITY_CACHE.get(model)
+    if cached is None:
+        cached = {
+            name: Mutability(meta.get("mutability", Mutability.MUTABLE.value))
+            for name, meta in _atl_meta(model).items()
+        }
+        _MUTABILITY_CACHE[model] = cached
+    return cached
 
 
 def is_sensitive(model: type[BaseModel], name: str) -> bool:
@@ -151,8 +164,12 @@ def is_sensitive(model: type[BaseModel], name: str) -> bool:
 
 
 def sensitive_fields(model: type[BaseModel]) -> list[str]:
-    """Names of every field declared ``sensitive`` (its value is sealed in state)."""
-    return [name for name, meta in _atl_meta(model).items() if meta.get("sensitive", False)]
+    """Names of every field declared ``sensitive`` (sealed in state). Do not mutate."""
+    cached = _SENSITIVE_CACHE.get(model)
+    if cached is None:
+        cached = [name for name, meta in _atl_meta(model).items() if meta.get("sensitive", False)]
+        _SENSITIVE_CACHE[model] = cached
+    return cached
 
 
 def physical_name_field(model: type[BaseModel]) -> str | None:

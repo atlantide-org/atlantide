@@ -63,6 +63,14 @@ def pg_dsn() -> Iterator[str]:
     failure — the other three backends still cover the contract, and requiring
     Docker to run the test suite would be a poor trade.
     """
+    # Checked before the server is even looked for: without the driver there is
+    # nothing to connect with, and a run that finds a database anyway fails deep
+    # inside the backend with a bare ImportError instead of skipping.
+    try:
+        import psycopg  # noqa: F401
+    except ImportError:  # pragma: no cover - depends on the installed extras
+        pytest.skip("postgres tests need the postgres extra (uv sync --extra postgres)")
+
     if dsn := os.environ.get(PG_DSN_ENV):
         yield dsn
         return

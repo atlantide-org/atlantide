@@ -30,7 +30,11 @@ jobs:
           python-version: "3.13"
           enable-cache: true
       - name: Install
-        run: uv sync --extra dev
+        # `postgres` too, matching ci.yml: the state suite is parametrized over
+        # postgres and starts a container for it when no server is named, so a
+        # run without psycopg reaches the backend and dies on the import rather
+        # than skipping.
+        run: uv sync --extra dev --extra postgres
       - name: Restore the example database
         uses: actions/cache@v4
         with:

@@ -17,7 +17,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, ClassVar, cast
 
-import boto3
 from botocore.exceptions import (
     ClientError,
     ConnectionClosedError,
@@ -160,19 +159,31 @@ class AwsProvider(Provider):
         # Sized here rather than per client: every client this provider makes
         # serves the same apply, so they share one concurrency budget.
         self._config = boto_config(parallelism=parallelism)
+        self._profile = profile
         # One Session per alias (``None`` is the default profile/chain), so
         # alternate accounts resolve their own credentials, not the environment's.
-        self._sessions: dict[str | None, Any] = {None: boto3.Session(profile_name=profile)}
+        # Built on demand, including the default one: every command builds a
+        # provider registry, and a `plan` makes no AWS call at all.
+        self._sessions: dict[str | None, Any] = {}
         self._clients: dict[tuple[str | None, str, str], Any] = {}
 
     def _session_for(self, alias: str | None) -> Any:
         session = self._sessions.get(alias)
         if session is None:
-            if alias not in self._aliases:
+            if alias is None:
+                profile = self._profile
+            elif alias in self._aliases:
+                profile = self._aliases[alias].profile
+            else:
                 raise ProviderError(
                     f"unknown provider_alias {alias!r} — declare it under [aws.aliases]"
                 )
-            session = boto3.Session(profile_name=self._aliases[alias].profile)
+            # Imported here rather than at module scope: boto3 costs ~45ms to
+            # import, this plugin is loaded by every command through provider
+            # discovery, and nothing before the first AWS call needs it.
+            import boto3
+
+            session = boto3.Session(profile_name=profile)
             self._sessions[alias] = session
         return session
 

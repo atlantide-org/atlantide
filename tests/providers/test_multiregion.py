@@ -41,8 +41,11 @@ async def test_aliased_resource_uses_its_own_session() -> None:
     await provider.create(Context(), res)
     names = {b["Name"] for b in boto3.client("s3").list_buckets()["Buckets"]}
     assert "prod-bucket" in names
-    # A distinct session is cached for the alias, separate from the default.
-    assert "prod" in provider._sessions and None in provider._sessions
+    # The alias got a session of its own. Sessions are built on demand, so the
+    # default one does not exist until something actually asks for it — and when
+    # it does, it is a different object, not the alias's.
+    assert "prod" in provider._sessions and None not in provider._sessions
+    assert provider._session_for(None) is not provider._sessions["prod"]
 
 
 async def test_unknown_alias_fails() -> None:
