@@ -293,6 +293,11 @@ class ResourceRegistry:
         self._outputs: dict[str, Any] = {}
         #: The config inputs this evaluation actually read (see `ConfigAPI.input`).
         self.inputs: dict[str, Any] = {}
+        #: Every environment a `Config` in this evaluation declared, and the
+        #: subset `--env` selected. The planner needs both to tell a
+        #: declared-but-unselected environment from one the config dropped.
+        self.envs_declared: tuple[str, ...] = ()
+        self.envs_selected: tuple[str, ...] = ()
 
     def add_policy_binding(self, binding: PolicyBinding) -> None:
         """Record a config-declared policy binding (see ``atlantide.policy.enforce``)."""

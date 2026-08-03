@@ -129,6 +129,64 @@ def test_ordinary_calls_still_work(source: str) -> None:
     assert is_successful(evaluate_source(source))
 
 
+# -- the one class config may declare ---------------------------------------
+#
+# Atlas-lang admits a `class X(EnvSchema)` whose body is only annotated fields.
+# The validator checks that shape syntactically, leaving two holes only the
+# interpreter can close — one per guard below.
+
+
+def test_a_rebound_base_cannot_smuggle_in_another_class() -> None:
+    """The validator matches the *spelling* `EnvSchema`, so this passes it.
+
+    Without the interpreter's identity check, `type(name, (S3Bucket,), ns)` would
+    run pydantic's metaclass over a namespace the config controls.
+    """
+    source = (
+        "from atlantide.providers.aws import S3Bucket\n"
+        "EnvSchema = S3Bucket\n"
+        "class Evil(EnvSchema):\n"
+        "    region: str\n"
+    )
+    assert is_successful(validate_source(source)), "the validator cannot see a rebind"
+    result = evaluate_source(source)
+    assert not is_successful(result)
+    assert "rebound" in str(result.failure())
+
+
+def test_a_default_never_becomes_a_class_attribute() -> None:
+    """`type()` runs `__set_name__` on a direct namespace value but not on one
+    nested in a dict, and a default is an arbitrary config expression. Keeping
+    defaults in `__atlas_defaults__` stops a default's own code running as the
+    class is built, and stops it shadowing each environment's value."""
+    source = (
+        "from atlantide.core import Config, EnvSchema, Stack, output\n"
+        "class E(EnvSchema):\n"
+        "    region: str\n"
+        "    tier: str = 'small'\n"
+        "config = Config(E, envs={'dev': {'region': 'r'}, "
+        "'prod': {'region': 'r', 'tier': 'large'}})\n"
+        "for env in config.envs():\n"
+        "    with Stack(env.name, config=env):\n"
+        "        output('tier', env.tier)\n"
+    )
+    outputs = evaluate_source(source).unwrap().outputs
+    # 'prod' reading 'small' would mean the class attribute won the lookup.
+    assert outputs == {"dev:tier": "small", "prod:tier": "large"}, outputs
+
+
+def test_a_schema_class_cannot_be_declared_inside_a_loop() -> None:
+    """A schema is a declaration, not a computation: a per-iteration class has no
+    defined meaning."""
+    source = (
+        "from atlantide.core import EnvSchema\n"
+        "for i in [1, 2]:\n"
+        "    class E(EnvSchema):\n"
+        "        region: str\n"
+    )
+    assert not is_successful(validate_source(source))
+
+
 # -- the surface config legitimately needs must keep working ----------------
 
 ALLOWED = [

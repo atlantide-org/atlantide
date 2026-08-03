@@ -8,11 +8,19 @@ are used without an import (a static checker will flag them as undefined).
 
 Things to notice:
 
+- **Config** — one :class:`Config` declares every environment and what differs
+  between them, as an :class:`EnvSchema` subclass, so an editor completes
+  ``env.versioning`` and a misspelling is a type error. ``atlantide plan --env
+  prod`` narrows a run to one environment; the ones left out are out of scope,
+  so their existing resources are not diffed and cannot be planned for deletion.
+  ``common`` below sits outside ``config.envs()``, since a shared stack every
+  environment builds on must stay in the graph when a run is narrowed.
 - **Stacks** — each environment is its own :class:`Stack`. The stack carries
   defaults (``region``, ``name_prefix``, ``tags``) that every resource inside
   inherits, so ``S3Bucket("assets")`` in the ``dev`` stack becomes the bucket
-  ``atlantide-assets-dev`` with the stack's tags. The same logical names live in
-  every stack without colliding (node ids are ``dev:aws.S3Bucket:assets`` etc.).
+  ``atlantide-assets-dev`` with the stack's tags. Passing ``config=env`` supplies
+  those three from the environment. The same logical names live in every stack
+  without colliding (node ids are ``dev:aws.S3Bucket:assets`` etc.).
 - **Refs** — reading another resource's computed output (``bucket.arn``) returns
   a lazy reference. That both wires the dependency (the engine orders the ref'd
   resource first) and resolves to the real value at apply time.
@@ -31,7 +39,7 @@ Things to notice:
   contrast ``random.Id``, whose value is decided at *apply*, not config, time.
 """
 
-from atlantide.core import SecretRef, Stack, output
+from atlantide.core import Config, EnvSchema, SecretRef, Stack, output
 from atlantide.policy import enforce
 from atlantide.providers.aws import (
     IamPolicy,
@@ -76,9 +84,47 @@ with Stack("common", region=Region.EuNorth1, name_prefix="atlantide", tags={"env
     # undefined-variable error, not a plan-time string mismatch).
     vpc_id = output("vpc_id", network.vpc_id)  # computed VPC id — consumed by dev + prod
 
-for env in ["dev", "prod"]:
+
+class AppEnv(EnvSchema):
+    """What differs between this system's environments.
+
+    The one class Atlas-lang admits: annotated fields only, no methods and no
+    decorators, so it is data. Declaring it makes `env.versioning` complete in an
+    editor and `env.versionning` a type error.
+
+    `region`, `tags` and `name_prefix` are well-known keys every environment
+    carries, so they need no declaration here.
+    """
+
+    versioning: bool = False
+
+
+# Every environment and what differs between them, declared once and typed.
+# `versioning` has a default, so dev says nothing about it; a missing or mistyped
+# prod value fails `atlantide validate` rather than the prod apply.
+config = Config(
+    AppEnv,
+    envs={
+        "dev": {
+            "region": Region.EuNorth1,
+            "name_prefix": "atlantide",
+            "tags": {"env": "dev"},
+        },
+        "prod": {
+            "region": Region.EuNorth1,
+            "name_prefix": "atlantide",
+            "tags": {"env": "prod"},
+            "versioning": True,
+        },
+    },
+)
+
+# `config.envs()` yields every environment, or only those `--env` named. The
+# `common` stack above sits outside this loop: it is not per-environment, so
+# narrowing to one env must not take it out of the graph.
+for env in config.envs():
     # region + name_prefix + tags are stack-scoped: resources inside inherit them.
-    with Stack(env, region=Region.EuNorth1, name_prefix="atlantide", tags={"env": env}):
+    with Stack(env.name, config=env):
         # A random build id, generated once at apply and pinned in state. The
         # bucket tags it (a Ref), so the engine creates this random resource before
         # the AWS bucket — a single graph across the random + aws providers.
@@ -87,12 +133,14 @@ for env in ["dev", "prod"]:
         # `uuid5`/`sha256_hex` are Atlas-lang builtins (deterministic, config-time).
         # Derive a stable, globally-unique bucket name + a config-digest tag; both
         # are fixed values baked into the IR.
-        bucket_name = f"atlantide-assets-{env}-{uuid5('atlantide-buckets', env)[:8]}"  # noqa: F821
+        bucket_name = f"atlantide-assets-{env.name}-{uuid5('atlantide-buckets', env.name)[:8]}"  # noqa: F821
         assets = S3Bucket(
             "assets",
             bucket=bucket_name,
-            versioning=(env == "prod"),
-            tags={"build_id": build.result, "config_hash": sha256_hex(env)[:12]},  # noqa: F821
+            # Read off the environment rather than branched on its name: the
+            # dev/prod difference is declared in the Config above.
+            versioning=env.versioning,
+            tags={"build_id": build.result, "config_hash": sha256_hex(env.name)[:12]},  # noqa: F821
         )
         jobs = SqsQueue("jobs", fifo=True)
 
@@ -101,7 +149,7 @@ for env in ["dev", "prod"]:
         # `common` first automatically. (A stack applied by a *separate* config would
         # instead name it via `StackReference("common").output("vpc_id")`, resolved
         # from committed state.) Each env hangs its own security group off the shared VPC.
-        edge = SecurityGroup("edge", group_name=f"edge-{env}", vpc_id=vpc_id)
+        edge = SecurityGroup("edge", group_name=f"edge-{env.name}", vpc_id=vpc_id)
 
         # A worker role EC2 and Lambda can assume (the processor below uses it);
         # the provider builds the trust document from these principals.
@@ -120,7 +168,7 @@ for env in ["dev", "prod"]:
             role_arn=worker.arn,
             handler="app.handler",
             code_path="processor",
-            signing_secret=SecretRef(f"app/signing-key-{env}"),
+            signing_secret=SecretRef(f"app/signing-key-{env.name}"),
         )
 
         # Inline policy granting the worker access to the bucket and queue. Each

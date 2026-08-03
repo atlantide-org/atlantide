@@ -7,15 +7,20 @@ from typing import ClassVar
 import pytest
 
 from atlantide.core import (
+    Config,
+    EnvView,
+    LanguageError,
     Ref,
     RegistryError,
     Resource,
     Stack,
     collecting,
     computed,
+    current_config,
     current_stack,
     immutable,
     mutable,
+    var,
 )
 
 
@@ -156,8 +161,9 @@ def test_nested_stack_region_inner_wins() -> None:
 
 
 def test_stack_requires_region() -> None:
-    with pytest.raises(TypeError):
-        Stack("prod")  # type: ignore[call-arg]  # region is mandatory
+    # A required *value*, not a required keyword: `config=` is the other source.
+    with pytest.raises(RegistryError, match="non-empty region"):
+        Stack("prod")
     with pytest.raises(RegistryError, match="non-empty region"):
         Stack("prod", region="")
 
@@ -182,3 +188,83 @@ def test_omitted_name_without_prefix_still_required() -> None:
 
     with pytest.raises(ValidationError):
         Bucket("assets")  # no name_prefix, no bucket_name -> required field missing
+
+
+# -- environment config ----------------------------------------------------
+
+
+def _env(**values: object) -> EnvView:
+    return Config(envs={"dev": values}).env("dev")  # type: ignore[arg-type]
+
+
+def test_config_supplies_the_region() -> None:
+    """What lets `Stack(env.name, config=env)` drop the separate `region=`."""
+    with Stack("dev", config=_env(region="eu-north-1")):
+        t = Thing("a", size=1)
+    assert t.stack == "dev"
+
+
+def test_config_supplies_the_name_prefix() -> None:
+    with Stack("dev", config=_env(region="us-east-1", name_prefix="atlantide")):
+        b = Bucket("assets")
+    assert b.bucket_name == "atlantide-assets-dev"
+
+
+def test_config_supplies_the_tags() -> None:
+    with Stack("dev", config=_env(region="us-east-1", tags={"env": "dev"})):
+        t = Tagged("a", size=1)
+    assert t.tags == {"env": "dev"}
+
+
+def test_an_explicit_argument_wins_over_the_config() -> None:
+    """Same rule the resource layer uses: an explicit value wins."""
+    env = _env(region="eu-north-1", name_prefix="fromconfig", tags={"env": "dev", "who": "config"})
+    with Stack(
+        "dev", config=env, region="us-east-1", name_prefix="explicit", tags={"who": "stack"}
+    ):
+        b = Bucket("assets")
+        t = Tagged("a", size=1)
+    assert b.region == "us-east-1"
+    assert b.bucket_name == "explicit-assets-dev"
+    assert t.tags == {"env": "dev", "who": "stack"}
+
+
+def test_a_resource_tag_still_wins_over_a_config_tag() -> None:
+    """Three levels: config tags < the stack's own tags= < the resource's."""
+    with Stack("dev", config=_env(region="us-east-1", tags={"env": "dev", "app": "fromconfig"})):
+        t = Tagged("a", size=1, tags={"app": "web"})
+    assert t.tags == {"env": "dev", "app": "web"}
+
+
+def test_current_config_is_ambient_inside_the_stack() -> None:
+    """So an L2 Component reads it without callers threading it through."""
+    env = _env(region="us-east-1")
+    assert current_config() is None
+    with Stack("dev", config=env):
+        assert current_config() is env
+    assert current_config() is None
+
+
+def test_nested_stacks_see_the_inner_config() -> None:
+    outer, inner = _env(region="us-east-1"), _env(region="eu-west-1")
+    with Stack("outer", config=outer):
+        assert current_config() is outer
+        with Stack("inner", config=inner):
+            assert current_config() is inner
+        assert current_config() is outer  # restored on exit
+
+
+def test_a_stack_without_a_config_clears_an_outer_one() -> None:
+    """Otherwise a component in the inner stack would read the outer
+    environment's values."""
+    with Stack("outer", config=_env(region="us-east-1")):  # noqa: SIM117 - testing nesting
+        with Stack("inner", region="us-east-1"):
+            assert current_config() is None
+
+
+def test_a_wrong_typed_well_known_key_names_its_environment() -> None:
+    """`region=5` is caught here, not as a pydantic error on whichever resource
+    was declared first."""
+    config = Config(schema={"region": var(int)}, envs={"dev": {"region": 5}})
+    with pytest.raises(LanguageError, match="environment 'dev': 'region' must be str"):
+        Stack("dev", config=config.env("dev"))

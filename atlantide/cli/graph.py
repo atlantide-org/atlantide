@@ -16,6 +16,7 @@ from atlantide.cli.errors import (
 )
 from atlantide.cli.options import (
     ConfigArg,
+    EnvOpt,
     VarFileOpt,
     VarOpt,
 )
@@ -29,14 +30,16 @@ def graph(
     config: ConfigArg = None,
     var: VarOpt = None,
     var_file: VarFileOpt = None,
+    env: EnvOpt = None,
     fmt: Annotated[str, typer.Option("--format", help="mermaid | dot")] = "mermaid",
 ) -> None:
     """Print the resource dependency graph (Graphviz dot or Mermaid)."""
     require_choice(fmt, ("dot", "mermaid"), "format")
-    run = config_run(config, var, var_file)
+    run = config_run(config, var, var_file, env)
     with stateless_engine(run.project) as engine:
         compiled = unwrap_or_diag(
-            engine.compile(run.source, str(run.path), inputs=run.inputs), run.source
+            engine.compile(run.source, str(run.path), inputs=run.inputs, envs=run.envs),
+            run.source,
         )
         digraph = compiled.graph
         rendered = to_dot(digraph) if fmt == "dot" else to_mermaid(digraph)

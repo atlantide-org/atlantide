@@ -104,16 +104,17 @@ Valid Python -- editors, formatters and type checkers read it -- but executed by
 Atlas-lang, a bounded interpreter with no clock, randomness, environment or
 network. `validate` needs no credentials; `plan` and `apply` do.
 
-    atlantide validate
+    atlantide validate            # checks every environment
     atlantide plan
     atlantide apply
+    atlantide apply --env prod    # prod only; dev is not diffed or touched
 
 S3 bucket names are globally unique. `name_prefix` composes them as
 {prefix}-{name}-{stack}, so the dev stack asks for `{prefix}-assets-dev`. If that
 name is taken, change [inputs].name_prefix in atlantide.toml.
 """
 
-from atlantide.core import Stack, output
+from atlantide.core import Config, EnvSchema, Stack, output
 from atlantide.policy import enforce
 from atlantide.providers.aws import Region, S3Bucket, SqsQueue
 
@@ -122,23 +123,53 @@ from atlantide.providers.aws import Region, S3Bucket, SqsQueue
 enforce("require-tags", keys=["env", "owner"])
 enforce("deny-destroy-in-protected", stacks=["prod"])
 
-# Set in atlantide.toml under [inputs]; override per run with `-var name=value`,
-# or per environment with a [profile.<name>.inputs] table.
+# A per-run value from outside the repository -- this one differs per checkout,
+# because S3 bucket names are globally unique. Set in atlantide.toml under
+# [inputs]; override per run with `-var name=value`.
 prefix = atlantide.input("name_prefix")  # noqa: F821
 
-for env in ["dev", "prod"]:
+
+class AppEnv(EnvSchema):
+    """What differs between this project's environments.
+
+    The one class Atlas-lang admits: annotated fields only, no methods and no
+    decorators, so it is data. Declaring it is what lets an editor complete
+    `env.versioning` below and flag a misspelling of it.
+
+    `region`, `tags` and `name_prefix` are well-known keys every environment
+    carries, so they need no declaration here.
+    """
+
+    versioning: bool = False
+
+
+# Every environment and what differs between them, declared once and typed: a
+# missing or mistyped prod value fails `validate` rather than the prod apply.
+config = Config(
+    AppEnv,
+    envs={
+        "dev": {
+            "region": Region.EuNorth1,
+            "name_prefix": prefix,
+            "tags": {"env": "dev", "owner": "platform"},
+        },
+        "prod": {
+            "region": Region.EuNorth1,
+            "name_prefix": prefix,
+            "tags": {"env": "prod", "owner": "platform"},
+            "versioning": True,
+        },
+    },
+)
+
+for env in config.envs():
     # region, name_prefix and tags are stack-scoped: everything in the body
     # inherits them, and the same logical names live in every stack without
     # colliding -- node ids are dev:aws.S3Bucket:assets, prod:aws.S3Bucket:assets.
-    with Stack(
-        env,
-        region=Region.EuNorth1,
-        name_prefix=prefix,
-        tags={"env": env, "owner": "platform"},
-    ):
+    with Stack(env.name, config=env):
         # `bucket` and `queue_name` are omitted on purpose: the stack's
         # name_prefix composes them, so one prefix renames every environment.
-        assets = S3Bucket("assets", versioning=(env == "prod"))
+        assets = S3Bucket("assets", versioning=env.versioning)
         jobs = SqsQueue("jobs")
 
         # Computed fields are lazy references -- the dependency edge, resolved at

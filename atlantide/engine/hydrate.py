@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from returns.result import Result
@@ -26,6 +27,8 @@ def assemble_compiled(
     bindings: tuple[PolicyBinding, ...],
     outputs: dict[str, Any],
     inputs: dict[str, Any] | None = None,
+    envs_declared: Sequence[str] = (),
+    envs_selected: Sequence[str] = (),
 ) -> Result[Compiled, AtlantideError]:
     """Build a :class:`Compiled` from an IR graph and its (source- or artifact-sourced) parts."""
     return build_graph(ir).map(
@@ -37,6 +40,8 @@ def assemble_compiled(
             policy_bindings=bindings,
             outputs=outputs,
             inputs=dict(inputs or {}),
+            envs_declared=tuple(envs_declared),
+            envs_selected=tuple(envs_selected),
         )
     )
 

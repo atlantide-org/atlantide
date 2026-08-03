@@ -24,6 +24,7 @@ from atlantide.cli.json_out import (
 )
 from atlantide.cli.options import (
     ConfigOpt,
+    EnvOpt,
     JsonOpt,
     RegionOpt,
     StateOpt,
@@ -58,6 +59,7 @@ def import_(
     config: ConfigOpt = None,
     var: VarOpt = None,
     var_file: VarFileOpt = None,
+    env: EnvOpt = None,
     state: StateOpt = None,
     id_field: Annotated[
         str | None,
@@ -99,11 +101,12 @@ def import_(
     `atlantide state rm <node>`, which forgets a row and leaves the resource.
     """
     machine_readable(json_out)
-    run = config_run(config, var, var_file)
+    run = config_run(config, var, var_file, env)
     target = state_target(state, run.project, announce=not json_out)
     with engine_for(target, region=region) as engine:
         compiled = unwrap_or_diag(
-            engine.compile(run.source, str(run.path), inputs=run.inputs), run.source
+            engine.compile(run.source, str(run.path), inputs=run.inputs, envs=run.envs),
+            run.source,
         )
         if node_id is None:
             _list_importable(engine, compiled, json_out=json_out)

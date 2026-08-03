@@ -42,24 +42,48 @@ local provider, so it applies with no cloud credentials at all.
 ## A quick look
 
 ```python
-from atlantide.core import Stack, output
+from atlantide.core import Config, EnvSchema, Stack, output
 from atlantide.policy import enforce
 from atlantide.providers.aws import S3Bucket, SqsQueue
 
 enforce("require-tags", keys=["env"])
 enforce("deny-destroy-in-protected", stacks=["prod"])
 
-for env in ["dev", "prod"]:
-    with Stack(env, region="eu-north-1", name_prefix="atlantide", tags={"env": env}):
-        assets = S3Bucket("assets", versioning=(env == "prod"))
+class AppEnv(EnvSchema):
+    versioning: bool = False
+
+config = Config(
+    AppEnv,
+    envs={
+        "dev":  {"region": "eu-north-1", "tags": {"env": "dev"}},
+        "prod": {"region": "eu-north-1", "tags": {"env": "prod"}, "versioning": True},
+    },
+)
+
+for env in config.envs():                       # env: AppEnv
+    with Stack(env.name, config=env, name_prefix="atlantide"):
+        assets = S3Bucket("assets", versioning=env.versioning)
         jobs = SqsQueue("jobs", fifo=True)
         output("assets_arn", assets.arn)
 ```
 
+One `Config` holds every environment and what differs between them. Each variable
+declares its type and, optionally, a default, so a missing or mistyped prod value
+fails `atlantide validate` rather than the prod apply. `region`, `tags` and
+`name_prefix` are well-known keys the `Stack` reads directly.
+
+An `EnvSchema` is the one class Atlas-lang admits — annotated fields only, no
+methods and no decorators, so it is still data. Declaring it makes the variables
+ordinary attributes: your editor completes `env.versioning`, and
+`env.versionning` is a type error. A schema can also be a mapping of `var()`
+declarations (`Config(schema={"versioning": var(bool, default=False)},
+envs=...)`) when the static side does not matter.
+
 ```bash
-atlantide plan  infra.py     # preview
-atlantide apply infra.py     # reconcile, in parallel
-atlantide apply infra.py     # again: all NOOP, zero provider calls
+atlantide plan  infra.py               # preview, every environment
+atlantide apply infra.py               # reconcile, in parallel
+atlantide apply infra.py               # again: all NOOP, zero provider calls
+atlantide apply infra.py --env prod    # prod only; dev is not diffed or touched
 ```
 
 Reading another resource's output (`assets.arn`) returns a lazy `Ref`. That is what
@@ -141,7 +165,8 @@ to production without re-executing the config.
 - No clock, environment, or network in config — the interpreter has no such builtins.
 - Content-hashed IR; `build` emits a portable `.atlas` artifact with provider
   versions pinned, `verify` re-checks it.
-- Determinism is over *(config, inputs)* — only inputs the config actually **read**.
+- Determinism is over *(config, inputs, selected environments)* — only inputs the
+  config actually **read**.
 
 **Plans**
 - Unchanged nodes cost zero provider calls.
@@ -167,6 +192,9 @@ to production without re-executing the config.
 **Escape hatches**
 - `--target` narrows to a resource and its closure, `--replace` forces a recreate —
   both printed in the plan.
+- `--env` narrows to one environment of the config's `Config`. An unselected
+  environment is out of scope, not undeclared: its state is never planned for
+  deletion, and the plan says which environments it left out.
 - A targeted apply leaves unselected state byte-identical.
 - `state rm` forgets a row without touching the provider; `state unlock` breaks a
   dead run's lease.

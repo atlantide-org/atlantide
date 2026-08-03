@@ -59,6 +59,7 @@ from atlantide.cli.options import (
     ON_FAILURE_CHOICES,
     ConfigArg,
     ConfirmOpt,
+    EnvOpt,
     JsonOpt,
     ParallelismOpt,
     RegionOpt,
@@ -198,6 +199,7 @@ def _planned(
             run.source,
             str(run.path),
             inputs=run.inputs,
+            envs=run.envs,
             targets=only or (),
             replace=replace or (),
         ),
@@ -210,6 +212,7 @@ def plan(
     config: ConfigArg = None,
     var: VarOpt = None,
     var_file: VarFileOpt = None,
+    env: EnvOpt = None,
     only: TargetOpt = None,
     replace: ReplaceOpt = None,
     state: StateOpt = None,
@@ -228,7 +231,7 @@ def plan(
     --detailed-exitcode, also exits 2 when changes are pending.
     """
     machine_readable(json_out)
-    run = config_run(config, var, var_file)
+    run = config_run(config, var, var_file, env)
     target = state_target(state, run.project, announce=not json_out)
     with engine_for(target) as engine:
         plan_obj = _planned(engine, run, only, replace)
@@ -249,6 +252,7 @@ def apply(
     config: ConfigArg = None,
     var: VarOpt = None,
     var_file: VarFileOpt = None,
+    env: EnvOpt = None,
     only: TargetOpt = None,
     replace: ReplaceOpt = None,
     state: StateOpt = None,
@@ -286,7 +290,7 @@ def apply(
     """
     require_choice(on_failure, ON_FAILURE_CHOICES, "--on-failure")
     machine_readable(json_out)
-    run = config_run(config, var, var_file)
+    run = config_run(config, var, var_file, env)
     cfg, source, inputs = run.path, run.source, run.inputs
     target = state_target(state, run.project, announce=not json_out)
     with engine_for(target, region=region, parallelism=parallelism) as engine:
@@ -329,6 +333,7 @@ def apply(
                     source,
                     str(cfg),
                     inputs=inputs,
+                    envs=run.envs,
                     targets=only or (),
                     replace=replace or (),
                     on_failure=cast(OnFailure, on_failure),
@@ -349,13 +354,20 @@ def apply(
 @app.command()
 def destroy(
     only: TargetOpt = None,
+    env: EnvOpt = None,
     state: StateOpt = None,
     confirm: ConfirmOpt = False,
     region: RegionOpt = None,
     parallelism: ParallelismOpt = None,
 ) -> None:
-    """Destroy every resource recorded in state (shows what, then prompts)."""
+    """Destroy every resource recorded in state (shows what, then prompts).
+
+    ``--env`` selects by stack rather than through a config: destroy reads no
+    config, only state. An environment's stack is its name, so ``--env dev``
+    expands to ``--target 'dev:*'``, with the same closure over dependents.
+    """
     project = load_project()
+    only = [*(only or ()), *(f"{name}:*" for name in env or ())] or None
     with engine_for(state_target(state, project), region=region, parallelism=parallelism) as engine:
         node_ids = unwrap_or_exit(engine.destroy_targets(only or ()))
         if not node_ids:
@@ -497,6 +509,7 @@ def validate(
     config: ConfigArg = None,
     var: VarOpt = None,
     var_file: VarFileOpt = None,
+    env: EnvOpt = None,
     json_out: JsonOpt = False,
 ) -> None:
     """Check that a config compiles: syntax, the Atlas-lang subset, and the graph.
@@ -505,22 +518,37 @@ def validate(
     change anything — which makes it the check to run in a pre-commit hook or on
     a pull request, where `plan` would need a backend it should not have.
 
+    Without ``--env`` every declared environment is evaluated, so a type error in
+    a prod-only value is caught here rather than at the prod apply.
+
     It cannot tell you what will *change* — that requires reading state — only
     that the config is well-formed and its dependencies are acyclic.
     """
     machine_readable(json_out)
-    run = config_run(config, var, var_file)
+    run = config_run(config, var, var_file, env)
     cfg = run.path
     with stateless_engine(run.project) as engine:
         compiled = unwrap_or_diag(
-            engine.compile(run.source, str(cfg), inputs=run.inputs), run.source
+            engine.compile(run.source, str(cfg), inputs=run.inputs, envs=run.envs), run.source
         )
     if json_out:
-        emit_json({"config": str(cfg), "resources": len(compiled.ir.nodes)})
+        emit_json(
+            {
+                "config": str(cfg),
+                "resources": len(compiled.ir.nodes),
+                "envs": {
+                    "declared": list(compiled.envs_declared),
+                    "selected": list(compiled.envs_selected),
+                },
+            }
+        )
         return
-    console.print(
-        f"[green]ok[/] {escape(str(cfg))} — {len(compiled.ir.nodes)} resource(s), no cycles"
-    )
+    summary = f"{cfg} — {len(compiled.ir.nodes)} resource(s)"
+    if compiled.envs_declared:
+        listed = ", ".join(compiled.envs_selected)
+        summary += f", {len(compiled.envs_selected)} environment(s) [{listed}]"
+    # Escaped at the boundary: rich would read the bare `[dev, prod]` as markup.
+    console.print(f"[green]ok[/] {escape(summary)}, no cycles")
 
 
 app.add_typer(component_app, name="component")

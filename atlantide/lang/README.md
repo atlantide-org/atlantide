@@ -9,7 +9,7 @@ Public entrypoint: `evaluate_source`, returning
 
 | Module | Purpose |
 | --- | --- |
-| `validate.py` | Parses with `ast` and rejects anything outside the subset: unbounded loops, classes, exceptions, dunder access, `str.format`, and any import outside the config surface (`atlantide.core`, `.policy`, `.providers.*`, `.components.*`). |
+| `validate.py` | Parses with `ast` and rejects anything outside the subset: unbounded loops, exceptions, dunder access, `str.format`, and any import outside the config surface (`atlantide.core`, `.policy`, `.providers.*`, `.components.*`). Classes are rejected too, with one carve-out: a module-level `class X(EnvSchema)` whose body is only annotated fields — data, so determinism is untouched, and the only way a type checker can complete `env.<var>`. |
 | `interp.py` | Tree-walking evaluator. Re-checks the import allow-list where names are bound, normalises set iteration to sorted order, and meters evaluation with a fuel counter. |
 | `builtins.py` | The config global namespace: safe builtins plus pure derived functions (`uuid5`, `sha256_hex`, `to_json`, `merge`, `slugify`). |
 

@@ -23,6 +23,7 @@ from atlantide.cli.options import (
     ON_FAILURE_CHOICES,
     ConfigArg,
     ConfirmOpt,
+    EnvOpt,
     ParallelismOpt,
     RegionOpt,
     StateOpt,
@@ -51,12 +52,17 @@ def build(
     config: ConfigArg = None,
     var: VarOpt = None,
     var_file: VarFileOpt = None,
+    env: EnvOpt = None,
     output: Annotated[Path, typer.Option("--output", "-o", help="Artifact path to write.")] = Path(
         "out.atlas"
     ),
 ) -> None:
-    """Compile a config into a portable, content-hashed .atlas artifact."""
-    run = config_run(config, var, var_file)
+    """Compile a config into a portable, content-hashed .atlas artifact.
+
+    ``--env`` narrows the build to those environments and is recorded in the
+    artifact, since ``deploy`` has no source to re-read.
+    """
+    run = config_run(config, var, var_file, env)
     project = run.project
     # The project root, not cwd: `load_project` walks up to atlantide.toml, so a
     # `build` run from a subdirectory would find no lock and record no pins.
@@ -64,7 +70,11 @@ def build(
     with stateless_engine(project) as engine:  # build needs no state
         artifact = unwrap_or_diag(
             engine.build(
-                run.source, str(run.path), inputs=run.inputs, component_pins=component_pins
+                run.source,
+                str(run.path),
+                inputs=run.inputs,
+                envs=run.envs,
+                component_pins=component_pins,
             ),
             run.source,
         )

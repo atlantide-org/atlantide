@@ -74,8 +74,7 @@ Alternate accounts (a resource selects one via ``provider_alias=``)::
     profile  = "prod-account"                # AWS shared-config profile
     endpoint = "http://localhost:4566"       # optional endpoint override
 
-Per-run inputs the config reads with ``atlantide.input(name)``. One config, N
-environments, no flags::
+Per-run inputs the config reads with ``atlantide.input(name)``::
 
     [inputs]
     instance_count = 2
@@ -84,6 +83,19 @@ environments, no flags::
     instance_count = 10
 
 ``--var-file f.toml`` overrides these, and ``-var name=value`` overrides both.
+
+Environments are declared with :class:`~atlantide.core.config.Config` in the
+config file and selected with ``--env``, not with inputs. The three mechanisms:
+
+- ``[inputs]`` / ``--var`` — a per-run value from outside the repository (a CI
+  build number, a fork's name prefix). Untyped, since it arrives as text.
+- ``Config(AppEnv, envs=...)`` — the checked-in, typed environment matrix,
+  validated when the config is evaluated. ``AppEnv`` is an ``EnvSchema``
+  subclass, so an editor completes each variable.
+- ``[profile.<name>]`` — where the run points: state backend, AWS
+  profile/region, parallelism, plus an ``[inputs]`` overlay.
+
+``--profile`` and ``--env`` are orthogonal; neither implies the other.
 
 Published components fetched from public git repos (see
 :mod:`atlantide.components`); config imports them as

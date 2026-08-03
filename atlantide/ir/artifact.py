@@ -14,6 +14,7 @@ corrupted IR no longer hashes to it. Pins/policies live outside that hash.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -41,6 +42,10 @@ class Artifact:
     #: recording which component code produced this IR. Integrity of the vendored
     #: code itself is checked by ``atlantide component verify``.
     component_pins: dict[str, str] = field(default_factory=dict)
+    #: The environments ``--env`` selected when this artifact was built, empty
+    #: when the config declares none or nothing was narrowed. Build provenance,
+    #: so outside the hash for the same reason the pins are.
+    envs: tuple[str, ...] = ()
     format_version: int = ARTIFACT_FORMAT
 
     def dumps(self) -> str:
@@ -53,11 +58,12 @@ def build_artifact(
     policies: tuple[PolicyBinding, ...],
     outputs: dict[str, Any],
     component_pins: dict[str, str] | None = None,
+    envs: Sequence[str] = (),
 ) -> Artifact:
     """Bundle a compiled IR into an :class:`Artifact`.
 
     Provider pins are derived from the IR; ``component_pins`` come from the
-    project's lock.
+    project's lock; ``envs`` records which environments the build selected.
     """
     return Artifact(
         ir=ir,
@@ -66,6 +72,7 @@ def build_artifact(
         policies=policies,
         outputs={key: refs_to_markers(value) for key, value in outputs.items()},
         component_pins=dict(component_pins) if component_pins else {},
+        envs=tuple(envs),
     )
 
 
@@ -105,6 +112,9 @@ def loads(text: str) -> Result[Artifact, ArtifactError]:
             policies=tuple(_binding_from_json(p) for p in data.get("policies", [])),
             outputs=dict(data.get("outputs", {})),
             component_pins=dict(data.get("component_pins", {})),
+            # Defaulted, so an artifact built before this key existed still
+            # reads and `ARTIFACT_FORMAT` need not move.
+            envs=tuple(data.get("envs", ())),
         )
     except (KeyError, TypeError, ValueError) as exc:
         return Failure(ArtifactError(f"malformed artifact: {exc}"))
@@ -138,6 +148,7 @@ def _to_json(artifact: Artifact) -> dict[str, Any]:
         "component_pins": artifact.component_pins,
         "policies": [_binding_json(b) for b in artifact.policies],
         "outputs": artifact.outputs,
+        "envs": list(artifact.envs),
     }
 
 

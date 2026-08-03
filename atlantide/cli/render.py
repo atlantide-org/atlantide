@@ -14,7 +14,7 @@ from atlantide.core import PolicyLevel
 from atlantide.core.fields import Mutability
 from atlantide.core.markers import contains_ref
 from atlantide.core.node_id import group_by_stack, short_id
-from atlantide.engine import Plan
+from atlantide.engine import Compiled, Plan
 from atlantide.reconcile import Action, ApplyReport, Change, Drift, DriftReport, NodeDrift
 from atlantide.reconcile.adopt import ImportOutcome, ImportStatus
 from atlantide.secrets import is_secret_ref_marker
@@ -93,6 +93,7 @@ def stack_sections(node_ids: list[str]) -> Iterator[str]:
 
 def render_plan(plan_obj: Plan, *, targeted: bool = False) -> None:
     render_inputs(plan_obj.compiled.inputs)
+    render_envs(plan_obj.compiled)
     if targeted:
         render_targeting(plan_obj)
     changeset = plan_obj.changeset
@@ -137,6 +138,22 @@ def render_inputs(inputs: dict[str, Any]) -> None:
         return
     shown = ", ".join(f"{key}={fmt_value(value)}" for key, value in sorted(inputs.items()))
     console.print(f"[dim]inputs: {escape(shown)}[/]")
+
+
+def render_envs(compiled: Compiled) -> None:
+    """Name the environments this plan covers, when it does not cover them all.
+
+    Excluded environments are outside the run rather than unchanged: their
+    resources are not diffed and will not be touched. Silent when nothing was
+    narrowed.
+    """
+    if not compiled.envs_excluded:
+        return
+    console.print(
+        f"[yellow]envs:[/] {', '.join(compiled.envs_selected)} "
+        f"[dim](of {', '.join(compiled.envs_declared)})[/] — "
+        f"{', '.join(compiled.envs_excluded)} is not planned and will not change"
+    )
 
 
 def _plan_suffix(change: Change) -> str:

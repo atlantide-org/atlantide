@@ -170,6 +170,7 @@ def run_header(
         "state": state_target.label,
         "version": version(),
         "inputs": plan_obj.compiled.inputs,
+        "envs": list(plan_obj.compiled.envs_selected),
         "planned": planned,
     }
 
@@ -190,12 +191,16 @@ class ConfigRun:
     path: Path
     source: str
     inputs: dict[str, Any]
+    #: The environments ``--env`` named, or ``None`` for every declared one.
+    #: ``None`` differs from ``()``, which would mean "act on nothing".
+    envs: tuple[str, ...] | None = None
 
 
 def config_run(
     config: Path | None,
     var: list[str] | None,
     var_file: list[Path] | None,
+    env: list[str] | None = None,
 ) -> ConfigRun:
     """Resolve, read and parameterise the config a command was pointed at.
 
@@ -210,6 +215,7 @@ def config_run(
         path=path,
         source=read_config(path),
         inputs=resolve_inputs(project.inputs, var_file, var),
+        envs=tuple(env) if env else None,
     )
 
 

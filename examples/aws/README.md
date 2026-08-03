@@ -18,14 +18,21 @@ VPC's `vpc_id` Ref likewise orders the subnet and security group after it.
 ## Feature showcase
 
 [`example-two.py`](example-two.py) is a second, self-contained example
-demonstrating three of the newer authoring features in one small graph:
+demonstrating four of the newer authoring features in one small graph:
 
+- **Config** — one `Config` declares both environments and what differs between
+  them, typed (`log_region` is required, `versioning` defaults to `False`). The
+  shape is an `EnvSchema` subclass — the one class Atlas-lang admits — so
+  `env.log_region` completes in an editor and a misspelling is a type error.
 - **Components** — `SecureBucket` is a library-authored L2 (bucket + a TLS-only
   Deny policy — no public grant, so it applies under S3 Block Public Access); one
   call expands to flat, namespaced nodes (`…:web-assets`, `…:web-policy`).
-- **Per-block region** — the stack is `eu-north-1`, but a `logs` bucket sits
-  inside `with region(Region.UsEast1):` and is created in `us-east-1` (its output
-  domain resolves to `…s3.us-east-1.amazonaws.com`).
+- **Per-block region** — the stack's region comes from the environment, and a
+  `logs` bucket sits inside `with region(env.log_region):`. In `prod` that is
+  `us-east-1`, a central log archive away from the stack's `eu-north-1`, so its
+  output domain resolves to `…s3.us-east-1.amazonaws.com`; `dev` keeps its logs
+  local. Where the override points is a declared property of the environment
+  rather than a literal in the body.
 - **Output combinators** — `concat` / `interpolate` / `join` build outputs from
   apply-time refs (ARNs/domains unknown until apply), evaluated when the refs
   resolve.
@@ -34,6 +41,7 @@ demonstrating three of the newer authoring features in one small graph:
 cd examples/aws
 uv run atlantide plan    example-two.py --state example-two.db
 uv run atlantide apply   example-two.py --state example-two.db
+uv run atlantide apply   example-two.py --state example-two.db --env prod  # one env
 uv run atlantide destroy --state example-two.db
 ```
 
@@ -44,8 +52,17 @@ S3 origin bucket fronted by a CloudFront distribution through an Origin Access
 Control (OAC), with a bucket policy that grants read access to **only that
 distribution** (scoped by an `AWS:SourceArn` condition). The site is served from
 the default `*.cloudfront.net` URL — no custom domain, ACM certificate, or Route53
-records needed. Four resources, ordered by refs: `origin` + `oac` → `cdn` →
-`origin-policy`.
+records needed. Four resources per environment, ordered by refs: `origin` + `oac`
+→ `cdn` → `origin-policy`.
+
+Its `Config` carries one variable, `price_class`, declared on a `SiteEnv` schema
+class so an editor completes it: `dev` serves from the cheapest edge set
+(`PriceClass_100`, North America + Europe) while `prod` takes the full global
+footprint. It also shows the two naming strategies side by side: the bucket is
+named explicitly with a `uuid5` seed because S3 names are *globally* unique,
+while the OAC's name is left to the environment's `name_prefix` to compose
+(`atlantide-oac-dev`, `atlantide-oac-prod`), since OAC names need only be unique
+per account.
 
 Run it with a **separate** state db so it never touches `example-one.py`'s state (one
 directory has one default `atlantide.toml`, so pass the config path explicitly):
@@ -53,16 +70,16 @@ directory has one default `atlantide.toml`, so pass the config path explicitly):
 ```bash
 cd examples/aws
 uv run atlantide plan    example-three.py --state site.db
-uv run atlantide apply   example-three.py --state site.db   # prints `bucket` + `site_url`
+uv run atlantide apply   example-three.py --state site.db --env dev  # prints `bucket` + `site_url`
 # upload content to the printed `bucket`, then open the `site_url` output:
 aws s3 cp index.html s3://<bucket-from-outputs>/
-uv run atlantide destroy --state site.db
+uv run atlantide destroy --state site.db --env dev
 ```
 
 > **CloudFront `destroy` is slow.** A distribution must be *disabled* and fully
 > *redeployed* before it can be deleted; on real AWS that transition takes ~15-20
 > minutes, so `destroy` blocks for that long. The provider disables it, polls until
-> it reports `Deployed`, then deletes.
+> it reports `Deployed`, then deletes. `--env` keeps that wait to one environment.
 
 The `AcmCertificate` and `Route53HostedZone`/`Route53Record` types are also
 supported by the provider (for custom-domain sites) but are not used by this

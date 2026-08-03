@@ -19,10 +19,12 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from atlantide.core.config import EnvSchema
 from atlantide.core.errors import FuelExhaustedError, LanguageError
 from atlantide.core.provider import Provider
 from atlantide.lang.validate import (
     DEFAULT_SURFACE,
+    ENV_SCHEMA_BASE,
     LanguageSurface,
     import_allowed,
     private_import_message,
@@ -75,6 +77,24 @@ _COMPARES: dict[type[ast.cmpop], Callable[[Any, Any], Any]] = {
     ast.In: lambda a, b: a in b,
     ast.NotIn: lambda a, b: a not in b,
 }
+
+
+def _annotation_of(annotation: ast.expr) -> str:
+    """An ``EnvSchema`` field's annotation, as the text it was written as.
+
+    Not evaluated: a `str = 5` earlier in the file would otherwise change what
+    `x: str` declares. Passing the text to `EnvSchema.__init_subclass__` also
+    puts the interpreter and ordinary Python (where ``from __future__ import
+    annotations`` already yields strings) through one parser.
+
+    `validate._check_annotation` has already restricted this to a supported name
+    or `X | None`.
+    """
+    if isinstance(annotation, ast.BinOp):  # `X | None`
+        assert isinstance(annotation.left, ast.Name)
+        return f"{annotation.left.id} | None"
+    assert isinstance(annotation, ast.Name)
+    return annotation.id
 
 
 def _sized_len(value: Any) -> int:
@@ -319,6 +339,48 @@ class Interpreter:
     def _st_FunctionDef(self, node: ast.FunctionDef, scope: Scope) -> None:
         scope.assign(node.name, self._make_closure(node.args, node.body, scope, node.name))
 
+    def _st_ClassDef(self, node: ast.ClassDef, scope: Scope) -> None:
+        """Build the one class config may declare: an ``EnvSchema`` of fields.
+
+        `validate` has already checked the *shape*; the two guards here are the
+        ones a syntactic pass cannot make.
+        """
+        base = self._eval(node.bases[0], scope)
+        # Guard 1: the validator matched the *spelling* `EnvSchema`, which
+        # `EnvSchema = S3Bucket` earlier in the file also passes. Without this,
+        # `type()` below would run pydantic's metaclass over a config-controlled
+        # namespace.
+        if base is not EnvSchema:
+            raise LanguageError(
+                f"class {node.name!r} must inherit the real {ENV_SCHEMA_BASE}, not a rebound name",
+                line=node.lineno,
+            )
+
+        annotations: dict[str, str] = {}
+        defaults: dict[str, Any] = {}
+        for stmt in node.body:
+            if not isinstance(stmt, ast.AnnAssign):
+                continue  # a docstring or `pass`; validate rejected anything else
+            self._tick()
+            assert isinstance(stmt.target, ast.Name)
+            annotations[stmt.target.id] = _annotation_of(stmt.annotation)
+            if stmt.value is not None:
+                defaults[stmt.target.id] = self._eval(stmt.value, scope)
+
+        # Guard 2: `type()` calls `__set_name__` on every *direct* namespace
+        # value but not on one nested in a dict, and a default is an arbitrary
+        # config expression (a Ref, a resource, a closure). Keeping defaults in
+        # `__atlas_defaults__` stops a default's own code running as the class
+        # is built.
+        namespace: dict[str, Any] = {
+            "__module__": "<config>",
+            "__qualname__": node.name,
+            "__slots__": (),
+            "__annotations__": annotations,
+            "__atlas_defaults__": defaults,
+        }
+        scope.assign(node.name, type(node.name, (EnvSchema,), namespace))
+
     def _st_Import(self, node: ast.Import, scope: Scope) -> None:
         # Binding a whole module would expose its attribute graph (and the stdlib
         # modules it imports) to config — a sandbox escape. Only `from ... import
@@ -481,7 +543,17 @@ class Interpreter:
             args = [self._normalize_arg(a) for a in args]
             kwargs = {k: self._normalize_arg(v) for k, v in kwargs.items()}
             self._tick(_native_call_cost(args, kwargs))
-        return func(*args, **kwargs)
+        try:
+            return func(*args, **kwargs)
+        except LanguageError as exc:
+            # A native callable (`Config(...)`, `enforce(...)`, `output(...)`)
+            # has no view of the source, so its error would render without the
+            # caret. Only `LanguageError` is stamped: a `RegistryError` or a
+            # pydantic failure from a resource constructor is about the value
+            # rather than this line.
+            if exc.line is None:
+                raise LanguageError(str(exc), line=node.lineno, col=node.col_offset + 1) from exc
+            raise
 
     def _normalize_arg(self, value: Any) -> Any:
         """Coerce a top-level set or frozenset argument to a deterministically ordered

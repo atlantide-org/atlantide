@@ -3,6 +3,16 @@
 Parses source with the stdlib ``ast`` (every config file is valid Python) and
 rejects any construct outside the allowed subset before evaluation, enforcing
 determinism by construction.
+
+The subset is expressed two ways. :data:`_ALLOWED_NODES` is the allow-list of
+node types permitted anywhere; ``ClassDef`` is deliberately absent from it and
+handled by :meth:`_Validator.visit_ClassDef` instead, because a class is
+permitted only in one exact shape — a module-level ``EnvSchema`` whose body is
+annotated fields. That carve-out is what makes an environment's variables
+attributes a type checker can see; a schema declares data, runs no code and never
+reaches the IR. The two checks a syntactic pass cannot make — that the base
+really is ``EnvSchema``, and that a default never lands in the class namespace —
+are made by ``Interpreter._st_ClassDef``.
 """
 
 from __future__ import annotations
@@ -166,7 +176,6 @@ _ATTR_HINTS: dict[str, str] = dict.fromkeys(_FORBIDDEN_ATTRS, _FORMAT_HINT)
 # AST node type name.
 _NODE_HINTS: dict[str, str] = {
     "While": "Atlas-lang has no `while` (halting must be provable); use a bounded `for`.",
-    "ClassDef": "define resource types in a provider, not in config (data + control flow only).",
     "Try": "no exceptions in config; guard with `if` instead.",
     "Raise": "no exceptions in config; guard with `if` instead.",
     "AsyncFunctionDef": "config is synchronous and pure; no `async`.",
@@ -195,8 +204,8 @@ _NAME_HINTS: dict[str, str] = {
     "globals": "dynamic introspection is excluded for determinism.",
     "locals": "dynamic introspection is excluded for determinism.",
     "type": "runtime type construction is excluded; define resource types in a provider.",
-    "super": "class machinery is excluded; config has no classes.",
-    "object": "class machinery is excluded; config has no classes.",
+    "super": "class machinery is excluded; the only class config declares is an EnvSchema.",
+    "object": "class machinery is excluded; the only class config declares is an EnvSchema.",
     "memoryview": "low-level buffers are excluded for determinism.",
     "breakpoint": "debugger hooks are excluded.",
 }
@@ -205,6 +214,20 @@ _IMPORT_HINT = (
     "config must be a pure function of its inputs; move helpers into a provider "
     "or use Atlas builtins (`uuid5`, `sha256_hex`, `to_json`, `merge`, `slugify`)."
 )
+
+#: The one base a config-declared class may have. Checked here by *spelling*
+#: only; `Interpreter._st_ClassDef` re-checks the bound object's identity, since
+#: `EnvSchema = S3Bucket` earlier in the file would pass this test.
+ENV_SCHEMA_BASE = "EnvSchema"
+
+#: Types an ``EnvSchema`` field may be annotated with — the same set `var()`
+#: accepts (`atlantide.core.config._SUPPORTED_TYPES`), spelled as source because
+#: the validator works on an AST and must not import core.
+_FIELD_TYPES: frozenset[str] = frozenset({"str", "int", "float", "bool", "list", "dict"})
+
+#: Field names that would be unreachable as `env.<name>`, mirroring
+#: `atlantide.core.config._RESERVED`.
+_RESERVED_FIELDS: frozenset[str] = frozenset({"name", "get", "as_dict"})
 
 #: Rendered in import rejections so the message names the surface, not the rule.
 _ALLOWED_IMPORTS_DESC = "'atlantide.core', '.policy', '.providers.*', '.components.*'"
@@ -221,6 +244,74 @@ def _err(message: str, node: ast.AST) -> LanguageError:
     # ast's col_offset is 0-based; LanguageError (and the CLI caret rendering)
     # use 1-based columns, matching SyntaxError's `offset`.
     return LanguageError(message, line=line, col=col + 1 if isinstance(col, int) else None)
+
+
+def _is_docstring(stmt: ast.stmt) -> bool:
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Constant)
+        and isinstance(stmt.value.value, str)
+    )
+
+
+#: What to write instead, for the statements an author is most likely to reach
+#: for inside a schema body. Keyed by AST node type name, like `_NODE_HINTS`.
+_SCHEMA_BODY_HINTS: dict[str, str] = {
+    "Assign": "write 'x: str = 1' with a type",
+    "FunctionDef": "move behaviour into a provider or a component",
+    "ClassDef": "a schema is flat; declare a second one at module level",
+}
+
+
+def _inherits_env_schema(node: ast.ClassDef) -> bool:
+    """Whether the class names ``EnvSchema`` as its one base.
+
+    A check on the *spelling* only — ``EnvSchema = S3Bucket`` earlier in the file
+    passes it, which is why ``Interpreter._st_ClassDef`` re-checks the object it
+    actually resolves to.
+    """
+    return (
+        len(node.bases) == 1
+        and isinstance(node.bases[0], ast.Name)
+        and node.bases[0].id == ENV_SCHEMA_BASE
+    )
+
+
+def _rejected_in_schema(stmt: ast.stmt) -> LanguageError:
+    """The rejection for a schema-body statement that is not an annotated field."""
+    kind = type(stmt).__name__
+    message = (
+        f"{kind!r} is not allowed in an {ENV_SCHEMA_BASE} — "
+        f"it declares annotated fields only (data, no behaviour)"
+    )
+    hint = _SCHEMA_BODY_HINTS.get(kind)
+    return _err(f"{message}; {hint}" if hint else message, stmt)
+
+
+def _check_annotation(annotation: ast.expr, owner: str, field: str) -> None:
+    """Allow one of the six supported types, or ``X | None``.
+
+    Annotations are never evaluated, here or by the interpreter: treating them
+    as expressions would let ``str = 5`` earlier in the file change what
+    ``x: str`` means.
+    """
+    if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+        right = annotation.right
+        if not (isinstance(right, ast.Constant) and right.value is None):
+            raise _err(f"field {field!r} of {owner!r}: only `X | None` may be combined", annotation)
+        _check_annotation(annotation.left, owner, field)
+        return
+    if isinstance(annotation, ast.Subscript):
+        raise _err(
+            f"field {field!r} of {owner!r}: parameterised generics such as list[str] "
+            f"are not supported — use `list`",
+            annotation,
+        )
+    if not isinstance(annotation, ast.Name) or annotation.id not in _FIELD_TYPES:
+        raise _err(
+            f"field {field!r} of {owner!r} must be one of {', '.join(sorted(_FIELD_TYPES))}",
+            annotation,
+        )
 
 
 def _rejected(kind: str, name: str, node: ast.AST, hints: Mapping[str, str]) -> LanguageError:
@@ -274,6 +365,83 @@ class _Validator(ast.NodeVisitor):
 
     def __init__(self, surface: LanguageSurface = DEFAULT_SURFACE) -> None:
         self.surface = surface
+        #: `id()` of every module-level ClassDef, to tell a schema declared
+        #: inside a function, loop or `if` from one at the top level.
+        self._toplevel: frozenset[int] = frozenset()
+
+    @override
+    def visit_Module(self, node: ast.Module) -> None:
+        self._toplevel = frozenset(id(stmt) for stmt in node.body if isinstance(stmt, ast.ClassDef))
+        self.generic_visit(node)
+
+    @override
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        """Allow exactly one class shape: an ``EnvSchema`` of annotated fields.
+
+        Defining this method intercepts the node before ``generic_visit``, which
+        is why ``"ClassDef"`` stays out of :data:`_ALLOWED_NODES`: the node is
+        not permitted in general, only in the shape checked here.
+
+        Interception also means children are not visited automatically, and
+        ``generic_visit`` cannot fix that (it would re-check ``ClassDef``
+        against the allow-list and reject). Default expressions are therefore
+        visited explicitly in :meth:`_check_field`.
+        """
+        if id(node) not in self._toplevel:
+            raise _err(
+                f"class {node.name!r} must be declared at module level — an "
+                f"EnvSchema is a declaration, not a computation",
+                node,
+            )
+        if node.decorator_list:
+            raise _err(f"a decorator on class {node.name!r} is not allowed", node)
+        if node.keywords:
+            raise _err(
+                f"class keyword arguments (metaclass=, ...) are not allowed on {node.name!r}",
+                node,
+            )
+        if getattr(node, "type_params", ()):  # `class X[T]:` — 3.12+
+            raise _err(f"type parameters on class {node.name!r} are not allowed", node)
+        if not _inherits_env_schema(node):
+            raise _err(
+                f"class {node.name!r} must inherit exactly {ENV_SCHEMA_BASE} — config "
+                f"declares no other classes; define resource types in a provider",
+                node,
+            )
+        self._check_schema_body(node)
+
+    def _check_schema_body(self, node: ast.ClassDef) -> None:
+        seen: set[str] = set()
+        for index, stmt in enumerate(node.body):
+            if isinstance(stmt, ast.Pass) or (index == 0 and _is_docstring(stmt)):
+                continue
+            if not isinstance(stmt, ast.AnnAssign):
+                raise _rejected_in_schema(stmt)
+            self._check_field(stmt, node.name, seen)
+
+    def _check_field(self, stmt: ast.AnnAssign, owner: str, seen: set[str]) -> None:
+        if not stmt.simple or not isinstance(stmt.target, ast.Name):
+            raise _err(f"a field of {owner!r} must be a plain name", stmt)
+        field = stmt.target.id
+        if field.startswith("_"):
+            raise _err(
+                f"field {field!r} of {owner!r} must not start with '_' — "
+                f"it is read back as `env.{field}`",
+                stmt,
+            )
+        if field in _RESERVED_FIELDS:
+            raise _err(
+                f"field {field!r} of {owner!r} collides with an environment's own API "
+                f"({', '.join(sorted(_RESERVED_FIELDS))}) — pick another name",
+                stmt,
+            )
+        if field in seen:
+            raise _err(f"field {field!r} of {owner!r} is declared twice", stmt)
+        seen.add(field)
+        _check_annotation(stmt.annotation, owner, field)
+        if stmt.value is not None:
+            # A default is an ordinary expression and must meet every other rule.
+            self.visit(stmt.value)
 
     @override
     def generic_visit(self, node: ast.AST) -> None:

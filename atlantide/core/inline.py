@@ -65,8 +65,11 @@ def inline_stack_outputs(registry: ResourceRegistry) -> ResourceRegistry:
         rebuilt.add_policy_binding(binding)
     # Every carried field must survive the rebuild; dropping the consumed
     # config inputs made `Compiled.inputs` empty for exactly the configs that
-    # use an in-config StackReference.
+    # use an in-config StackReference. Dropping the environment selection has the
+    # same shape: without it, `apply --env prod` plans every dev node as a delete.
     rebuilt.inputs = dict(registry.inputs)
+    rebuilt.envs_declared = registry.envs_declared
+    rebuilt.envs_selected = registry.envs_selected
     return rebuilt
 
 

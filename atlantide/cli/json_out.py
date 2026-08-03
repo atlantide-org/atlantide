@@ -23,6 +23,12 @@ def plan_json(plan_obj: Plan) -> dict[str, Any]:
         # What the config was evaluated with; two runs differing only in these
         # legitimately plan differently.
         "inputs": plan_obj.compiled.inputs,
+        # Declared environments and the subset this run acted on: equal when
+        # nothing was narrowed, both empty when the config has no `Config`.
+        "envs": {
+            "declared": list(plan_obj.compiled.envs_declared),
+            "selected": list(plan_obj.compiled.envs_selected),
+        },
         "changes": [
             {
                 "node_id": c.node_id,

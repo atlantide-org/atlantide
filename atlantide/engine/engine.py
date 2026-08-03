@@ -30,6 +30,7 @@ from atlantide.core import (
 )
 from atlantide.core.errors import StateError
 from atlantide.core.events import EventSink, no_sink
+from atlantide.core.node_id import stack_of
 from atlantide.engine.drift import raise_drift
 from atlantide.engine.hydrate import assemble_compiled, rehydrate_resources
 from atlantide.engine.locking import (
@@ -44,7 +45,7 @@ from atlantide.engine.planner import Planner, protected_ids
 from atlantide.engine.result import forward_failure, raise_on_failure
 from atlantide.graph import build_graph
 from atlantide.graph.order import topological_order
-from atlantide.graph.select import closure, match_targets
+from atlantide.graph.select import TargetError, closure, match_targets
 from atlantide.ir import Artifact, build_artifact, lower, verify_hash
 from atlantide.ir.model import IRGraph
 from atlantide.lang import DEFAULT_SURFACE, LanguageSurface, evaluate_source
@@ -137,11 +138,17 @@ class Engine:
         filename: str = "<config>",
         *,
         inputs: dict[str, Any] | None = None,
+        envs: Sequence[str] | None = None,
         extra_globals: dict[str, Any] | None = None,
     ) -> Result[Compiled, AtlantideError]:
         """Evaluate Atlas-lang source into a :class:`Compiled` (IR, graph, hashes)."""
         evaluated = evaluate_source(
-            source, filename, inputs=inputs, extra_globals=extra_globals, surface=self.surface
+            source,
+            filename,
+            inputs=inputs,
+            envs=envs,
+            extra_globals=extra_globals,
+            surface=self.surface,
         )
         return evaluated.bind(self._compile_registry)
 
@@ -159,6 +166,8 @@ class Engine:
             bindings=registry.policy_bindings,
             outputs=registry.outputs,
             inputs=registry.inputs,
+            envs_declared=registry.envs_declared,
+            envs_selected=registry.envs_selected,
         )
 
     def plan(
@@ -167,6 +176,7 @@ class Engine:
         filename: str = "<config>",
         *,
         inputs: dict[str, Any] | None = None,
+        envs: Sequence[str] | None = None,
         extra_globals: dict[str, Any] | None = None,
         targets: Sequence[str] = (),
         replace: Sequence[str] = (),
@@ -174,9 +184,12 @@ class Engine:
         """Compile and diff against current state; the Plan carries any violations.
 
         ``targets`` narrows the plan to the named resources and everything they
-        depend on; ``replace`` forces the named ones to be recreated.
+        depend on; ``replace`` forces the named ones to be recreated; ``envs``
+        narrows it to the named environments of the config's ``Config``.
         """
-        compiled = self.compile(source, filename, inputs=inputs, extra_globals=extra_globals)
+        compiled = self.compile(
+            source, filename, inputs=inputs, envs=envs, extra_globals=extra_globals
+        )
         return compiled.bind(
             lambda built: self._plan_from_compiled(built, targets=targets, replace=replace)
         )
@@ -193,6 +206,7 @@ class Engine:
         migrated, _ = resolve_aliases(self.backend.load(), built.ir)
         try:
             selected = self._selection(built, migrated, targets)
+            selected = self._within_envs(built, migrated, selected, targets)
             forced = self._match_only(built, migrated, replace)
         except AtlantideError as exc:
             return Failure(exc)
@@ -204,21 +218,63 @@ class Engine:
             replace=forced,
         )
 
+    @staticmethod
+    def _known_ids(built: Compiled, prior: StateGraph) -> set[str]:
+        """Every node id a pattern may name: the desired graph plus what state holds.
+
+        Ids in state but absent from the desired graph are matchable too — a
+        resource being deleted no longer has a node in the config.
+        """
+        return set(built.graph.node_ids) | set(prior.nodes)
+
     def _selection(
         self, built: Compiled, prior: StateGraph, patterns: Sequence[str]
     ) -> frozenset[str] | None:
         """Node ids the patterns name, closed over their dependencies.
 
         ``None`` when nothing was asked for — distinct from an empty set, which
-        would mean "act on nothing". Ids in state but absent from the desired
-        graph are matchable too: a resource being deleted is a legitimate target,
-        and it has no node in the config any more.
+        would mean "act on nothing".
         """
         if not patterns:
             return None
-        known = set(built.graph.node_ids) | set(prior.nodes)
-        seeds = match_targets(patterns, known)
+        seeds = match_targets(patterns, self._known_ids(built, prior))
         return closure(built.graph, seeds & set(built.graph.node_ids), reverse=False) | seeds
+
+    def _within_envs(
+        self,
+        built: Compiled,
+        prior: StateGraph,
+        selected: frozenset[str] | None,
+        patterns: Sequence[str],
+    ) -> frozenset[str] | None:
+        """Drop state nodes belonging to a declared-but-unselected environment.
+
+        Under ``--env prod`` the config declares no dev resources, so every dev
+        node in state would otherwise diff as a delete. An unselected
+        environment is out of scope for this run rather than undeclared, so its
+        nodes leave the selection instead of being planned.
+
+        Stacks declared outside ``config.envs()`` — a shared ``common`` — are not
+        in ``envs_declared`` and are unaffected.
+        """
+        excluded = set(built.envs_excluded)
+        if not excluded:
+            return selected
+        in_scope = frozenset(
+            node_id
+            for node_id in self._known_ids(built, prior)
+            if stack_of(node_id) not in excluded
+        )
+        if selected is None:
+            return in_scope
+        narrowed = selected & in_scope
+        if selected and not narrowed:
+            # Named explicitly: otherwise this reads as "--target matched nothing".
+            raise TargetError(
+                f"--target {', '.join(patterns)} matched only resources in "
+                f"environment(s) {', '.join(built.envs_excluded)}, which --env excluded"
+            )
+        return narrowed
 
     def _match_only(
         self, built: Compiled, prior: StateGraph, patterns: Sequence[str]
@@ -231,8 +287,7 @@ class Engine:
         """
         if not patterns:
             return frozenset()
-        known = set(built.graph.node_ids) | set(prior.nodes)
-        return match_targets(patterns, known)
+        return match_targets(patterns, self._known_ids(built, prior))
 
     def _stack_outputs(self) -> dict[str, Any]:
         """Committed cross-stack outputs, with any sealed sensitive value unsealed."""
@@ -246,6 +301,7 @@ class Engine:
         filename: str = "<config>",
         *,
         inputs: dict[str, Any] | None = None,
+        envs: Sequence[str] | None = None,
         extra_globals: dict[str, Any] | None = None,
         on_failure: OnFailure = "rollback",
         progress: ProgressCallback | None = None,
@@ -262,7 +318,9 @@ class Engine:
         that difference into a :class:`PlanDriftError` instead of a silent
         substitution.
         """
-        compiled = self.compile(source, filename, inputs=inputs, extra_globals=extra_globals)
+        compiled = self.compile(
+            source, filename, inputs=inputs, envs=envs, extra_globals=extra_globals
+        )
         if isinstance(compiled, Failure):
             return forward_failure(compiled)
         return await self._apply_compiled(
@@ -277,6 +335,7 @@ class Engine:
         filename: str = "<config>",
         *,
         inputs: dict[str, Any] | None = None,
+        envs: Sequence[str] | None = None,
         extra_globals: dict[str, Any] | None = None,
         component_pins: dict[str, str] | None = None,
     ) -> Result[Artifact, AtlantideError]:
@@ -285,9 +344,13 @@ class Engine:
         ``component_pins`` (alias -> resolved commit, from the project's lock) is
         recorded in the artifact as provenance for any published components used.
         """
-        compiled = self.compile(source, filename, inputs=inputs, extra_globals=extra_globals)
+        compiled = self.compile(
+            source, filename, inputs=inputs, envs=envs, extra_globals=extra_globals
+        )
         return compiled.map(
-            lambda c: build_artifact(c.ir, c.policy_bindings, c.outputs, component_pins)
+            lambda c: build_artifact(
+                c.ir, c.policy_bindings, c.outputs, component_pins, envs=c.envs_selected
+            )
         )
 
     def verify_artifact(self, artifact: Artifact) -> Result[None, AtlantideError]:

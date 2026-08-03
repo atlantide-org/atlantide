@@ -54,6 +54,9 @@ class Harness:
     backend: StateBackend = field(default_factory=MemoryStateBackend)
     secrets: SecretsRegistry = field(default_factory=SecretsRegistry)
     globals: dict[str, Any] = field(default_factory=dict)
+    #: The ``--env`` selection the config is evaluated under. ``None`` (the
+    #: default) means every environment a ``Config`` declares, as with the flag.
+    envs: tuple[str, ...] | None = None
     parallelism: int | None = None
     #: The write guard the executor consults. Exposed so a test can put it in the
     #: state a failed lease renewal would leave it in.
@@ -103,7 +106,7 @@ class Harness:
     def _compile(
         self, source: str, providers: ProviderRegistry
     ) -> tuple[Any, Any, Any, dict[str, str]]:
-        registry = evaluate_source(source, extra_globals=self.globals).unwrap()
+        registry = evaluate_source(source, extra_globals=self.globals, envs=self.envs).unwrap()
         ir = lower(registry, providers)
         graph = build_graph(ir).unwrap()
         hashes = merkle_hashes(ir, topological_order(graph))

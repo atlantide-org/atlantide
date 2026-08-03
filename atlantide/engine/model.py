@@ -23,6 +23,22 @@ class Compiled:
     #: The config inputs this evaluation actually read. Shown above the plan, so a
     #: plan that differs from yesterday's can be accounted for.
     inputs: dict[str, Any] = field(default_factory=dict)
+    #: Every environment the config's ``Config`` declared, and the subset this
+    #: run selected. Equal (or both empty) when nothing was narrowed. The planner
+    #: reads both to keep an unselected environment's existing state out of the
+    #: diff, which would otherwise plan as a delete.
+    envs_declared: tuple[str, ...] = ()
+    envs_selected: tuple[str, ...] = ()
+
+    @property
+    def envs_excluded(self) -> tuple[str, ...]:
+        """Environments the config declared that this run did not select.
+
+        Empty unless ``--env`` narrowed the run. Read by both the planner (which
+        keeps these out of the diff) and the plan header (which names them).
+        """
+        selected = set(self.envs_selected)
+        return tuple(name for name in self.envs_declared if name not in selected)
 
 
 @dataclass(frozen=True, slots=True)

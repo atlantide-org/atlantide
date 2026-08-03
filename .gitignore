@@ -67,3 +67,5 @@ atlantide.secrets
 
 # token-savior index
 .token-savior-cache.json
+dist-*
+build-*

@@ -46,6 +46,12 @@ VarFileOpt = Annotated[
     list[Path] | None,
     typer.Option("--var-file", help="TOML file of config inputs (repeatable)."),
 ]
+#: No ``ATLANTIDE_ENV`` counterpart: the environment a run acts on is passed on
+#: the command line, not inherited from the shell.
+EnvOpt = Annotated[
+    list[str] | None,
+    typer.Option("--env", "-e", help="Act only on this Config environment (repeatable)."),
+]
 TargetOpt = Annotated[
     list[str] | None,
     typer.Option(

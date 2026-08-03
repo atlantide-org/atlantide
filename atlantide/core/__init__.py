@@ -8,6 +8,16 @@ from returns.pipeline import is_successful
 from returns.result import Failure, Result, Success
 
 from atlantide.core.component import Component, child
+from atlantide.core.config import (
+    Config,
+    EnvSchema,
+    EnvSelection,
+    EnvView,
+    Var,
+    current_selection,
+    selecting,
+    var,
+)
 from atlantide.core.context import Context
 from atlantide.core.errors import (
     ArtifactError,
@@ -56,6 +66,7 @@ from atlantide.core.stack import (
     DEFAULT_STACK,
     Stack,
     StackReference,
+    current_config,
     current_stack,
     current_stack_name_prefix,
     current_stack_region,
@@ -81,9 +92,13 @@ __all__ = [
     "AtlantideError",
     "Component",
     "ComponentError",
+    "Config",
     "Context",
     "CycleError",
     "DataSource",
+    "EnvSchema",
+    "EnvSelection",
+    "EnvView",
     "Failure",
     "FuelExhaustedError",
     "IRError",
@@ -115,12 +130,15 @@ __all__ = [
     "StateError",
     "Success",
     "Transform",
+    "Var",
     "active_registry",
     "check_compatible",
     "child",
     "collecting",
     "computed",
     "concat",
+    "current_config",
+    "current_selection",
     "current_stack",
     "current_stack_name_prefix",
     "current_stack_region",
@@ -138,5 +156,7 @@ __all__ = [
     "physical_name_field",
     "region",
     "secret",
+    "selecting",
     "sensitive_fields",
+    "var",
 ]
