@@ -1,28 +1,38 @@
-"""Plan refinement and policy evaluation: compiled config + prior state -> Plan."""
+"""Plan refinement and policy evaluation: compiled config + prior state -> Plan.
+
+Also the two checks made on a plan once the lease is held: the destroy
+changeset, and refusing an apply whose changes drifted from the approved ones.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, replace
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 from returns.result import Failure, Result, Success
 
-from atlantide.core import AtlantideError, PolicyBinding, Resource
-from atlantide.core.errors import SecretsError
-from atlantide.core.fields import Mutability, physical_name_field
+from atlantide.core import AtlantideError, Resource
+from atlantide.core.errors import PlanDriftError, SecretsError
 from atlantide.core.markers import STACK_OUTPUT_KEY, is_stack_output_marker
-from atlantide.core.node_id import field_scope, stack_of
 from atlantide.engine.model import Compiled, Plan
-from atlantide.policy import PolicyContext, PolicyRegistry, Violation, class_bindings
+from atlantide.engine.policy_eval import evaluate_policies
+from atlantide.engine.result import catching, forward_failure
+from atlantide.engine.secret_audit import audit_secrets
+from atlantide.engine.selection import destroy_selection
+from atlantide.graph.cbd import cbd_forcers, effective_cbd
+from atlantide.ir.model import IRGraph
+from atlantide.policy import PolicyRegistry
 from atlantide.reconcile import (
-    Action,
     Change,
     ChangeSet,
+    check_prevent_destroy,
+    deferred_to_apply,
     diff,
-    plan,
     restrict,
 )
+from atlantide.reconcile.applied import consumed
+from atlantide.reconcile.changes import TypeMutability
+from atlantide.reconcile.ordering import behind_destroy_first, resolve_cbd
 from atlantide.secrets import (
     SecretsRegistry,
     is_secret_ref_marker,
@@ -31,9 +41,86 @@ from atlantide.secrets import (
 from atlantide.state import StateGraph
 
 
-def protected_ids(prior: StateGraph) -> frozenset[str]:
-    """Node ids in state whose lifecycle sets ``prevent_destroy``."""
-    return frozenset(n.id for n in prior.nodes.values() if n.prevent_destroy)
+def protected_ids(prior: StateGraph, desired: IRGraph | None = None) -> frozenset[str]:
+    """Node ids the ``prevent_destroy`` guard protects in a plan of ``desired`` over ``prior``.
+
+    Terraform's model: for a node the config declares, the flag the config sets
+    decides, so protection added in a plan already guards that plan and
+    protection removed in it already permits a replace. For a node the config
+    does not declare (a DELETE, or ``destroy``, which has no config) the flag
+    recorded in state decides, since it is the only record left.
+    """
+    declared = {node.id: node.prevent_destroy for node in desired.nodes} if desired else {}
+    stored = {n.id for n in prior.nodes.values() if n.prevent_destroy and n.id not in declared}
+    return frozenset(stored | {node_id for node_id, flag in declared.items() if flag})
+
+
+def _deferral_notes(deferred: frozenset[str]) -> tuple[str, ...]:
+    """The plan warning for each protected node whose replace is judged at apply."""
+    return tuple(
+        f"{node_id}: prevent_destroy is checked at apply — its replacement is known "
+        "only after apply, and the apply refuses it if an immutable value actually changes"
+        for node_id in sorted(deferred)
+    )
+
+
+def destroy_changeset(
+    state: StateGraph,
+    mutability: TypeMutability,
+    targets: Sequence[str] = (),
+) -> Result[ChangeSet, AtlantideError]:
+    """Delete everything in ``state``, or only ``targets`` and their dependents.
+
+    ``prevent_destroy`` is enforced here, like any other plan.
+    """
+    changes = diff(IRGraph(nodes=()), {}, state, mutability)
+    if targets:
+        selected = catching(lambda: destroy_selection(state, targets))
+        if isinstance(selected, Failure):
+            return forward_failure(selected)
+        changes = restrict(changes, selected.unwrap())
+    return check_prevent_destroy(changes, protected_ids(state))
+
+
+def raise_drift(approved: ChangeSet, fresh: ChangeSet) -> None:
+    """Refuse to execute a changeset that is not the one that was approved.
+
+    Called with the lease held, after the re-diff. State may change between the
+    approved plan and the one about to run (another apply landed, or a resource
+    was destroyed out of band); a changed diff is refused.
+    """
+    before, after = approved.fingerprint(), fresh.fingerprint()
+    if before == after:
+        return
+    added = sorted(_drift_entry(entry) for entry in after - before)
+    removed = sorted(_drift_entry(entry) for entry in before - after)
+    parts = []
+    if added:
+        parts.append(f"now also: {', '.join(added)}")
+    if removed:
+        parts.append(f"no longer: {', '.join(removed)}")
+    raise PlanDriftError(
+        "state changed between the plan you approved and the lock being taken, so "
+        "the changes are no longer the ones shown — " + "; ".join(parts) + ". "
+        "Re-run to plan against current state."
+    )
+
+
+def _drift_entry(entry: tuple[str, str, tuple[str, ...], bool, bool]) -> str:
+    """One :meth:`ChangeSet.fingerprint` entry, with everything it compares.
+
+    The action and node id alone would print a change whose fields or flags
+    moved as both added and removed, unchanged.
+    """
+    node_id, action, changed_fields, conditional, create_before_destroy = entry
+    text = f"{action} {node_id}"
+    if changed_fields:
+        text += f" [{', '.join(changed_fields)}]"
+    if conditional:
+        text += " (known after apply)"
+    if create_before_destroy:
+        text += " create-before-destroy"
+    return text
 
 
 def _actionable_fields(changeset: ChangeSet) -> Iterator[tuple[Change, str, Any]]:
@@ -50,96 +137,21 @@ def _actionable_fields(changeset: ChangeSet) -> Iterator[tuple[Change, str, Any]
             yield change, field_name, value
 
 
-@dataclass(frozen=True, slots=True)
-class SecretAudit:
-    """How the unchanged nodes' live secret values compare to their stored digests.
-
-    Two conclusions come out of one comparison, which is why it is a value rather
-    than a pair of passes: which fields to re-apply, and whether the misses are
-    rotations at all.
-    """
-
-    #: node id -> field names whose value no longer matches the stored digest.
-    rotated: dict[str, tuple[str, ...]]
-    #: Digests that verified — any at all means this install's salt is the right one.
-    matched: int
-    #: Nodes holding a digest that exists and missed (a never-written one proves nothing).
-    mismatched: frozenset[str]
-
-    @property
-    def looks_like_a_foreign_keyfile(self) -> bool:
-        """Whether the misses are better explained by the wrong ``secrets_key``.
-
-        Rotation digests are salted per install, so a teammate without the shared
-        keyfile recomputes every digest under a different salt and every secret
-        reads as rotated. One rotated secret is a rotation; two resources' worth
-        rotating at once with *nothing* intact is a salt that does not match the
-        one those digests were written with.
-        """
-        return self.matched == 0 and len(self.mismatched) >= 2
-
-    def applied_to(
-        self, changeset: ChangeSet, mutability: Mapping[str, Mapping[str, Mutability]]
-    ) -> ChangeSet:
-        """Upgrade each NOOP whose secret rotated to a re-apply of those fields.
-
-        The IR is value-independent, so a rotation is invisible to the Merkle
-        diff; this is where it re-enters the plan. Classified through the same
-        mutability the diff uses: a rotated ``immutable()`` field cannot be
-        pushed through ``update()``, so it is a REPLACE, not an UPDATE.
-        """
-        if not self.rotated:
-            return changeset
-        return changeset.map(
-            lambda change: (
-                self._upgraded(change, fields, mutability)
-                if (fields := self.rotated.get(change.node_id))
-                else change
-            )
-        )
-
-    @staticmethod
-    def _upgraded(
-        change: Change,
-        fields: tuple[str, ...],
-        mutability: Mapping[str, Mapping[str, Mutability]],
-    ) -> Change:
-        assert change.desired is not None  # rotation is only audited on NOOPs with IR
-        muts = mutability.get(change.desired.type, {})
-        if any(muts.get(f) is Mutability.IMMUTABLE for f in fields):
-            return replace(
-                change,
-                action=Action.REPLACE,
-                changed_fields=fields,
-                create_before_destroy=change.desired.create_before_destroy,
-            )
-        return replace(change, action=Action.UPDATE, changed_fields=fields)
-
-    def warnings(self) -> tuple[str, ...]:
-        """The non-blocking note to show above the plan, if there is one."""
-        if not self.looks_like_a_foreign_keyfile:
-            return ()
-        return (
-            f"every secret in state reads as rotated ({len(self.mismatched)} resources) — "
-            f"if they did not all change, this install's secrets_key differs from the "
-            f"one that wrote this state; point secrets_key at the shared keyfile "
-            f"rather than applying these updates",
-        )
-
-
 class Planner:
     """Turns a compiled config + prior state into a :class:`Plan`.
 
-    Owns the post-diff refinement passes — secret-rotation detection, undefined-
-    secret validation, create-before-destroy collision resolution — plus policy
-    evaluation, holding their inputs (``mutability``/``types``/``secrets``/
-    ``policies``).
+    Runs the post-diff refinement passes in order (secret-rotation detection,
+    :mod:`~atlantide.engine.secret_audit`; undefined-secret and stack-output
+    validation; create-before-destroy collision resolution,
+    :func:`~atlantide.reconcile.ordering.resolve_cbd`) and then policy
+    evaluation (:mod:`~atlantide.engine.policy_eval`), holding their inputs
+    (``mutability``/``types``/``secrets``/``policies``).
     """
 
     def __init__(
         self,
         *,
-        mutability: dict[str, dict[str, Mutability]],
+        mutability: TypeMutability,
         types: dict[str, type[Resource]],
         secrets: SecretsRegistry,
         policies: PolicyRegistry,
@@ -151,7 +163,7 @@ class Planner:
 
     def build(
         self,
-        built: Compiled,
+        compiled: Compiled,
         prior: StateGraph,
         stack_outputs: dict[str, Any],
         *,
@@ -160,37 +172,63 @@ class Planner:
     ) -> Result[Plan, AtlantideError]:
         """Diff, then shape the result before the policy and safety passes run.
 
-        Ordering matters: forcing a replace and restricting to a selection both
-        happen *before* :func:`plan`, so a forced node still meets
-        ``prevent_destroy`` and still goes through create-before-destroy
-        resolution. Applying them afterwards would let ``--replace`` walk past
-        the one guard that exists to stop an unintended destroy.
+        Forcing a replace and restricting to a selection both happen before
+        :func:`check_prevent_destroy`, so a node forced by ``--replace`` is still
+        subject to ``prevent_destroy`` and create-before-destroy resolution.
+
+        The diff also sees what each node's ``$ref`` fields resolve to against the
+        stored outputs, compared with what they were last applied with (see
+        :mod:`atlantide.reconcile.applied`), so a value an interrupted or targeted
+        run moved is a known change: a protected node it replaces is refused here.
         """
-        raw = diff(built.ir, built.hashes, prior, self.mutability, replace=replace)
+        # A salted ``$ref`` record cannot be checked without the install key; the
+        # SecretsError naming the missing keyfile is the plan's failure.
+        moved = catching(lambda: consumed(compiled.ir, prior, self.secrets))
+        if isinstance(moved, Failure):
+            return forward_failure(moved)
+        raw = diff(
+            compiled.ir,
+            compiled.hashes,
+            prior,
+            self.mutability,
+            replace=replace,
+            consumed=moved.unwrap(),
+        )
         if selected is not None:
             raw = restrict(raw, selected)
-        changeset: Result[ChangeSet, AtlantideError] = plan(raw, protected_ids(prior))
-        return changeset.bind(lambda cs: self._refine(cs, built, prior, stack_outputs))
+        protected = protected_ids(prior, compiled.ir)
+        changeset: Result[ChangeSet, AtlantideError] = check_prevent_destroy(raw, protected)
+        notes = _deferral_notes(deferred_to_apply(raw, protected))
+        return changeset.bind(lambda cs: self._refine(cs, compiled, prior, stack_outputs, notes))
 
     def _refine(
         self,
         changeset: ChangeSet,
-        built: Compiled,
+        compiled: Compiled,
         prior: StateGraph,
         stack_outputs: dict[str, Any],
+        notes: tuple[str, ...] = (),
     ) -> Result[Plan, AtlantideError]:
         """Post-diff passes, in order: secrets, then references, then policy.
 
-        The secret audit runs first and once — both of its consumers (upgrading a
-        NOOP whose secret rotated, and warning when those "rotations" are really a
-        foreign keyfile) read the same comparison, and resolving each handle twice
-        would mean two round trips per secret to a remote store.
+        The secret audit runs first and once: both of its consumers (upgrading a
+        NOOP whose secret rotated, and warning when the mismatches come from a
+        foreign keyfile) read the same comparison, which avoids a second round
+        trip per secret to a remote store.
+
+        A stored digest with no keyfile to check it against fails the plan (the
+        SecretsError names the keyfile path) rather than reading as a rotation.
         """
-        audit = self._audit_secrets(changeset, prior)
+        audited = catching(lambda: audit_secrets(changeset, prior, self.secrets))
+        if isinstance(audited, Failure):
+            return forward_failure(audited)
+        audit = audited.unwrap()
         return (
-            self._require_secrets(audit.applied_to(changeset, self.mutability))
+            self._require_secrets(
+                audit.applied_to(changeset, self.mutability, effective_cbd(compiled.ir))
+            )
             .bind(lambda cs: self._require_stack_outputs(cs, stack_outputs))
-            .bind(lambda cs: self._finalize(cs, built, audit.warnings()))
+            .bind(lambda cs: self._finalize(cs, compiled, notes + audit.warnings()))
         )
 
     def _require_stack_outputs(
@@ -225,133 +263,37 @@ class Planner:
             ref = secret_ref_from_marker(value)
             try:
                 self.secrets.resolve(ref)
-            except SecretsError:
-                missing.append(f"{change.node_id}.{field_name} -> {ref.name!r}")
+            except SecretsError as exc:
+                # The provider's reason (not found, not allow-listed, unreachable)
+                # is included; providers never put secret values in it.
+                missing.append(f"{change.node_id}.{field_name} -> {ref.name!r} ({exc})")
         if missing:
             return Failure(SecretsError("undefined secret(s): " + "; ".join(sorted(missing))))
         return Success(changeset)
 
-    def _audit_secrets(self, changeset: ChangeSet, prior: StateGraph) -> SecretAudit:
-        """Compare every unchanged node's secret handles against its stored digests.
-
-        Only NOOPs are worth auditing: a node the Merkle diff already flagged is
-        being re-applied regardless, and a rotation is invisible to that diff
-        precisely because the IR holds handles rather than values.
-
-        Best-effort — a handle this install cannot resolve is left to apply, which
-        must resolve it anyway.
-        """
-        rotated: dict[str, tuple[str, ...]] = {}
-        matched = 0
-        mismatched: set[str] = set()
-        for change in changeset.changes:
-            node = change.desired
-            prior_node = prior.get(change.node_id)
-            if change.action is not Action.NOOP or node is None or prior_node is None:
-                continue
-            fields: list[str] = []
-            for field_name, value in node.properties.items():
-                if not is_secret_ref_marker(value):
-                    continue
-                try:
-                    plaintext = self.secrets.resolve(secret_ref_from_marker(value))
-                except AtlantideError:
-                    continue
-                stored = prior_node.secret_digests.get(field_name)
-                scope = field_scope(change.node_id, field_name)
-                if self.secrets.digest_matches(scope, plaintext, stored):
-                    matched += 1
-                    continue
-                fields.append(field_name)
-                # Only a digest that exists and misses is evidence about the salt;
-                # one never written (a pre-secrets state row, or a non-sensitive
-                # field) says nothing either way.
-                if stored is not None:
-                    mismatched.add(change.node_id)
-            if fields:
-                rotated[change.node_id] = tuple(sorted(fields))
-        return SecretAudit(rotated=rotated, matched=matched, mismatched=frozenset(mismatched))
-
     def _finalize(
-        self, changeset: ChangeSet, built: Compiled, notes: tuple[str, ...] = ()
+        self, changeset: ChangeSet, compiled: Compiled, notes: tuple[str, ...] = ()
     ) -> Result[Plan, AtlantideError]:
-        resolved, warnings = self._resolve_cbd(changeset)
-        try:
-            violations = self._evaluate_policies(resolved, built)
-        except AtlantideError as exc:  # policy provider errors cross back to Result here
-            return Failure(exc)
-        return Success(
-            Plan(
-                changeset=resolved,
-                compiled=built,
+        resolved = resolve_cbd(
+            changeset,
+            types=self.types,
+            mutability=self.mutability,
+            forcers=cbd_forcers(compiled.ir),
+        )
+        if isinstance(resolved, Failure):
+            return forward_failure(resolved)
+        # A downgrade makes an upstream destroy-first: its conditional
+        # dependents must go before its delete, as the diff orders them.
+        cs, warnings = resolved.unwrap()
+        settled = behind_destroy_first(cs, self.mutability)
+        # Policy provider errors cross back to Result here.
+        return catching(
+            lambda: evaluate_policies(settled, compiled, types=self.types, policies=self.policies)
+        ).map(
+            lambda violations: Plan(
+                changeset=settled,
+                compiled=compiled,
                 violations=violations,
                 warnings=notes + warnings,
             )
         )
-
-    def _resolve_cbd(self, changeset: ChangeSet) -> tuple[ChangeSet, tuple[str, ...]]:
-        """Downgrade create-before-destroy REPLACEs that would collide on identity.
-
-        CBD needs the new resource to coexist with the old; when the replacement
-        keeps the old identity (its physical name, or — for types that declare
-        none — no immutable field changed), fall back to destroy-before-create.
-        """
-        resolved = [self._resolve_one_cbd(change) for change in changeset.changes]
-        changes = tuple(change for change, _ in resolved)
-        warnings = tuple(warning for _, warning in resolved if warning)
-        return ChangeSet(changes), warnings
-
-    def _resolve_one_cbd(self, change: Change) -> tuple[Change, str | None]:
-        if not self._cbd_collides(change):
-            return change, None
-        warning = (
-            f"{change.node_id}: create_before_destroy not possible "
-            "(replacement shares the old identity); using destroy-before-create"
-        )
-        return replace(change, create_before_destroy=False), warning
-
-    def _cbd_collides(self, change: Change) -> bool:
-        """Whether a create-before-destroy REPLACE would clash with the old resource."""
-        if not (change.action is Action.REPLACE and change.create_before_destroy):
-            return False
-        assert change.desired is not None and change.prior is not None
-        type_name = change.desired.type
-        cls = self.types.get(type_name)
-        name_field = physical_name_field(cls) if cls is not None else None
-        if name_field is not None:
-            # Distinct only when the cloud name itself changes.
-            return change.desired.properties.get(name_field) == change.prior.properties.get(
-                name_field
-            )
-        # No declared identity: the replacement is distinct only if an immutable
-        # field changed; otherwise it occupies the same slot as the prior resource.
-        mutability = self.mutability.get(type_name, {})
-        return not any(mutability.get(f) is Mutability.IMMUTABLE for f in change.changed_fields)
-
-    def _evaluate_policies(self, changeset: ChangeSet, compiled: Compiled) -> tuple[Violation, ...]:
-        violations: list[Violation] = []
-        for change in changeset.actionable:  # skip NOOP
-            node = change.desired or change.prior
-            type_name = node.type if node is not None else ""
-            for binding in self._bindings_for(type_name, compiled):
-                # Rebuilt per binding: a parameterised policy bound twice (one
-                # stack set per environment) must see each binding's arguments.
-                ctx = PolicyContext(
-                    node_id=change.node_id,
-                    action=change.action,
-                    stack=stack_of(change.node_id),
-                    resource=compiled.resources.get(change.node_id),
-                    params=binding.params,
-                )
-                result = self.policies.evaluate(binding.name, ctx)
-                if not result.passed:
-                    violations.append(
-                        Violation(binding.name, binding.level, change.node_id, result.message)
-                    )
-        return tuple(violations)
-
-    def _bindings_for(self, type_name: str, compiled: Compiled) -> list[PolicyBinding]:
-        config_bindings = [b for b in compiled.policy_bindings if b.applies_to(type_name)]
-        cls = self.types.get(type_name)
-        decorated = list(class_bindings(cls)) if cls is not None else []
-        return config_bindings + decorated

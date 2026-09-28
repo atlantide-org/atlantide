@@ -1,14 +1,12 @@
 """Preflight checks: what ``atlantide state check`` reports.
 
 A backend answers :meth:`~atlantide.state.backend.StateBackend.check` with a list
-of :class:`Check` results — one per thing that has to be true before shared state
-is trustworthy (the object exists, versioning is on, the lock table has the right
-key, conditional writes are honoured). Reporting them together is the point: the
-alternative is discovering them one failed API call at a time, weeks apart.
+of :class:`Check` results, one per precondition for trusting shared state (the
+object exists, versioning is on, the lock table has the right key, conditional
+writes are honoured). Reporting them together surfaces every problem at once
+rather than one failed API call at a time.
 
-``Status`` is deliberately four-valued. ``warn`` is for a real risk that does not
-stop a run today (versioning off, no lock TTL) — the class of problem that
-otherwise surfaces only when it is too late to fix.
+``warn`` flags a risk that does not block a run (versioning off, no lock TTL).
 """
 
 from __future__ import annotations
@@ -17,7 +15,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 #: ``ok`` works | ``warn`` works but is risky | ``fail`` broken | ``skip`` not checked.
-Status = Literal["ok", "warn", "fail", "skip"]
+type Status = Literal["ok", "warn", "fail", "skip"]
 
 OK: Status = "ok"
 WARN: Status = "warn"

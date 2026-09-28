@@ -2,9 +2,8 @@
 
 The determinism guarantee is over *(config, inputs)*, not config alone. Two runs
 with the same inputs must produce byte-identical IR; two runs with different ones
-are supposed to differ. Both halves are asserted here, because the first is what
-makes the artifact/hash story hold and the second is the whole point of the
-feature.
+must differ. Both halves are asserted: artifact hashing relies on the first, and
+the second is the purpose of the feature.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.support import Cli
+from tests.support import Cli, write_config
 
 cli = Cli()
 
@@ -29,9 +28,7 @@ CONFIG = (
 
 
 def _config(tmp_path: Path) -> Path:
-    cfg = tmp_path / "config.py"
-    cfg.write_text(CONFIG)
-    return cfg
+    return write_config(tmp_path, CONFIG)
 
 
 def _plan(tmp_path: Path, *args: str) -> object:
@@ -77,7 +74,7 @@ def test_a_var_file_supplies_inputs(tmp_path: Path) -> None:
 
 
 def test_the_project_table_supplies_inputs(tmp_path: Path, monkeypatch) -> None:
-    """The real first-hour need: one config, N environments, no flags."""
+    """One config, N environments, no flags."""
     (tmp_path / "atlantide.toml").write_text(f'[inputs]\ndir = "{tmp_path}"\nenv = "fromtoml"\n')
     cfg = _config(tmp_path)
     monkeypatch.chdir(tmp_path)
@@ -136,15 +133,14 @@ def _built_hash(tmp_path: Path, name: str, *args: str) -> str:
 
 
 def test_the_same_inputs_produce_the_same_ir(tmp_path: Path) -> None:
-    """The invariant the artifact story rests on."""
+    """The invariant artifact hashing rests on."""
     first = _built_hash(tmp_path, "a", "-var", "env=prod")
     second = _built_hash(tmp_path, "b", "-var", "env=prod")
     assert first == second
 
 
 def test_different_inputs_produce_different_ir(tmp_path: Path) -> None:
-    """And the point of the feature: the config really did describe something
-    else, so the hash has to say so."""
+    """Different inputs describe different infrastructure, so the hash must differ."""
     assert _built_hash(tmp_path, "a", "-var", "env=dev") != _built_hash(
         tmp_path, "b", "-var", "env=prod"
     )
@@ -162,7 +158,7 @@ def test_an_input_nobody_read_does_not_change_the_plan(tmp_path: Path) -> None:
 
 
 def test_the_plan_shows_what_it_was_evaluated_with(tmp_path: Path) -> None:
-    """Otherwise "why is today's plan different" has no answer anywhere."""
+    """Recording the inputs is what explains why one plan differs from another."""
     result = _plan(tmp_path, "-var", "env=prod")
     assert "inputs:" in result.output
     assert "env='prod'" in result.output.replace(" ", "").replace("\n", "")
@@ -214,8 +210,8 @@ def test_an_unreadable_var_file_is_reported(tmp_path: Path) -> None:
 
 
 def test_a_var_value_stays_a_string(tmp_path: Path) -> None:
-    """A shell hands over text. Guessing between "2", 2 and True is how a config
-    silently takes the wrong branch, so the conversion is the config's to make."""
+    """A shell hands over text. Guessing between "2", 2 and True can silently send a
+    config down the wrong branch, so the conversion is left to the config."""
     cfg = tmp_path / "typed.py"
     # `+ "!"` only succeeds if the value is already a string; an int would raise.
     cfg.write_text(

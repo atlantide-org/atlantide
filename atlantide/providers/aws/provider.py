@@ -1,10 +1,10 @@
 """AWS provider: a dispatcher over per-resource handlers.
 
-boto3 is synchronous; each CRUD call runs in a worker thread via
+boto3 is synchronous, so each CRUD call runs in a worker thread via
 ``asyncio.to_thread`` to fit the async Provider contract without blocking the
-scheduler. Clients are cached per ``(alias, service, region)`` — one boto3
-``Session`` per alias supplies alternate credentials/endpoint (multi-account),
-while region stays a per-resource choice.
+scheduler. Clients are cached per ``(alias, service, region)``: each alias has its
+own boto3 ``Session`` with alternate credentials or endpoint (multi-account), and
+region is chosen per resource.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, cast, override
 
 from botocore.exceptions import (
     ClientError,
@@ -24,7 +24,6 @@ from botocore.exceptions import (
     EndpointConnectionError,
     ReadTimeoutError,
 )
-from typing_extensions import override
 
 from atlantide.core import Context, Provider, Resource
 from atlantide.core.errors import ProviderError
@@ -33,17 +32,19 @@ from atlantide.core.tuning import DEFAULT_PARALLELISM
 from atlantide.providers.aws.config import boto_config
 from atlantide.providers.aws.handlers import HANDLERS, AwsHandler
 from atlantide.providers.aws.region import Region
+from atlantide.util.aws import error_code, error_message
 
-#: Transient AWS failures retried with backoff rather than aborting the apply:
-#: throttling, service 5xx, and IAM eventual consistency, where a just-created
-#: role is not yet assumable by the service that will use it.
+#: Attempts and backoff bounds (seconds) for transient AWS failures: throttling,
+#: service 5xx and transport errors.
 _RETRY_ATTEMPTS = 6
 _RETRY_BASE_DELAY = 1.0
 _RETRY_MAX_DELAY = 10.0
 
-#: Wall-clock ceiling for one call including all its backoff. Attempt counts alone
-#: do not bound elapsed time, and an unbounded retry chain inside a node makes any
-#: per-node timeout a lie.
+#: Wall-clock budget in seconds for starting another attempt of one call. It is
+#: checked before each backoff sleep: no retry is scheduled whose sleep would end
+#: past the budget. An attempt already running is not interrupted, so the total can
+#: exceed the budget by the last attempt's duration (bounded by the botocore read
+#: timeout and transport retries in :mod:`atlantide.providers.aws.config`).
 _RETRY_BUDGET = 120.0
 
 #: Error codes that are transient regardless of message (throttling + service 5xx).
@@ -64,9 +65,8 @@ _TRANSIENT_CODES = frozenset(
 
 
 #: IAM eventual consistency: the role exists but is not yet assumable or visible.
-#: Matched on phrasing, not on the presence of "role": the same error code also
-#: carries permanent failures that mention one, and a malformed RoleArn would
-#: otherwise burn every attempt before surfacing.
+#: Matched on specific phrasing, since the same error code also carries permanent
+#: role failures (e.g. a malformed RoleArn) that must not be retried.
 _IAM_PROPAGATION = re.compile(
     r"cannot be assumed"
     r"|not authorized to perform:\s*sts:assumerole"
@@ -75,16 +75,18 @@ _IAM_PROPAGATION = re.compile(
     re.IGNORECASE,
 )
 
-#: IAM propagation settles in seconds — commonly 5-10 of them — so the attempts
-#: and the floored backoff below are sized to guarantee that much wall-clock
-#: waiting before giving up. Kept separate from the throttling budget: throttling
-#: deserves patience, a genuinely wrong role deserves a fast, legible failure.
+#: IAM propagation typically settles in 5-10 seconds. With the delays floored at
+#: :data:`_IAM_DELAY_FLOOR` of each cap, these attempts wait at least 11.25 s in
+#: total (0.75 + 1.5 + 3 + 6), covering that window. Separate from
+#: :data:`_RETRY_ATTEMPTS` so a wrong role fails fast.
 _IAM_ATTEMPTS = 5
 
-#: Transport failures worth retrying. botocore's adaptive retries (see
-#: :mod:`atlantide.providers.aws.config`) handle most of these, but a call that
-#: exhausts them still arrives here, and one reset connection should not abort
-#: a whole apply.
+#: Fraction of each capped delay kept as a floor for IAM propagation retries.
+_IAM_DELAY_FLOOR = 0.75
+
+#: Transport failures to retry. botocore's adaptive retries
+#: (:mod:`atlantide.providers.aws.config`) handle most of these; a call that
+#: exhausts them is retried here as well.
 _TRANSIENT_BOTOCORE = (
     EndpointConnectionError,
     ConnectionClosedError,
@@ -94,42 +96,35 @@ _TRANSIENT_BOTOCORE = (
 
 
 def _is_iam_propagation(exc: BaseException) -> bool:
-    """The specific race :data:`_IAM_PROPAGATION` names: a role that exists but
-    is not yet visible or assumable by the service consuming it."""
-    if not isinstance(exc, ClientError):
+    """Whether ``exc`` is the IAM propagation race that :data:`_IAM_PROPAGATION` matches."""
+    if not isinstance(exc, ClientError) or error_code(exc) != "InvalidParameterValueException":
         return False
-    error = exc.response.get("Error", {})
-    if error.get("Code", "") != "InvalidParameterValueException":
-        return False
-    return bool(_IAM_PROPAGATION.search(error.get("Message", "")))
+    return bool(_IAM_PROPAGATION.search(error_message(exc)))
 
 
 def _is_transient(exc: BaseException) -> bool:
     """Whether ``exc`` is worth another attempt.
 
-    Note the asymmetry: transport errors and throttling are transient regardless
-    of what they were doing, while an ``InvalidParameterValueException`` is only
-    transient for the one specific race it is used to signal.
+    Transport errors and throttling are always transient; an
+    ``InvalidParameterValueException`` is transient only for the IAM propagation
+    race.
     """
     if isinstance(exc, _TRANSIENT_BOTOCORE):
         return True
     if not isinstance(exc, ClientError):
         return False
-    code = exc.response.get("Error", {}).get("Code", "")
-    if code in _TRANSIENT_CODES:
-        return True
-    return _is_iam_propagation(exc)
+    return error_code(exc) in _TRANSIENT_CODES or _is_iam_propagation(exc)
 
 
 def _attempts_for(exc: BaseException) -> int:
-    """How many attempts this class of failure is worth in total."""
+    """Total attempts allowed for this class of failure."""
     return _IAM_ATTEMPTS if _is_iam_propagation(exc) else _RETRY_ATTEMPTS
 
 
-#: One handler CRUD call, deferred until :meth:`AwsProvider._call` has resolved
-#: which handler owns the resource and which client it needs. Re-invoked per
-#: retry attempt, so it must stay side-effect-free up to the boto3 call itself.
-_Invoke = Callable[[AwsHandler[Any], Any], Any]
+#: One handler CRUD call, invoked by :meth:`AwsProvider._call` with the resolved
+#: handler and client. It runs once per retry attempt, so it must have no side
+#: effects before the boto3 call.
+type _Invoke = Callable[[AwsHandler[Any], Any], Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,14 +151,13 @@ class AwsProvider(Provider):
         self.region = region
         self.endpoint_url = endpoint_url
         self._aliases = dict(aliases or {})
-        # Sized here rather than per client: every client this provider makes
-        # serves the same apply, so they share one concurrency budget.
+        # One config for every client: they serve the same apply and share one
+        # concurrency budget.
         self._config = boto_config(parallelism=parallelism)
         self._profile = profile
-        # One Session per alias (``None`` is the default profile/chain), so
-        # alternate accounts resolve their own credentials, not the environment's.
-        # Built on demand, including the default one: every command builds a
-        # provider registry, and a `plan` makes no AWS call at all.
+        # One Session per alias (``None`` is the default profile/chain), so each
+        # account resolves its own credentials. Sessions are built lazily: every
+        # command builds a provider registry, and ``plan`` makes no AWS calls.
         self._sessions: dict[str | None, Any] = {}
         self._clients: dict[tuple[str | None, str, str], Any] = {}
 
@@ -178,9 +172,8 @@ class AwsProvider(Provider):
                 raise ProviderError(
                     f"unknown provider_alias {alias!r} — declare it under [aws.aliases]"
                 )
-            # Imported here rather than at module scope: boto3 costs ~45ms to
-            # import, this plugin is loaded by every command through provider
-            # discovery, and nothing before the first AWS call needs it.
+            # Lazy import: boto3 takes ~45ms to import, and provider discovery
+            # loads this module for every command.
             import boto3
 
             session = boto3.Session(profile_name=profile)
@@ -194,7 +187,7 @@ class AwsProvider(Provider):
             session = self._session_for(alias)  # validates the alias name first
             endpoint = self._aliases[alias].endpoint_url if alias is not None else self.endpoint_url
             # boto3-stubs overloads client() per literal service name; the service
-            # is dynamic here, so go through an untyped factory.
+            # is dynamic here, so the call goes through an untyped reference.
             make_client: Any = session.client
             client = make_client(
                 service, region_name=region, endpoint_url=endpoint, config=self._config
@@ -217,15 +210,11 @@ class AwsProvider(Provider):
         return handler.identity_field if handler is not None else None
 
     async def _call(self, res: Resource, op: str, invoke: _Invoke) -> Any:
-        """Dispatch one CRUD op to its handler: guard, thread, retry.
+        """Dispatch one CRUD op to its handler under the error guard, in a thread, with retries.
 
-        The four operations differ only in which handler method they call and
-        what they pass it; the dispatch/guard/retry sandwich is the same. Each
-        caller supplies that difference as ``invoke`` rather than as the method's
-        name, so the call it makes is the ordinary typed one
-        :class:`AwsHandler` declares — a wrong name or arity is a type error here
-        rather than an ``AttributeError`` at apply time. ``op`` remains a string
-        because what it labels is a *message*: the failure this is reported as.
+        ``invoke`` is a typed call on :class:`AwsHandler`, so a wrong method name or
+        arity is a type error rather than a runtime ``AttributeError``. ``op`` only
+        labels error messages.
         """
         handler, client = self._dispatch(res, op)
         with provider_guard("aws", op, res):
@@ -260,15 +249,11 @@ class AwsProvider(Provider):
 async def _retrying(fn: Callable[..., Any], *args: Any) -> Any:
     """Run a blocking boto3 call in a thread, retrying transient failures.
 
-    Backoff is *fully jittered* — a uniform draw from ``[0, capped_delay]`` rather
-    than the delay itself. Without it, N nodes throttled at the same instant all
-    sleep the same amount and retry in lockstep, which is precisely the burst that
-    caused the throttling; the herd never disperses. Randomness here is in the
-    effect layer and does not touch the determinism guarantees, which are about
-    config evaluation.
-
-    A whole-run budget bounds the total, so a call whose every attempt is slow
-    cannot quietly outlast the node timeout that is supposed to contain it.
+    Backoff is fully jittered (a uniform draw from ``[0, capped_delay]``) so nodes
+    throttled together do not retry in lockstep. The randomness is confined to the
+    effect layer; the determinism guarantees cover config evaluation only.
+    :data:`_RETRY_BUDGET` stops scheduling retries once a backoff would end past
+    it; it does not cut short an attempt in progress.
     """
     deadline = time.monotonic() + _RETRY_BUDGET
     attempt = 0
@@ -280,12 +265,9 @@ async def _retrying(fn: Callable[..., Any], *args: Any) -> Any:
             if not _is_transient(exc) or attempt >= _attempts_for(exc):
                 raise
             capped = min(_RETRY_BASE_DELAY * 2 ** (attempt - 1), _RETRY_MAX_DELAY)
-            # IAM propagation needs wall-clock time, not dispersal: a fully
-            # jittered draw can land near zero on every attempt and spend the
-            # whole retry budget inside 100ms for a condition that takes seconds.
-            # Equal jitter keeps half of each delay as a floor (several seconds
-            # guaranteed across _IAM_ATTEMPTS) while still spreading the herd.
-            low = capped / 2 if _is_iam_propagation(exc) else 0.0
+            # IAM propagation needs elapsed time: full jitter can draw near-zero
+            # delays on every attempt, so its draws are floored.
+            low = capped * _IAM_DELAY_FLOOR if _is_iam_propagation(exc) else 0.0
             delay = random.uniform(low, capped)
             if time.monotonic() + delay >= deadline:
                 raise

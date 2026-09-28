@@ -18,8 +18,7 @@ from typing import Any
 from returns.result import Failure, Result
 
 from atlantide.core.errors import LockError
-from atlantide.state import MemoryStateBackend
-from atlantide.state.backend import Lease, StateBackend, StateGraph, StateNode
+from atlantide.state import Lease, MemoryStateBackend, StateBackend, StateGraph, StateNode
 
 
 @dataclass
@@ -35,8 +34,7 @@ class SpyBackend(StateBackend):
 
     ``fail_lock_after`` is the lease-loss lever: the first N ``acquire_lock`` /
     ``renew_lock`` calls succeed and every one after that returns a ``Failure``,
-    which is exactly what a run whose hold lapsed and was taken by someone else
-    observes.
+    which is what a run whose hold lapsed and was taken by someone else observes.
     """
 
     def __init__(
@@ -58,7 +56,7 @@ class SpyBackend(StateBackend):
         self.calls.append(Call(method, detail))
 
     def names(self) -> list[str]:
-        """Just the method names, in order."""
+        """The method names, in order."""
         return [call.method for call in self.calls]
 
     def count(self, method: str) -> int:

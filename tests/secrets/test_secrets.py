@@ -107,13 +107,13 @@ def test_concurrent_writers_lose_no_secrets(tmp_path: object) -> None:
 
 def test_env_provider_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DB_PASSWORD", "s3cr3t")
-    assert EnvSecretsProvider().resolve("DB_PASSWORD") == "s3cr3t"
+    assert EnvSecretsProvider(allow=["DB_PASSWORD"]).resolve("DB_PASSWORD") == "s3cr3t"
 
 
 def test_env_provider_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("NOPE", raising=False)
     with pytest.raises(SecretsError):
-        EnvSecretsProvider().resolve("NOPE")
+        EnvSecretsProvider(allow=["*"]).resolve("NOPE")
 
 
 # -- registry routing --------------------------------------------------------
@@ -127,7 +127,7 @@ def test_registry_resolves_via_default_and_named(
     store.set("app/key", "from-store")
     reg = SecretsRegistry()
     reg.register(store, default=True)
-    reg.register(EnvSecretsProvider())
+    reg.register(EnvSecretsProvider(allow=["API_*"]))
 
     assert reg.resolve(SecretRef("app/key")) == "from-store"  # default (keyfile)
     assert reg.resolve(SecretRef("API_KEY", provider="env")) == "from-env"  # routed by provider
@@ -165,7 +165,7 @@ def test_secret_ref_marker_roundtrip() -> None:
 
 
 def test_check_reports_an_empty_project_as_fine(tmp_path: object) -> None:
-    """No store yet is not a failure — a project may simply have no secrets."""
+    """No store yet is not a failure: a project may have no secrets."""
     result = _store(tmp_path).check()
     assert result.status == "ok"
     assert "no store yet" in result.detail
@@ -181,10 +181,10 @@ def test_check_counts_stored_secrets(tmp_path: object) -> None:
 
 
 def test_check_catches_a_store_written_under_another_key(tmp_path: object) -> None:
-    """The failure this exists for: a keyfile not shared, or regenerated after loss.
+    """Catches a keyfile that was not shared, or was regenerated after loss.
 
-    Resolution only happens mid-apply, where the symptom is every secret being
-    unreadable and nothing naming the cause.
+    Otherwise resolution fails only mid-apply, with every secret unreadable and
+    nothing naming the cause.
     """
     base = str(tmp_path)  # type: ignore[arg-type]
     original = _store(tmp_path, "shared")
@@ -205,12 +205,18 @@ def test_check_reports_a_corrupt_store(tmp_path: object) -> None:
 
 
 def test_env_provider_reports_itself_usable() -> None:
-    assert EnvSecretsProvider().check().status == "ok"
+    assert EnvSecretsProvider(allow=["APP_*"]).check().status == "ok"
+
+
+def test_env_provider_with_nothing_allowed_warns() -> None:
+    result = EnvSecretsProvider().check()
+    assert result.status == "warn"
+    assert "[secrets.env] allow" in result.detail
 
 
 def test_a_provider_without_a_name_is_rejected_at_registration() -> None:
     """``name`` is a ClassVar the ABC declares but cannot enforce, so registration
-    is where a provider that never set one has to be caught — and named."""
+    catches a provider that never set one, and names it."""
 
     class Nameless(SecretsProvider):
         def resolve(self, name: str) -> str:
@@ -221,7 +227,7 @@ def test_a_provider_without_a_name_is_rejected_at_registration() -> None:
 
 
 def test_a_provider_without_a_check_says_so() -> None:
-    """The ABC default must not claim a pass it did not earn."""
+    """The ABC default reports a skip, not a pass."""
 
     class Custom(SecretsProvider):
         name = "custom"

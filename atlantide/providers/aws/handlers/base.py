@@ -2,28 +2,25 @@
 
 One handler per resource type owns its boto3 service and its CRUD logic;
 ``AwsProvider`` dispatches over :data:`~atlantide.providers.aws.handlers.HANDLERS`.
-Handlers are synchronous (boto3 is sync) and run in a worker thread. ``client``
-is typed ``Any`` to avoid a dependency on per-service type stubs.
+Handlers are synchronous (boto3 is sync) and run in a worker thread; ``client``
+is typed :data:`Client`.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, Generic, TypeVar
+from typing import Any, ClassVar
 
 from atlantide.core import Resource
 
-R = TypeVar("R", bound=Resource)
-
-# Split by concern; re-exported here because every handler already imports
-# these names from base and the split should not ripple through them.
-from atlantide.providers.aws.handlers.faults import (  # noqa: E402
+# Re-exported so a handler imports the contract and its common helpers from one module.
+from atlantide.providers.aws.handlers.faults import (
     create_or_adopt,
     error_code,
     ignore_missing,
     is_missing,
 )
-from atlantide.providers.aws.handlers.tags import (  # noqa: E402
+from atlantide.providers.aws.handlers.tags import (
     stale_tag_keys,
     sync_tags,
     tag_list,
@@ -32,6 +29,7 @@ from atlantide.providers.aws.handlers.tags import (  # noqa: E402
 
 __all__ = [
     "AwsHandler",
+    "Client",
     "create_or_adopt",
     "error_code",
     "ignore_missing",
@@ -42,6 +40,10 @@ __all__ = [
     "tag_list",
     "tags_from_list",
 ]
+
+#: A boto3 service client. boto3 builds clients at runtime and only
+#: ``boto3-stubs[s3]`` is installed, so the alias is ``Any`` and names intent only.
+Client = Any
 
 
 def known_id(res: Resource, field: str) -> str | None:
@@ -56,7 +58,7 @@ def known_id(res: Resource, field: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-class AwsHandler(ABC, Generic[R]):
+class AwsHandler[R: Resource](ABC):
     """CRUD for one AWS resource type ``R`` over one boto3 service.
 
     Generic in ``R`` so each handler's methods receive its concrete resource
@@ -67,18 +69,14 @@ class AwsHandler(ABC, Generic[R]):
     service: ClassVar[str]
     resource_type: ClassVar[type[Resource]]
 
-    #: The computed field holding this resource's provider-assigned id, for the
-    #: types AWS locates by an opaque id rather than by a name — an ACM
-    #: certificate's ``arn``, a VPC's ``vpc_id``. ``None`` means ``read`` finds
-    #: the resource from its declared attributes and needs nothing restored.
+    #: The computed field holding the provider-assigned id, for types AWS locates
+    #: by an opaque id rather than a name (an ACM certificate's ``arn``, a VPC's
+    #: ``vpc_id``). ``None`` means ``read`` finds the resource from its declared
+    #: attributes and needs nothing restored.
     #:
-    #: Declared rather than derived because it is an *input* to ``read``: nothing
-    #: about a call tells you that ACM keys on an arn and EC2 on a vpc id. (The
-    #: opposite case — which fields a read *observed* — is derivable from its
-    #: return value, and :mod:`atlantide.reconcile.refresh` deliberately derives
-    #: it rather than declaring it.) The names here were already written down as
-    #: ``known_id(res, "arn")`` literals; this collects them in one place, and
-    #: ``tests/providers/test_identity_fields.py`` holds them to the handler.
+    #: Declared rather than derived because it is an *input* to ``read``. Handlers
+    #: pass it to ``known_id`` instead of a literal field name;
+    #: ``tests/providers/aws/test_identity_fields.py`` checks that.
     identity_field: ClassVar[str | None] = None
 
     def region(self, res: R) -> str | None:
@@ -90,13 +88,13 @@ class AwsHandler(ABC, Generic[R]):
         return getattr(res, "provider_alias", None)
 
     @abstractmethod
-    def create(self, client: Any, res: R) -> dict[str, Any]: ...
+    def create(self, client: Client, res: R) -> dict[str, Any]: ...
 
     @abstractmethod
-    def read(self, client: Any, res: R) -> dict[str, Any] | None: ...
+    def read(self, client: Client, res: R) -> dict[str, Any] | None: ...
 
     @abstractmethod
-    def update(self, client: Any, prior: dict[str, Any], res: R) -> dict[str, Any]: ...
+    def update(self, client: Client, prior: dict[str, Any], res: R) -> dict[str, Any]: ...
 
     @abstractmethod
-    def delete(self, client: Any, res: R) -> None: ...
+    def delete(self, client: Client, res: R) -> None: ...

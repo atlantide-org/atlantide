@@ -9,12 +9,13 @@ validation record whose name/type/value are surfaced as computed outputs.
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+import time
+from typing import Any, override
 
-from typing_extensions import override
-
+from atlantide.core.errors import ProviderError
 from atlantide.providers.aws.handlers.base import (
     AwsHandler,
+    Client,
     ignore_missing,
     known_id,
     sync_tags,
@@ -25,6 +26,11 @@ from atlantide.providers.aws.handlers.faults import absent_ok, not_found
 from atlantide.providers.aws.region import Region
 from atlantide.providers.aws.resources import AcmCertificate
 
+#: Bounded poll for ACM to emit the DNS validation record after a request; it
+#: usually appears within a few seconds.
+_RECORD_POLL_ATTEMPTS = 30
+_RECORD_POLL_DELAY = 2.0
+
 
 class AcmCertificateHandler(AwsHandler[AcmCertificate]):
     service = "acm"
@@ -33,28 +39,29 @@ class AcmCertificateHandler(AwsHandler[AcmCertificate]):
 
     @override
     def region(self, res: AcmCertificate) -> str:
-        return Region.UsEast1  # CloudFront viewer certificates must live in us-east-1
+        return Region.UsEast1
 
     @override
-    def create(self, client: Any, res: AcmCertificate) -> dict[str, Any]:
-        # A certificate has no name to look it up by, so a retried create cannot
-        # adopt the way the other handlers do; ACM's idempotency token returns the
-        # same certificate instead. The provider's `_retrying` reissues this call
-        # on transient failures.
+    def create(self, client: Client, res: AcmCertificate) -> dict[str, Any]:
+        # A certificate has no name to look up, so a retried create cannot adopt;
+        # ACM's idempotency token returns the same certificate instead. The
+        # provider's `_retrying` reissues this call on transient failures.
         request: dict[str, Any] = {
             "DomainName": res.domain_name,
             "ValidationMethod": res.validation_method,
-            "IdempotencyToken": _idempotency_token(res.node_id),
+            "IdempotencyToken": _idempotency_token(res),
         }
         if res.subject_alternative_names:
             request["SubjectAlternativeNames"] = res.subject_alternative_names
         if res.tags:
             request["Tags"] = tag_list(res.tags)
         arn = client.request_certificate(**request)["CertificateArn"]
+        if res.validation_method == "DNS":
+            return {"arn": arn, **_await_validation_record(client, arn, res)}
         return {"arn": arn, **_validation_record(client, arn, res.domain_name)}
 
     @override
-    def read(self, client: Any, res: AcmCertificate) -> dict[str, Any] | None:
+    def read(self, client: Client, res: AcmCertificate) -> dict[str, Any] | None:
         arn = known_id(res, self.identity_field)
         if arn is None:
             return None
@@ -63,12 +70,12 @@ class AcmCertificateHandler(AwsHandler[AcmCertificate]):
         return {"arn": arn, **_validation_record(client, arn, res.domain_name)}
 
     @override
-    def update(self, client: Any, prior: dict[str, Any], res: AcmCertificate) -> dict[str, Any]:
+    def update(self, client: Client, prior: dict[str, Any], res: AcmCertificate) -> dict[str, Any]:
         arn = prior.get(self.identity_field) or known_id(res, self.identity_field)
         if arn is None:  # update only runs on an existing (already-requested) cert
             raise not_found(res, "update")
-        # ACM removes tags by whole object rather than by key, which is why the
-        # untag callback is handed the live tags alongside the stale keys.
+        # ACM removes tags by key and value, so the untag callback builds the tag
+        # objects from the live tags.
         sync_tags(
             res.tags,
             live=lambda: tags_from_list(
@@ -84,7 +91,7 @@ class AcmCertificateHandler(AwsHandler[AcmCertificate]):
         return {"arn": arn, **_validation_record(client, arn, res.domain_name)}
 
     @override
-    def delete(self, client: Any, res: AcmCertificate) -> None:
+    def delete(self, client: Client, res: AcmCertificate) -> None:
         arn = known_id(res, self.identity_field)
         if arn is None:
             return
@@ -92,20 +99,53 @@ class AcmCertificateHandler(AwsHandler[AcmCertificate]):
             client.delete_certificate(CertificateArn=arn)
 
 
-def _idempotency_token(node_id: str) -> str:
-    """A stable ACM idempotency token for one node.
+def _idempotency_token(res: AcmCertificate) -> str:
+    """A stable ACM idempotency token for one node and its immutable request.
 
-    ACM allows 1-32 alphanumeric characters, so the node id — which carries colons
-    and dots and is often longer — is hashed rather than passed through.
+    ACM returns the earlier certificate for a repeated token within an hour, so the
+    token covers every field that forces a replacement: a replaced certificate with
+    a new domain must not get the old one back. ACM allows 1-32 alphanumeric
+    characters; the node id contains colons and dots and can be longer, so it is
+    hashed.
     """
-    return hashlib.sha256(node_id.encode("utf-8")).hexdigest()[:32]
+    key = "\n".join(
+        [
+            res.node_id,
+            res.domain_name,
+            ",".join(sorted(res.subject_alternative_names)),
+            res.validation_method,
+        ]
+    )
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
 
 
-def _validation_record(client: Any, arn: str, domain: str) -> dict[str, str]:
+def _await_validation_record(client: Client, arn: str, res: AcmCertificate) -> dict[str, str]:
+    """The DNS validation record, polling until ACM emits it.
+
+    ACM fills ``ResourceRecord`` a few seconds after the request; stored blank,
+    the ``validation_*`` outputs would give a dependent ``Route53Record`` nothing
+    to create.
+    """
+    for attempt in range(_RECORD_POLL_ATTEMPTS):
+        record = _validation_record(client, arn, res.domain_name)
+        if record["validation_name"]:
+            return record
+        if attempt + 1 < _RECORD_POLL_ATTEMPTS:
+            time.sleep(_RECORD_POLL_DELAY)
+    raise ProviderError(
+        f"ACM did not emit the DNS validation record for {arn} after "
+        f"{_RECORD_POLL_ATTEMPTS * _RECORD_POLL_DELAY:.0f}s",
+        op="create",
+        resource_type=res.type_name(),
+    )
+
+
+def _validation_record(client: Client, arn: str, domain: str) -> dict[str, str]:
     """The DNS validation record ACM wants created, or blanks if not yet emitted.
 
-    Real ACM populates ``ResourceRecord`` a moment after the request; a caller that
-    needs it re-reads. Match the option by domain — order is not guaranteed.
+    ACM populates ``ResourceRecord`` shortly after the request; a caller that needs
+    it re-reads. Options are matched by domain because their order is not
+    guaranteed.
     """
     options = client.describe_certificate(CertificateArn=arn)["Certificate"].get(
         "DomainValidationOptions", []

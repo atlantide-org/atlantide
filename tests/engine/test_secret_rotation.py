@@ -32,7 +32,7 @@ class Locked(Resource):
 
 def _engine(key_path: Path, *classes: type[Resource]) -> Engine:
     secrets = SecretsRegistry(material=KeyMaterial(str(key_path)))
-    secrets.register(EnvSecretsProvider(), default=True)
+    secrets.register(EnvSecretsProvider(allow=["S*"]), default=True)
     return engine_for(
         *classes, provider=FakeProvider(), backend=MemoryStateBackend(), secrets=secrets
     )

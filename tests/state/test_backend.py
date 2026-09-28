@@ -23,6 +23,20 @@ def test_put_load_roundtrip(make_backend: BackendFactory) -> None:
     assert loaded.get("a") == written
 
 
+def test_the_ref_digest_record_round_trips(make_backend: BackendFactory) -> None:
+    """Every backend stores what a node's refs resolved to at apply, and a row
+    without it reads back with an empty record ("unknown"), not an error."""
+    backend = make_backend()
+    recorded = {"target_arn": "sha256:" + "ab" * 32, "token": "salted:" + "cd" * 32}
+    backend.put(node("a", properties={"target_arn": {"$ref": "x#out"}}, ref_digests=recorded))
+    backend.put(node("b"))
+    loaded = backend.load()
+    assert loaded.get("a").ref_digests == recorded
+    assert loaded.get("b").ref_digests == {}
+    backend.put(node("a", ref_digests={}))
+    assert backend.load().get("a").ref_digests == {}
+
+
 def test_upsert_overwrites(make_backend: BackendFactory) -> None:
     backend = make_backend()
     backend.put(node("a", input_hash="h1"))
@@ -44,9 +58,9 @@ def test_delete(make_backend: BackendFactory) -> None:
 def test_serial_bumps_on_mutation(make_backend: BackendFactory) -> None:
     """The serial advances when stored state changes, and never goes backwards.
 
-    Deliberately an inequality: a backend may skip a write whose node is already
-    stored verbatim (the s3 one does, since every write there rewrites the whole
-    document), and skipping a write that changes nothing is not a mutation.
+    Asserted as an inequality: a backend may skip a write whose node is already
+    stored verbatim (s3 does, since every write there rewrites the whole document),
+    and a skipped no-op write is not a mutation.
     """
     backend = make_backend()
     assert backend.serial() == 0
@@ -156,6 +170,23 @@ def test_locks_are_visible_and_breakable(make_backend: BackendFactory) -> None:
     assert not is_successful(backend.acquire_lock("bob", 30, {"b"}))
 
 
+def test_locks_report_the_fence_each_hold_was_taken_at(make_backend: BackendFactory) -> None:
+    """`state unlock` shows, and the fence check compares, the epoch a hold was
+    taken at. A backend reporting `0` (which `Lease` reads as unfenced) for a
+    minted hold hides which of two runs is current."""
+    backend = make_backend()
+    first = backend.acquire_lock("alice", 30, {"a", "b"}).unwrap()
+    second = backend.acquire_lock("bob", 30, {"c"}).unwrap()
+    assert second.fence > first.fence > 0
+
+    fences = {node_id: lease.fence for node_id, lease in backend.locks().items()}
+    assert fences == {"a": first.fence, "b": first.fence, "c": second.fence}
+
+    again = backend.acquire_lock("alice", 30, {"a"}).unwrap()
+    assert again.fence > second.fence
+    assert backend.locks()["a"].fence == again.fence, "a re-acquire restamps the hold"
+
+
 def test_force_unlock_of_an_unheld_node_is_a_no_op(make_backend: BackendFactory) -> None:
     backend = make_backend()
     assert backend.force_unlock({"nope"}) == 0
@@ -164,9 +195,9 @@ def test_force_unlock_of_an_unheld_node_is_a_no_op(make_backend: BackendFactory)
 # -- write fencing ------------------------------------------------------------
 #
 # The authoritative half of the concurrency guarantee. `LeaseGuard` is a local
-# clock check and can be wrong; these assert that the *store* refuses a write
-# from a run that no longer holds the lock, which is what stands between two
-# concurrent applies and a silently merged state.
+# clock check and can be wrong; these tests assert that the store refuses a write
+# from a run that no longer holds the lock, so two concurrent applies cannot
+# silently merge state.
 
 
 def test_an_unbound_backend_writes_freely(make_backend: BackendFactory) -> None:
@@ -199,8 +230,7 @@ def test_a_write_is_refused_once_the_lock_has_been_taken_away(
 def test_a_write_is_refused_after_the_lease_expires_and_is_reclaimed(
     make_backend: BackendFactory,
 ) -> None:
-    """Expiry alone is not enough — the hold has to actually change hands, which
-    is what makes the write unsafe rather than merely late."""
+    """Expiry alone does not make a write unsafe; the hold must change hands."""
     clock = FakeClock()
     backend = make_backend(clock=clock)
     lease = backend.acquire_lock("run-a", 60.0, {"a"}).unwrap()
@@ -216,8 +246,8 @@ def test_a_write_is_refused_after_the_lease_expires_and_is_reclaimed(
 def test_a_write_outside_the_lease_scope_is_refused(
     make_backend: BackendFactory,
 ) -> None:
-    """Not a race but a bug — and one whose symptom is a node written with
-    nothing protecting it, which is exactly what the lock was for."""
+    """Not a race but a bug: the node would be written without the lock's
+    protection."""
     backend = make_backend()
     backend.bind_lease(backend.acquire_lock("run-a", 300.0, {"a"}).unwrap())
 
@@ -252,8 +282,7 @@ def test_unbinding_restores_unfenced_writes(make_backend: BackendFactory) -> Non
 
 
 def test_every_delete_is_fenced_too(make_backend: BackendFactory) -> None:
-    """A delete is a write. Fencing only the upserts would leave the destructive
-    half of the API unguarded."""
+    """A delete is a write; fencing only upserts would leave deletes unguarded."""
     backend = make_backend()
     backend.put(node("a"))
     backend.bind_lease(backend.acquire_lock("run-a", 300.0, {"a"}).unwrap())

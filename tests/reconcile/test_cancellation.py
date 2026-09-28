@@ -1,14 +1,14 @@
 """Interrupting an apply runs the saga instead of walking away from it.
 
 `asyncio.CancelledError` is a `BaseException`, so an `except Exception` around the
-scheduler silently skips the compensation in the one case an operator most expects
-it: Ctrl-C part-way through an apply that has already created resources. These
-tests pin the consequence — what was created gets undone — rather than the clause.
+scheduler would skip compensation on Ctrl-C part-way through an apply that has
+already created resources. These tests pin the outcome (what was created is
+undone) rather than the except clause.
 
-The interrupt is delivered the way a real one is: by cancelling the task that is
-*awaiting* the apply. Raising `CancelledError` inside a provider call would not do
-it — `TaskGroup` reads that as the child being cancelled rather than as a failure,
-so it never reaches the handler under test.
+The interrupt is delivered as a real one is: by cancelling the task *awaiting*
+the apply. Raising `CancelledError` inside a provider call would not work, since
+`TaskGroup` reads it as the child being cancelled rather than as a failure, so it
+never reaches the handler under test.
 """
 
 from __future__ import annotations
@@ -20,8 +20,7 @@ import pytest
 
 from atlantide.cli.errors import flatten_group
 from atlantide.core.errors import LeaseLostError, ProviderError
-from atlantide.state import MemoryStateBackend
-from atlantide.state.backend import LeaseGuard
+from atlantide.state import LeaseGuard, MemoryStateBackend
 from tests.support import FakeProvider
 
 from .conftest import Harness
@@ -35,8 +34,8 @@ SOURCE = "a = Box('a', size=1)\nBox('b', size=2, ref=a.out)\n"
 class BlocksOnB(FakeProvider):
     """Creates `a` normally, then parks on `b` until the run is cancelled.
 
-    By the time `b` is reached, `a` exists at the provider and in state — so `a`
-    is what the saga has to compensate.
+    By the time `b` is reached, `a` exists at the provider and in state, so the
+    saga must compensate `a`.
     """
 
     def __init__(self, **kw: Any) -> None:
@@ -57,14 +56,13 @@ async def _interrupt(h: Harness, on_failure: str = "rollback", **kw: Any) -> Bas
     task = asyncio.ensure_future(h.apply_async(SOURCE, on_failure, **kw))
     await asyncio.wait_for(provider.reached_b.wait(), timeout=5)
     task.cancel()
-    with pytest.raises(BaseException) as caught:
+    with pytest.raises(asyncio.CancelledError) as caught:
         await task
     return caught.value
 
 
 async def test_an_interrupt_still_compensates_what_was_already_created() -> None:
-    """The whole point. Before this, Ctrl-C left every created resource in place
-    while reporting nothing about them."""
+    """Guards against Ctrl-C leaving every created resource in place, unreported."""
     h = Harness(MemoryStateBackend(), provider=BlocksOnB())
 
     await _interrupt(h)
@@ -74,8 +72,8 @@ async def test_an_interrupt_still_compensates_what_was_already_created() -> None
 
 
 async def test_a_cancellation_is_never_reported_as_a_provider_failure() -> None:
-    """Wrapping it in a `ProviderError` would stop the unwind and invent a fault
-    that never happened."""
+    """Wrapping it in a `ProviderError` would stop the unwind and report a fault
+    that did not occur."""
     h = Harness(MemoryStateBackend(), provider=BlocksOnB())
 
     error = await _interrupt(h, on_failure="halt")
@@ -86,8 +84,8 @@ async def test_a_cancellation_is_never_reported_as_a_provider_failure() -> None:
 
 
 async def test_halt_leaves_an_interrupted_apply_alone() -> None:
-    """`--on-failure halt` means what it says for an interrupt too: state keeps
-    the completed node, so the next run resumes rather than rebuilds."""
+    """`--on-failure halt` applies to an interrupt too: state keeps the completed
+    node, so the next run resumes rather than rebuilds."""
     h = Harness(MemoryStateBackend(), provider=BlocksOnB())
 
     await _interrupt(h, on_failure="halt")
@@ -100,8 +98,7 @@ async def test_a_lost_lease_skips_the_saga_and_says_so() -> None:
     """A run that no longer holds the lock must not compensate: another run may
     now own these resources, and undoing "its" creates could destroy theirs.
 
-    Leaving them is the lesser harm — but silently leaving them is not, so the
-    reason has to reach the report.
+    The resources are left in place, and the reason must reach the report.
     """
     h = Harness(MemoryStateBackend(), provider=BlocksOnB())
     provider = h.fake()
@@ -112,7 +109,7 @@ async def test_a_lost_lease_skips_the_saga_and_says_so() -> None:
     # The renewal task fails mid-run and cancels the apply — in that order.
     h.lease.fail(LeaseLostError("another run took the lock"))
     task.cancel()
-    with pytest.raises(BaseException):  # noqa: B017
+    with pytest.raises(asyncio.CancelledError):
         await task
 
     assert A in h.backend.load().nodes, "left in place rather than destroyed blind"
@@ -120,7 +117,7 @@ async def test_a_lost_lease_skips_the_saga_and_says_so() -> None:
 
 
 async def test_a_run_that_kept_its_lease_still_rolls_back() -> None:
-    """The counterpart, so the skip cannot quietly become unconditional."""
+    """Counterpart: the lost-lease skip does not apply while the lease is held."""
     h = Harness(MemoryStateBackend(), provider=BlocksOnB())
     assert h.lease.lost is None
 
@@ -130,8 +127,8 @@ async def test_a_run_that_kept_its_lease_still_rolls_back() -> None:
 
 
 async def test_the_progress_display_is_told_when_a_node_is_cancelled() -> None:
-    """A node cancelled mid-CRUD would otherwise spin forever in the TUI: its
-    `start` was never matched by a `finish` or a `fail`."""
+    """Otherwise a node cancelled mid-CRUD spins indefinitely in the TUI, its
+    `start` never matched by a `finish` or a `fail`."""
     phases: list[tuple[str, str]] = []
     h = Harness(MemoryStateBackend(), provider=BlocksOnB())
 
@@ -145,9 +142,9 @@ async def test_the_progress_display_is_told_when_a_node_is_cancelled() -> None:
 
 
 async def test_a_second_interrupt_does_not_abandon_the_saga_half_done() -> None:
-    """The shield. A compensation cancelled between its provider call and its
-    state write is the exact window that leaves state lying, so the saga finishes
-    even while the caller is being cancelled again.
+    """The saga is shielded: a compensation cancelled between its provider call
+    and its state write would leave state wrong, so the saga finishes even when
+    the caller is cancelled again.
     """
     h = Harness(MemoryStateBackend(), provider=BlocksOnB())
     provider = h.fake()
@@ -157,8 +154,8 @@ async def test_a_second_interrupt_does_not_abandon_the_saga_half_done() -> None:
     await asyncio.wait_for(provider.reached_b.wait(), timeout=5)
     task.cancel()
     await asyncio.sleep(0)  # let the saga start
-    task.cancel()  # ...and interrupt it again
-    with pytest.raises(BaseException):  # noqa: B017
+    task.cancel()  # interrupt it again
+    with pytest.raises(asyncio.CancelledError):
         await task
 
     assert A not in h.backend.load().nodes, "the compensation still completed"

@@ -9,12 +9,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from typing import Any, Self
 
 from atlantide.core import PolicyLevel, Resource
 from atlantide.core.actions import Action
-
-T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,7 +30,7 @@ class PolicyContext:
     resource: Resource | None  # desired resource; None for a pure DELETE
     params: Mapping[str, Any] = field(default_factory=dict)
 
-    def param(self, name: str, default: T) -> Any:
+    def param[T](self, name: str, default: T) -> Any:
         """This binding's ``name`` argument, or ``default`` when unset."""
         return self.params.get(name, default)
 
@@ -43,11 +41,11 @@ class PolicyResult:
     message: str = ""
 
     @classmethod
-    def ok(cls) -> PolicyResult:
+    def ok(cls) -> Self:
         return cls(passed=True)
 
     @classmethod
-    def fail(cls, message: str) -> PolicyResult:
+    def fail(cls, message: str) -> Self:
         return cls(passed=False, message=message)
 
 
@@ -60,11 +58,11 @@ class Violation:
 
 
 #: A policy check: pure function of the context.
-PolicyFn = Callable[[PolicyContext], PolicyResult]
+type PolicyFn = Callable[[PolicyContext], PolicyResult]
 
 
 class PolicyProvider(ABC):
-    """Evaluates named policies. Deterministic (runs at plan time)."""
+    """Evaluates named policies. Must be deterministic: policies run at plan time."""
 
     @abstractmethod
     def has(self, name: str) -> bool:

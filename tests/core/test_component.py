@@ -73,6 +73,6 @@ def test_super_init_pushes_the_prefix_once() -> None:
 def test_prefix_is_restored_after_component() -> None:
     with collecting() as reg, Stack("prod", region="eu-north-1"):
         Pair("web", size=1)
-        top = _Thing("standalone", size=9)  # created after the component
+        top = _Thing("standalone", size=9)
     assert top.node_id == "prod:test._Thing:standalone"  # unprefixed
     assert len(reg.all()) == 3

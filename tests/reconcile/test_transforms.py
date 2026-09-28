@@ -7,16 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from atlantide.engine import Engine
-from atlantide.providers import local
-from atlantide.providers.local import LocalProvider
 from atlantide.reconcile import Action
 from atlantide.reconcile.resolve import resolve_value
-from tests.conftest import make_engine
-
-
-def _engine() -> Engine:
-    return make_engine(local.TYPES, LocalProvider())
+from tests.support import local_engine
 
 
 def _config(tmp: Path, expr: str) -> str:
@@ -28,7 +21,7 @@ def _config(tmp: Path, expr: str) -> str:
 
 
 async def test_concat_over_ref_resolves_at_apply(tmp_path: Path) -> None:
-    engine = _engine()
+    engine = local_engine()
     cfg = _config(tmp_path, "concat(a.checksum, '!')")
 
     # The transform wires a real dependency edge a -> b.
@@ -47,13 +40,13 @@ async def test_concat_over_ref_resolves_at_apply(tmp_path: Path) -> None:
 
 
 async def test_interpolate_and_join(tmp_path: Path) -> None:
-    engine = _engine()
+    engine = local_engine()
     cfg = _config(tmp_path, "interpolate('[{}]', a.checksum)")
     (await engine.apply(cfg)).unwrap()
     checksum = hashlib.sha256(b"alpha").hexdigest()
     assert (tmp_path / "b.txt").read_text() == f"[{checksum}]"
 
-    engine2 = _engine()
+    engine2 = local_engine()
     cfg2 = _config(tmp_path, "join('/', ['x', a.checksum, 'y'])")
     (await engine2.apply(cfg2)).unwrap()
     assert (tmp_path / "b.txt").read_text() == f"x/{checksum}/y"
@@ -67,7 +60,7 @@ def test_unknown_transform_op_raises() -> None:
 
 
 def test_transform_ir_is_deterministic(tmp_path: Path) -> None:
-    engine = _engine()
+    engine = local_engine()
     cfg = _config(tmp_path, "concat(a.checksum, '/', 'x')")
     h1 = engine.compile(cfg).unwrap().hashes
     h2 = engine.compile(cfg).unwrap().hashes

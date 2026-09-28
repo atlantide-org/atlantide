@@ -1,10 +1,10 @@
 """The approved plan is the applied plan, or the apply refuses.
 
-An apply re-diffs once it holds the lock — it must, or a resource another run
+An apply re-diffs once it holds the lock; otherwise a resource another run
 created in the meantime would still be planned as a CREATE and get built twice.
-That re-diff is correct and is defended by ``test_concurrency``. What it also
-means is that the changeset a human read and the changeset that executes can
-differ, and nothing used to say so.
+That re-diff is defended by ``test_concurrency``. It also means the changeset a
+human read and the changeset that executes can differ, which the apply must
+report.
 """
 
 from __future__ import annotations
@@ -13,8 +13,7 @@ import pytest
 from returns.result import Success
 
 from atlantide.core.errors import PlanDriftError
-from atlantide.reconcile import Action, ChangeSet
-from atlantide.reconcile.diff import Change
+from atlantide.reconcile import Action, Change, ChangeSet
 from atlantide.state import MemoryStateBackend
 from tests.support import Box, engine_for, globals_of, state_node
 
@@ -79,9 +78,8 @@ def test_the_fingerprint_distinguishes_what_a_reviewer_would_care_about() -> Non
 
 
 async def test_an_apply_refuses_a_changeset_that_is_no_longer_the_approved_one() -> None:
-    """The scenario: a plan is shown and approved, another run creates one of its
-    nodes, and the re-diff drops that CREATE. Applying anyway would be applying
-    something nobody read."""
+    """A plan is shown and approved, another run creates one of its nodes, and the
+    re-diff drops that CREATE. Applying anyway would apply something nobody read."""
     backend = MemoryStateBackend()
     engine = engine_for(Box, backend=backend)
 
@@ -114,8 +112,8 @@ async def test_an_unchanged_plan_applies_normally() -> None:
 
 
 async def test_without_expect_the_re_diff_still_wins() -> None:
-    """The opt-out (`--allow-plan-drift`) keeps the old behaviour: re-diff and
-    apply whatever is now correct."""
+    """The opt-out (`--allow-plan-drift`) re-diffs and applies whatever is now
+    correct."""
     backend = MemoryStateBackend()
     engine = engine_for(Box, backend=backend)
     engine.plan(TWO, extra_globals=GLOBALS).unwrap()
@@ -128,7 +126,7 @@ async def test_without_expect_the_re_diff_still_wins() -> None:
 
 async def test_a_node_appearing_in_the_fresh_plan_is_reported_too() -> None:
     """Drift in the other direction: something the approved plan did *not*
-    include now needs doing. Applying it silently is the destroy-nobody-saw case.
+    include now needs doing. Applying it silently would run a destroy nobody saw.
     """
     backend = MemoryStateBackend()
     engine = engine_for(Box, backend=backend)

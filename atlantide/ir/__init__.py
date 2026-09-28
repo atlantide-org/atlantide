@@ -1,4 +1,4 @@
-"""atlantide.ir: the Atlas IR — canonical, hashable, language-independent config."""
+"""atlantide.ir: the Atlas IR, a canonical, hashable, language-independent config form."""
 
 from atlantide.ir.artifact import Artifact, build_artifact, loads, verify_hash
 from atlantide.ir.canonical import to_canonical_json

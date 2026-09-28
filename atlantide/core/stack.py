@@ -12,8 +12,9 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
+from atlantide.core._describe import describe_type, describe_value
 from atlantide.core.config import EnvSchema
 from atlantide.core.errors import LanguageError, RegistryError
 from atlantide.core.node_id import require_identifier
@@ -54,9 +55,9 @@ def current_stack_name_prefix() -> str | None:
 def current_config() -> EnvSchema | None:
     """The innermost active stack's environment config, or ``None``.
 
-    Ambient for the same reason ``region`` and ``tags`` are: a
+    Ambient, like ``region`` and ``tags``, so a
     :class:`~atlantide.core.component.Component` reads it without every caller
-    threading it through a constructor.
+    passing it through a constructor.
     """
     return _active_config.get()
 
@@ -73,7 +74,7 @@ def _well_known(config: EnvSchema | None, key: str, expected: type) -> Any:
     if value is not None and not isinstance(value, expected):
         raise LanguageError(
             f"environment {config.name!r}: {key!r} must be {expected.__name__}, "
-            f"got {type(value).__name__} {value!r}"
+            f"got {describe_type(value)} {describe_value(value)}"
         )
     return value
 
@@ -82,10 +83,10 @@ def _well_known(config: EnvSchema | None, key: str, expected: type) -> Any:
 def region(name: str) -> Iterator[None]:
     """Override the active region for resources created in the body.
 
-    A lightweight sub-scope of :class:`Stack` (region only): resources with a
-    ``region`` field created inside inherit ``name`` unless they pass their own,
-    e.g. an ACM certificate / CloudFront-facing bucket in ``us-east-1`` within a
-    stack whose default region is elsewhere. Nests and restores on exit.
+    A region-only sub-scope of :class:`Stack`: resources with a ``region`` field
+    created inside inherit ``name`` unless they pass their own, e.g. an ACM
+    certificate in ``us-east-1`` within a stack whose default region is elsewhere.
+    Nests and restores on exit.
     """
     if not name:
         raise RegistryError("region() requires a non-empty region")
@@ -104,8 +105,8 @@ class Stack:
     stack's.
 
     ``region`` is **required**, from either the ``region=`` argument or a
-    ``config=`` environment that declares one — it is the default for every
-    resource in the body that has a ``region`` field and did not pass one
+    ``config=`` environment that declares one. It is the default for every
+    resource in the body that has a ``region`` field and does not pass one
     explicitly. ``name_prefix`` composes the cloud name of resources whose name
     field is marked ``physical_name`` into ``{name_prefix}-{base}-{stack}``,
     falling back to the enclosing stack's value when omitted (inner wins).
@@ -143,17 +144,14 @@ class Stack:
                 f"stack {name!r} requires a non-empty region — pass region=, or a "
                 f"config= whose environment declares one"
             )
-        # One token set per active `with`, and the entry stack itself lives in a
-        # ContextVar: tokens belong to an entry *in one context*. An instance-
-        # level list interleaves across asyncio tasks — task A's `__exit__`
-        # would pop task B's tokens and `reset()` them in the wrong context
-        # (ValueError), leaking A's own settings for the rest of its context.
+        # One token set per active `with`, held in a ContextVar because tokens belong
+        # to one context: an instance-level list interleaves across asyncio tasks, so
+        # one task's `__exit__` would `reset()` another task's tokens (ValueError).
         self._entries: ContextVar[tuple[tuple[tuple[ContextVar[Any], Any], ...], ...]] = ContextVar(
             f"atlantide_stack_entries_{name}_{id(self)}", default=()
         )
 
-    def __enter__(self) -> Stack:
-        # name_prefix left as None inherits the enclosing stack's value.
+    def __enter__(self) -> Self:
         region = self.region
         prefix = self.name_prefix if self.name_prefix is not None else current_stack_name_prefix()
         entry = (

@@ -1,10 +1,9 @@
 """``--target`` and ``--replace``: acting on part of a graph, and forcing a rebuild.
 
-These are the escape hatches for when one resource is wrong and the alternatives
-are editing the config and hoping, or destroying everything. The risk they carry
-is the mirror of their usefulness — a plan narrowed to nothing reads exactly like
-a plan with nothing to do — so most of what is asserted here is that the
-narrowing is *visible* and that it cannot corrupt a later full run.
+They fix one wrong resource without editing the config or destroying everything.
+A plan narrowed to nothing reads like a plan with nothing to do, so most of what
+is asserted here is that the narrowing is *visible* and that it cannot corrupt a
+later full run.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from atlantide.state import SqliteStateBackend
-from tests.support import Cli
+from tests.support import Cli, write_config
 
 cli = Cli()
 
@@ -25,14 +24,13 @@ C = "default:local.File:c"
 
 def _config(tmp_path: Path, content: str = "one") -> Path:
     """Three files; `b` depends on `a` by reading its checksum, `c` is independent."""
-    cfg = tmp_path / "config.py"
-    cfg.write_text(
+    return write_config(
+        tmp_path,
         "from atlantide.providers.local import File\n"
         f"a = File('a', path={str(tmp_path / 'a.txt')!r}, content={content!r})\n"
         f"b = File('b', path={str(tmp_path / 'b.txt')!r}, content=a.checksum)\n"
-        f"c = File('c', path={str(tmp_path / 'c.txt')!r}, content='independent')\n"
+        f"c = File('c', path={str(tmp_path / 'c.txt')!r}, content='independent')\n",
     )
-    return cfg
 
 
 def _applied(tmp_path: Path) -> tuple[Path, Path]:
@@ -73,8 +71,8 @@ def test_a_targeted_apply_leaves_untargeted_hashes_untouched(tmp_path: Path) -> 
 
 
 def test_a_full_run_after_a_targeted_one_still_sees_the_pending_work(tmp_path: Path) -> None:
-    """The consequence of the above, from the operator's side: work skipped by a
-    targeted apply must still be waiting afterwards, not silently marked done."""
+    """Work skipped by a targeted apply must still be pending afterwards, not
+    silently marked done."""
     _cfg, state = _applied(tmp_path)
     changed = _config(tmp_path, content="two")
     cli.ok("apply", changed, "--state", state, "-t", "local.File:c", "-y")
@@ -113,7 +111,7 @@ def test_targeting_a_dependency_does_not_pull_in_its_dependents(tmp_path: Path) 
 def test_a_destroy_closes_over_dependents_instead(tmp_path: Path) -> None:
     """The other direction: removing `a` means removing what still points at it.
     Closing over dependencies here would destroy what `a` is built from and leave
-    `a` dangling — the opposite of what was asked."""
+    `a` dangling."""
     _, state = _applied(tmp_path)
 
     cli.run("destroy", "--state", state, "-t", "local.File:a", "-y")
@@ -127,7 +125,7 @@ def test_a_destroy_closes_over_dependents_instead(tmp_path: Path) -> None:
 
 
 def test_a_targeted_plan_says_it_is_a_subset(tmp_path: Path) -> None:
-    """A plan narrowed to nothing reads exactly like a plan with nothing to do."""
+    """A plan narrowed to nothing reads like a plan with nothing to do."""
     _cfg, state = _applied(tmp_path)
     changed = _config(tmp_path, content="two")
 
@@ -155,7 +153,7 @@ def test_a_targeted_destroy_previews_only_what_goes(tmp_path: Path) -> None:
 
 
 def test_a_pattern_matching_nothing_is_an_error(tmp_path: Path) -> None:
-    """Silent no-op targeting is how someone concludes a resource is fine."""
+    """Silent no-op targeting would suggest the resource is fine."""
     cfg, state = _applied(tmp_path)
     result = cli.run("plan", cfg, "--state", state, "-t", "local.File:ghost")
     assert result.exit_code == 1
@@ -180,8 +178,8 @@ def test_a_full_node_id_works(tmp_path: Path) -> None:
 
 
 def test_replace_recreates_a_resource_config_says_is_fine(tmp_path: Path) -> None:
-    """The escape hatch: the resource is wrong in a way the config cannot see, so
-    the diff has nothing to report and a plain apply is a no-op."""
+    """The resource is wrong in a way the config cannot see, so the diff has
+    nothing to report and a plain apply is a no-op."""
     cfg, state = _applied(tmp_path)
 
     result = cli.run("plan", cfg, "--state", state, "--replace", "local.File:c")
@@ -199,7 +197,7 @@ def test_replace_actually_rebuilds_it(tmp_path: Path) -> None:
 
 def test_replace_still_respects_prevent_destroy(tmp_path: Path) -> None:
     """`--replace` destroys and recreates, so it has to meet the one guard that
-    exists to stop an unintended destroy — otherwise the flag is a way around it.
+    exists to stop an unintended destroy, or the flag would bypass it.
     """
     cfg = tmp_path / "protected.py"
     cfg.write_text(

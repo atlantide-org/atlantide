@@ -4,20 +4,19 @@ build-backend = "hatchling.build"
 
 [project]
 name = "atlantide"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Typed Python IaC engine: deterministic Atlas-lang config, graph state, parallel reconciliation"
 readme = "README.md"
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 keywords = [
     "infrastructure-as-code", "iac", "aws", "terraform", "pulumi",
     "devops", "cloud", "provisioning", "deterministic",
 ]
-# PyPI's facets are the only way anyone finds this by browsing rather than by
-# name. "4 - Beta" is a claim about stability, not completeness: the state
-# format has a versioned forward migration, but it can still change between
-# minor releases.
+# Classifiers drive PyPI's browse facets. "4 - Beta" refers to stability, not
+# completeness: the state format has a versioned forward migration, but can
+# still change between minor releases.
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -28,7 +27,6 @@ classifiers = [
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -44,10 +42,6 @@ dependencies = [
     "returns>=0.23",
     "boto3>=1.34",
     "cryptography>=42",
-    # `typing.override` is 3.12+; the floor here is 3.11. Declared directly rather
-    # than leaned on transitively through pydantic, because `@override` is load
-    # bearing at runtime import time in every provider handler.
-    "typing-extensions>=4.4",
 ]
 
 [project.urls]
@@ -55,12 +49,12 @@ Homepage = "https://github.com/atlantide-org/atlantide"
 Documentation = "https://atlantide-org.github.io/"
 Repository = "https://github.com/atlantide-org/atlantide"
 # The releases page, not a CHANGELOG.md: `release.yml` cuts a GitHub Release for
-# every `v*` tag, so this is true with no upkeep.
+# every `v*` tag, so it needs no upkeep.
 Changelog = "https://github.com/atlantide-org/atlantide/releases"
 Issues = "https://github.com/atlantide-org/atlantide/issues"
 
-# The built-in providers are discovered exactly as a third-party one is. A door
-# only the shipped providers can walk through is a door nobody tests.
+# Built-in providers use the same entry-point discovery as third-party ones, so
+# the shipped providers exercise the plugin path.
 [project.entry-points."atlantide.providers"]
 aws = "atlantide.providers.aws:PLUGIN"
 local = "atlantide.providers.local:PLUGIN"
@@ -86,36 +80,39 @@ dev = [
     "testcontainers[postgres]>=4.8",
 ]
 
+# The one place the version is written: hatch reads `__version__` from the
+# package, so the built metadata and a source-tree `--version` cannot disagree.
+[tool.hatch.version]
+path = "atlantide/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["atlantide"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 strict = true
 packages = ["atlantide"]
 plugins = ["returns.contrib.mypy.returns_plugin"]
 
 # Beyond `strict`, which leaves these off by default.
 #
-# `warn_unreachable` and `extra_checks` both cost nothing here — the package was
-# already clean under them — and both catch a class of change that otherwise
-# lands silently: a narrowed branch that can no longer be entered, and a
-# variance/TypedDict mistake that only shows up at a call site far away.
+# `warn_unreachable` and `extra_checks` catch changes that otherwise land
+# silently: a narrowed branch that can no longer be entered, and a
+# variance/TypedDict mistake that only shows up at a distant call site.
 warn_unreachable = true
 extra_checks = true
 
-# `truthy-bool` is the one that paid for itself immediately: a `Result` has no
-#   `__bool__`, so `if not result:` is always false and the error branch behind it
-#   is dead. That is invisible in review and in tests that only cover the happy
-#   path — the failure surfaces as `unwrap`'s bare `UnwrapFailedError`.
-# `explicit-override` makes a subclass say it is overriding, so renaming a base
-#   method turns every stale subclass into an error instead of a method nobody
-#   calls any more. With this many provider handlers that is the likeliest way to
-#   silently lose behaviour.
-# `possibly-undefined`, `truthy-iterable` and `ignore-without-code` were all
-#   already clean; they are here to stay that way.
+# `truthy-bool`: a `Result` has no `__bool__`, so `if not result:` is always
+#   false and the error branch behind it is dead. Review and happy-path tests
+#   miss it; the failure surfaces as `unwrap`'s bare `UnwrapFailedError`.
+# `explicit-override` makes a subclass declare that it overrides, so renaming a
+#   base method turns every stale subclass into an error instead of an uncalled
+#   method. Across many provider handlers, this guards against silently lost
+#   behaviour.
+# `possibly-undefined`, `truthy-iterable` and `ignore-without-code` keep the
+#   package clean of those errors.
 #
-# Deliberately NOT enabled:
+# Not enabled:
 # `redundant-expr` — every hit is a defensive `isinstance` guarding a value that
 #   arrives from an untyped source (config evaluation, a state file). The
 #   annotation states the intended contract; the guard enforces it at runtime.
@@ -124,7 +121,7 @@ extra_checks = true
 #   `ClassVar[type[Resource]]` to their own type, which is the whole point of the
 #   handler being generic over one resource.
 # `unused-awaitable` — fires on `tg.create_task(...)` inside `async with
-#   asyncio.TaskGroup()`, where the group is what awaits the task. Correct code.
+#   asyncio.TaskGroup()`, where the group awaits the task.
 enable_error_code = [
     "explicit-override",
     "ignore-without-code",
@@ -140,11 +137,39 @@ module = ["psycopg", "psycopg.*"]
 ignore_missing_imports = true
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py312"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+select = [
+    "E", "F", "W", "I", "UP", "B", "SIM", "RUF",
+    "FBT", "PT", "ERA", "PERF", "TC", "C90", "PLR0913",
+]
+ignore = [
+    # `assert a and b`: 117 test sites; splitting them is churn for little gain.
+    "PT018",
+    # Moving typing-only imports under `if TYPE_CHECKING:` (590 sites): heavy imports
+    # are already deferred where it matters, and pydantic, Typer and dataclass
+    # evaluation need many of these names at runtime.
+    "TC001",
+    "TC002",
+    "TC003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer declares every CLI option as a defaulted parameter of the command function;
+# Typer passes them by name, so a `bool` option default is not a positional flag.
+"atlantide/cli/app.py" = ["FBT002"]
+"atlantide/cli/commands/**" = ["FBT002"]
+# pytest and hypothesis inject test parameters by name; a boolean literal in a test
+# is often the value under test (`to_canonical_json(True)`).
+"tests/**/test_*.py" = ["FBT001", "FBT003"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-args = 7
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -161,13 +186,60 @@ root_package = "atlantide"
 name = "layered architecture"
 type = "layers"
 layers = [
-    "atlantide.cli",
+    # `testing` is the public test API for component authors: an entrypoint like
+    # the CLI, and independent of it.
+    "atlantide.cli | atlantide.testing",
     "atlantide.engine",
     "atlantide.reconcile",
     "atlantide.policy | atlantide.providers | atlantide.state | atlantide.secrets | atlantide.lang",
     "atlantide.graph",
     "atlantide.ir",
+    "atlantide.util",
     "atlantide.core",
+]
+
+# Nothing ships on top of the test API: the engine, the CLI and config-reachable
+# packages alike run without it. The layers contract covers the layered packages;
+# this one also covers `components`.
+[[tool.importlinter.contracts]]
+name = "nothing imports testing"
+type = "forbidden"
+source_modules = [
+    "atlantide.cli",
+    "atlantide.components",
+    "atlantide.core",
+    "atlantide.engine",
+    "atlantide.graph",
+    "atlantide.ir",
+    "atlantide.lang",
+    "atlantide.policy",
+    "atlantide.providers",
+    "atlantide.reconcile",
+    "atlantide.secrets",
+    "atlantide.state",
+    "atlantide.util",
+]
+forbidden_modules = ["atlantide.testing"]
+
+# `util` is shared engine plumbing (AWS client config, owner-only files, the
+# project-file lookup). The layers contract keeps everything but `core` from
+# being imported by it; this one also covers the packages outside the layers.
+[[tool.importlinter.contracts]]
+name = "util depends only on core"
+type = "forbidden"
+source_modules = ["atlantide.util"]
+forbidden_modules = [
+    "atlantide.cli",
+    "atlantide.components",
+    "atlantide.engine",
+    "atlantide.graph",
+    "atlantide.ir",
+    "atlantide.lang",
+    "atlantide.policy",
+    "atlantide.providers",
+    "atlantide.reconcile",
+    "atlantide.secrets",
+    "atlantide.state",
 ]
 
 [[tool.importlinter.contracts]]
@@ -187,7 +259,7 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
-name = "providers depend only on core"
+name = "providers depend only on core and util"
 type = "forbidden"
 source_modules = ["atlantide.providers"]
 forbidden_modules = [
@@ -202,7 +274,7 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
-name = "secrets depends only on core"
+name = "secrets depends only on core and util"
 type = "forbidden"
 source_modules = ["atlantide.secrets"]
 forbidden_modules = [
@@ -214,4 +286,135 @@ forbidden_modules = [
     "atlantide.providers",
     "atlantide.cli",
     "atlantide.engine",
+]
+
+[[tool.importlinter.contracts]]
+name = "components depend only on core and util"
+type = "forbidden"
+source_modules = ["atlantide.components"]
+forbidden_modules = [
+    "atlantide.cli",
+    "atlantide.engine",
+    "atlantide.graph",
+    "atlantide.ir",
+    "atlantide.lang",
+    "atlantide.policy",
+    "atlantide.providers",
+    "atlantide.reconcile",
+    "atlantide.secrets",
+    "atlantide.state",
+]
+
+# No import cycle between a package and its submodules, or between the resource
+# and component models: the components package imports its submodules (lazily,
+# in `mount`), and `core.component` types `child` against `Resource`, so the
+# reverse edges stay out. The active component prefix lives in the private
+# `core._component_prefix`. `as_packages = false` names the modules themselves,
+# not their descendants, so `fetch` may still import `components.lock`.
+[[tool.importlinter.contracts]]
+name = "no import cycles through the components package or core.component"
+type = "forbidden"
+as_packages = false
+source_modules = [
+    "atlantide.core.resource",
+    "atlantide.components.fetch",
+    "atlantide.components.lock",
+    "atlantide.components.source",
+    "atlantide.components._layout",
+]
+forbidden_modules = [
+    "atlantide.core.component",
+    "atlantide.components",
+]
+
+# Backends stay swappable behind `StateBackend`: what they share lives in
+# `state.{model,leases,fencing,backend,codec}`, never in another backend.
+[[tool.importlinter.contracts]]
+name = "state backends are independent"
+type = "independence"
+modules = [
+    "atlantide.state.s3",
+    "atlantide.state.sql",
+    "atlantide.state.memory",
+]
+
+# "Everything before the diff is pure": the diff, the modules it is built from
+# (the change model, the per-node rules, the upstream verdicts, replace
+# ordering) and the prevent_destroy guard never reach the executor, the state
+# writer or a storage backend.
+[[tool.importlinter.contracts]]
+name = "diff and guards are pure"
+type = "forbidden"
+source_modules = [
+    "atlantide.reconcile.changes",
+    "atlantide.reconcile.classify",
+    "atlantide.reconcile.diff",
+    "atlantide.reconcile.guards",
+    "atlantide.reconcile.ordering",
+    "atlantide.reconcile.upstream",
+]
+forbidden_modules = [
+    "atlantide.reconcile.executor",
+    "atlantide.reconcile.writer",
+    "atlantide.state.s3",
+    "atlantide.state.sql",
+]
+
+# Command groups share only the `cli` infrastructure and `cli.views`.
+[[tool.importlinter.contracts]]
+name = "cli command groups are independent"
+type = "independence"
+modules = [
+    "atlantide.cli.commands.artifact",
+    "atlantide.cli.commands.component",
+    "atlantide.cli.commands.graph",
+    "atlantide.cli.commands.imports",
+    "atlantide.cli.commands.init",
+    "atlantide.cli.commands.introspect",
+    "atlantide.cli.commands.outputs",
+    "atlantide.cli.commands.providers",
+    "atlantide.cli.commands.run",
+    "atlantide.cli.commands.secrets",
+    "atlantide.cli.commands.state",
+    "atlantide.cli.commands.validate",
+]
+
+# The import graph both modules' docstrings describe: the typed-config layer
+# sits below the resource and stack model, never on top of it.
+[[tool.importlinter.contracts]]
+name = "core.config and core._config_types import only core._describe, core.errors and core.node_id"
+type = "forbidden"
+source_modules = ["atlantide.core.config", "atlantide.core._config_types"]
+forbidden_modules = [
+    "atlantide.core._tree",
+    "atlantide.core.actions",
+    "atlantide.core.check",
+    "atlantide.core.component",
+    "atlantide.core.context",
+    "atlantide.core.events",
+    "atlantide.core.fields",
+    "atlantide.core.inline",
+    "atlantide.core.lifecycle",
+    "atlantide.core.logging",
+    "atlantide.core.markers",
+    "atlantide.core.plugin",
+    "atlantide.core.policy",
+    "atlantide.core.provider",
+    "atlantide.core.registry",
+    "atlantide.core.resource",
+    "atlantide.core.stack",
+    "atlantide.core.tuning",
+    "atlantide.core.types",
+    "atlantide.cli",
+    "atlantide.components",
+    "atlantide.engine",
+    "atlantide.graph",
+    "atlantide.ir",
+    "atlantide.lang",
+    "atlantide.policy",
+    "atlantide.providers",
+    "atlantide.reconcile",
+    "atlantide.secrets",
+    "atlantide.state",
+    "atlantide.util",
 ]

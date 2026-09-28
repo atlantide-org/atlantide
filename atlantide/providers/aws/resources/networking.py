@@ -1,4 +1,4 @@
-"""EC2 networking resources: VPC, subnet, security group."""
+"""EC2 networking resources: VPC, subnet, security group, gateways, route table."""
 
 from __future__ import annotations
 
@@ -30,18 +30,17 @@ class Subnet(Ec2Resource):
     ``region`` are immutable; ``map_public_ip_on_launch`` and ``tags`` update in
     place. ``subnet_id`` is computed.
 
-    ``availability_zone`` decides whether a deployment survives one zone failing,
-    so it is worth stating: without it AWS picks, and two subnets meant to be in
-    different zones can land in the same one. Pass a name from
+    When ``availability_zone`` is unset AWS picks one, so two subnets meant for
+    different zones can share a zone. Pass a name from
     :class:`~atlantide.providers.aws.resources.data.AwsAvailabilityZones` rather
-    than a literal — which letters exist differs per account as well as region.
+    than a literal: zone letters differ per account as well as per region.
     """
 
     vpc_id: str = immutable()
     cidr_block: str = immutable()
     availability_zone: str | None = immutable(default=None)
-    #: Give instances launched here a public IP. Off by default: a subnet that
-    #: hands out public addresses should be one somebody chose.
+    #: Give instances launched here a public IP. Off by default, so public
+    #: addressing is always explicit.
     map_public_ip_on_launch: bool = mutable(default=False)
     subnet_id: str = computed()
 
@@ -54,14 +53,12 @@ class Subnet(Ec2Resource):
 class SgRule(Nested):
     """One security-group rule.
 
-    ``protocol="-1"`` means every protocol, in which case the ports are ignored —
-    AWS's spelling, kept rather than invented so a rule reads the same here as in
-    the console.
+    ``protocol="-1"`` (AWS's spelling) means every protocol; the ports are then
+    ignored.
 
-    Exactly one source is given: ``cidr_blocks``/``ipv6_cidr_blocks`` for
-    addresses, or ``source_security_group_id`` for another group. Passing that a
-    ``Ref`` (``other.group_id``) is what makes group-to-group access a real
-    dependency edge rather than a string nobody ordered.
+    Give at least one source: ``cidr_blocks``/``ipv6_cidr_blocks`` for
+    addresses, or ``source_security_group_id`` for another group. Pass a ``Ref``
+    (``other.group_id``) there so group-to-group access is a dependency edge.
     """
 
     protocol: str = "tcp"
@@ -79,15 +76,15 @@ class SgRule(Nested):
                 f"SgRule for protocol {self.protocol!r} needs from_port and to_port "
                 f"(use protocol='-1' for all traffic)"
             )
+        if not (self.cidr_blocks or self.ipv6_cidr_blocks or self.source_security_group_id):
+            raise ValueError(
+                "SgRule needs a source: cidr_blocks, ipv6_cidr_blocks or source_security_group_id"
+            )
         return self
 
 
-#: AWS's implicit outbound rule on a new group. Named so a config can say
-#: "everything except this" without spelling out the shape.
-#: Mirrors the egress rule AWS attaches to a new security group — including its
-#: *empty* description. A friendlier string here would never reach AWS (the rule
-#: is created by AWS, not by us), so every read would report it as drift and every
-#: untouched security group would look permanently out of sync.
+#: The allow-all egress rule AWS attaches to a new security group. Its description
+#: is empty to match the AWS-created rule; any other value reads back as drift.
 ALLOW_ALL_EGRESS = SgRule(protocol="-1", cidr_blocks=["0.0.0.0/0"])
 
 
@@ -98,11 +95,9 @@ class SecurityGroup(Ec2Resource):
     ``region`` are immutable (AWS forbids editing name/description/VPC);
     ``ingress``, ``egress`` and ``tags`` update in place. ``group_id`` is computed.
 
-    **Egress defaults to open, as AWS does.** A new group is created with an
-    allow-all egress rule, and this mirrors that rather than quietly diverging: a
-    group whose outbound traffic silently stopped working would be a worse
-    surprise than one that matches the console. Pass ``egress=[]`` to mean *no*
-    outbound access — the allow-all rule is then revoked explicitly.
+    **Egress defaults to open, as in AWS.** The default matches the allow-all rule
+    AWS creates with a new group. Pass ``egress=[]`` for no outbound access; the
+    handler then revokes that rule.
     """
 
     group_name: str = immutable(physical_name=True)
@@ -116,9 +111,8 @@ class SecurityGroup(Ec2Resource):
 class InternetGateway(Ec2Resource):
     """An internet gateway, attached to ``vpc_id``.
 
-    The attachment is a field rather than a seventh resource type: an unattached
-    gateway does nothing, and a config that could express one would only be able
-    to express a mistake.
+    The attachment is a field rather than a separate resource type, since an
+    unattached gateway does nothing.
     """
 
     vpc_id: str = immutable()
@@ -135,9 +129,8 @@ class ElasticIp(Ec2Resource):
 class NatGateway(Ec2Resource):
     """A NAT gateway: outbound internet for a private subnet.
 
-    ``subnet_id`` must be a *public* subnet — one whose route table sends
-    ``0.0.0.0/0`` to an internet gateway. A NAT in a private subnet is the classic
-    way to build a VPC that looks right and routes nowhere.
+    ``subnet_id`` must be a public subnet, one whose route table sends ``0.0.0.0/0``
+    to an internet gateway; a NAT in a private subnet has no route to the internet.
     """
 
     subnet_id: str = immutable()
@@ -163,12 +156,11 @@ class Route(Nested):
 class RouteTable(Ec2Resource):
     """A route table and the subnets that use it.
 
-    Routes are inline rather than a resource each: their order is irrelevant,
-    they have no identity of their own, and one-resource-per-route turns a
-    three-line table into three nodes whose only purpose is to be counted.
+    Routes are inline rather than a resource each: their order is irrelevant and
+    they have no identity of their own.
 
-    ``subnet_ids`` associates the table; a subnet may belong to one table, so the
-    association lives here rather than being a third thing to keep in step.
+    ``subnet_ids`` associates the table; a subnet belongs to at most one table, so
+    the association lives here rather than in a separate resource.
     """
 
     vpc_id: str = immutable()

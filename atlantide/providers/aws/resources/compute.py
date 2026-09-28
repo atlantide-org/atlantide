@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import stat
 import zipfile
 from hashlib import sha256
 from pathlib import Path
@@ -18,22 +19,23 @@ class LambdaFunction(RegionalResource, TaggedResource):
     """An AWS Lambda function.
 
     ``function_name`` and ``region`` are immutable; ``role_arn`` (pass
-    ``role.arn``), ``runtime``, ``handler``, ``code``, ``memory_size``,
-    ``timeout``, ``environment`` and ``tags`` update in place. ``arn`` is a
-    computed output.
+    ``role.arn``), ``runtime``, ``handler``, the package (including ``code_path``),
+    ``memory_size``, ``timeout``, ``environment`` and ``tags`` update in place.
+    ``arn`` is computed.
 
-    **Code.** ``code`` is either a local path to a zip (or a directory, zipped
-    deterministically) or an object already in S3. A local source is fingerprinted
-    at config-evaluation time into ``code_sha256``, an input that drives the diff:
-    change a byte and the hash changes, so plan sees an UPDATE and apply ships the
-    new package. Bytes are read by the provider at apply, so a rehydrate (deploy)
-    uses the artifact's pinned hash and never touches disk — the same shape
-    :class:`~atlantide.providers.aws.resources.s3.S3Folder` uses.
+    **Code.** ``code_path`` names a local zip (or a directory, zipped
+    deterministically); ``s3_bucket`` / ``s3_key`` name an object already in S3. A
+    local package is fingerprinted at config-evaluation time into ``code_sha256``,
+    so any byte change plans as an UPDATE. Moving the package to another
+    ``code_path`` is an UPDATE too (re-uploading the same bytes), not a
+    replacement. The provider reads the bytes at apply; a
+    rehydrate (deploy) uses the artifact's pinned hash and never reads disk, as
+    :class:`~atlantide.providers.aws.resources.s3.S3Folder` does.
 
-    ``signing_secret`` holds a :class:`~atlantide.core.SecretRef` (a name, never a
-    value) — surfaced to the function as the ``SIGNING_SECRET`` env var, resolved
-    from the secrets backend at apply and redacted in plan/logs. It is merged into
-    ``environment``, which it overrides on a key clash.
+    ``signing_secret`` holds a :class:`~atlantide.core.SecretRef` (a name, not a
+    value). It is resolved from the secrets backend at apply, redacted in plan and
+    logs, and set as the ``SIGNING_SECRET`` environment variable, overriding any
+    ``environment`` entry of that name.
     """
 
     class Action:
@@ -47,10 +49,11 @@ class LambdaFunction(RegionalResource, TaggedResource):
     runtime: str = mutable(default="python3.12")
     handler: str = mutable(default="index.handler")
     #: Local zip or directory to deploy. Mutually exclusive with ``s3_bucket``.
-    code_path: str | None = immutable(default=None)
-    #: Digest of the package ``code_path`` names — the input the diff watches.
+    #: Mutable: ``code_sha256`` carries the content, so a move is not a new function.
+    code_path: str | None = mutable(default=None)
+    #: sha256 of the ``code_path`` package; the input the diff compares.
     code_sha256: str = mutable(default="")
-    #: An already-uploaded package. ``s3_key`` is required alongside the bucket.
+    #: Bucket of an already-uploaded package; requires ``s3_key``.
     s3_bucket: str | None = mutable(default=None)
     s3_key: str | None = mutable(default=None)
     s3_object_version: str | None = mutable(default=None)
@@ -89,12 +92,11 @@ class LambdaFunction(RegionalResource, TaggedResource):
 
 
 def _fingerprint(path: str) -> str:
-    """The digest of the package at ``path`` — a zip file, or a directory zipped.
+    """The sha256 of the package at ``path``: a zip file, or a directory zipped.
 
-    Read at evaluation time, which is why the path must be a literal: the whole
-    point is that the *hash* is what reaches the IR, so two runs of the same
-    config over the same bytes produce identical IR, and a deploy from an
-    artifact needs no filesystem at all.
+    Read at evaluation time, so the path must be a literal. Only the hash reaches
+    the IR, so identical bytes give identical IR and a deploy from an artifact needs
+    no filesystem.
     """
     if not isinstance(path, str) or contains_ref(path):
         raise LanguageError("LambdaFunction.code_path must be a literal path")
@@ -107,21 +109,27 @@ def _fingerprint(path: str) -> str:
 def package_bytes(source: Path) -> bytes:
     """The deployment package for ``source``: its bytes if a zip, else a zip of it.
 
-    Directories are zipped with sorted entries and a fixed timestamp, so the same
-    tree always produces the same bytes — otherwise the fingerprint would change
-    on every run and every plan would show an update.
+    Directories are zipped with sorted posix entry names, a fixed timestamp and a
+    normalised mode, so the same tree always yields the same bytes and the
+    fingerprint is stable across runs and platforms. Python caches are skipped as
+    :class:`~atlantide.providers.aws.resources.s3.S3Folder` skips them: their bytes
+    vary between runs and would plan spurious updates. An executable file keeps
+    its exec bit (0o755), which a ``bootstrap`` for a ``provided.*`` runtime needs.
     """
     if source.is_file():
         return source.read_bytes()
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for entry in sorted(p for p in source.rglob("*") if p.is_file()):
-            info = zipfile.ZipInfo(str(entry.relative_to(source)), date_time=_EPOCH)
-            info.external_attr = 0o644 << 16
+            rel = entry.relative_to(source)
+            if "__pycache__" in rel.parts or entry.suffix == ".pyc":
+                continue
+            info = zipfile.ZipInfo(rel.as_posix(), date_time=_EPOCH)
+            executable = entry.stat().st_mode & stat.S_IXUSR
+            info.external_attr = (0o755 if executable else 0o644) << 16
             archive.writestr(info, entry.read_bytes())
     return buffer.getvalue()
 
 
-#: Fixed zip timestamp. Real mtimes would make the archive — and so the
-#: fingerprint — differ between two checkouts of identical code.
+#: Fixed zip timestamp: real mtimes differ between checkouts of identical code.
 _EPOCH = (1980, 1, 1, 0, 0, 0)

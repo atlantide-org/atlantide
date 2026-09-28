@@ -1,12 +1,12 @@
 """Atlantide static-website example: S3 + CloudFront + Origin Access Control.
 
-Like ``infra.py``, this is valid Python but run by the deterministic Atlas-lang
+Like ``example-one.py``, this is valid Python but run by the deterministic Atlas-lang
 interpreter (no clock, randomness, env, or network at config time). ``uuid5`` is an
 Atlas-lang *builtin* — a pure derived function the interpreter injects, used without
 an import (a static checker flags it as undefined; hence the ``# noqa: F821``).
 
 The site is served from the **default CloudFront domain** (``*.cloudfront.net``), so
-it needs no custom domain, ACM certificate, or Route53 records — just four
+it needs no custom domain, ACM certificate, or Route53 records: four
 resources, wired by refs into one graph, in each of two environments:
 
 - **Config** — one declaration of both environments and what differs between them:
@@ -19,7 +19,7 @@ resources, wired by refs into one graph, in each of two environments:
 - **S3Bucket** — a private origin bucket (no public access; CloudFront reads it
   through the OAC). Its ``regional_domain_name`` is the CloudFront origin.
 - **OriginAccessControl** — lets CloudFront sign requests to the private bucket
-  (SigV4). The modern replacement for the legacy Origin Access Identity.
+  (SigV4). It supersedes AWS's Origin Access Identity (OAI).
 - **CloudFrontDistribution** — the CDN. ``origin_domain`` and ``oac_id`` are refs,
   so the engine creates the bucket and OAC *before* the distribution. ``domain_name``
   (a computed output) is the site URL.
@@ -133,5 +133,5 @@ for env in config.envs():
         )
 
         output("site_url", cdn.domain_name)  # https://<id>.cloudfront.net
-        output("bucket", origin.bucket)  # the origin bucket name
-        output("distribution_id", cdn.distribution_id)  # the CloudFront distribution id
+        output("bucket", origin.bucket)
+        output("distribution_id", cdn.distribution_id)

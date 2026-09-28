@@ -1,20 +1,18 @@
 """Backend-parametrized fixtures: every state test runs on memory, sqlite, s3 and
-(when a database is offered) postgres.
+(when a database is available) postgres.
 
-The point of the parametrization is that :mod:`tests.state.test_backend` is
-written once and every backend must satisfy it identically — that is what makes
-the state layer swappable rather than merely pluggable.
+:mod:`tests.state.test_backend` is written once and every backend must satisfy it
+identically, which keeps the state layer swappable.
 
-Postgres needs a real server. :func:`pg_dsn` finds one — an already-running
-database named by ``ATLANTIDE_TEST_PG_DSN``, or a container it starts itself via
-testcontainers — and skips when neither is available.
+Postgres needs a real server. :func:`pg_dsn` uses the database named by
+``ATLANTIDE_TEST_PG_DSN``, or starts a container via testcontainers, and skips
+when neither is available.
 
-The container is started **lazily**, by the first test that asks for the fixture.
-That laziness is the whole design: postgres is always in the parameter list, so a
-contributor with Docker running gets the postgres tests without configuring
-anything, while ``pytest tests/lang`` still costs nothing. CI keeps setting
-``ATLANTIDE_TEST_PG_DSN`` against its service container — the env var wins, and
-starting a second database inside the runner would be pure waste.
+The container starts lazily, on the first test that requests the fixture. Postgres
+is always in the parameter list, so a contributor with Docker running gets the
+postgres tests without configuration, while ``pytest tests/lang`` pays nothing.
+CI sets ``ATLANTIDE_TEST_PG_DSN`` against its service container; the env var takes
+precedence, so no second database starts inside the runner.
 """
 
 from __future__ import annotations
@@ -29,12 +27,12 @@ import pytest
 from moto import mock_aws
 
 from atlantide.state import MemoryStateBackend, SqliteStateBackend, StateBackend, StateNode
-from atlantide.state.s3_backend import S3StateBackend
+from atlantide.state.s3 import S3StateBackend
 from tests.support import TEST_REGION, FakeClock, create_state_store, fake_aws_credentials
 
 __all__ = ["BackendFactory", "FakeClock", "make_backend", "node", "pg_dsn"]
 
-BackendFactory = Callable[..., StateBackend]
+type BackendFactory = Callable[..., StateBackend]
 
 PG_DSN_ENV = "ATLANTIDE_TEST_PG_DSN"
 REGION = TEST_REGION
@@ -43,9 +41,9 @@ LOCK_TABLE = "atlantide-test-locks"
 #: Schemas the postgres backend fixture owns; dropped before each test.
 PG_SCHEMAS = tuple(f"atlantide_test_{nth}" for nth in range(4))
 
-#: Postgres is always offered. Whether it runs is decided by :func:`pg_dsn` at
-#: fixture time, not here — deciding at import time would mean starting a
-#: container during collection, for every run that never touches state.
+#: Postgres is always listed; :func:`pg_dsn` decides at fixture time whether it
+#: runs. Deciding at import time would start a container during collection, even
+#: for runs that never touch state.
 _BACKENDS = ["memory", "sqlite", "s3", "postgres"]
 
 #: Pinned to match the service container in ci.yml, so a failure that reproduces
@@ -57,14 +55,11 @@ PG_IMAGE = "postgres:16-alpine"
 def pg_dsn() -> Iterator[str]:
     """A connectable postgres, or a skip.
 
-    Preference order is deliberate: an externally supplied database is used as-is
-    (CI, or a contributor pointing at their own server), and only when there is
-    none does this start a container. Docker being absent is a skip rather than a
-    failure — the other three backends still cover the contract, and requiring
-    Docker to run the test suite would be a poor trade.
+    An externally supplied database (CI, or a contributor's own server) is used
+    as-is; a container starts only when there is none. Missing Docker is a skip,
+    not a failure: the other three backends still cover the contract.
     """
-    # Checked before the server is even looked for: without the driver there is
-    # nothing to connect with, and a run that finds a database anyway fails deep
+    # Checked first: without the driver, a run that finds a database fails deep
     # inside the backend with a bare ImportError instead of skipping.
     try:
         import psycopg  # noqa: F401
@@ -83,16 +78,14 @@ def pg_dsn() -> Iterator[str]:
             f"installed (uv sync --extra dev)"
         )
 
-    # Ryuk is testcontainers' reaper sidecar: it kills containers a crashed test
-    # run left behind. It cannot map its port under several common Docker setups
-    # (Docker Desktop on macOS, colima), and when it fails it takes the whole
-    # session down with it — turning "postgres tests run for free" into "postgres
-    # tests never run", silently, on the machines most likely to be a laptop.
+    # Ryuk, testcontainers' reaper sidecar, removes containers left by crashed
+    # runs. It cannot map its port under several common Docker setups (Docker
+    # Desktop on macOS, colima), and its failure aborts the whole session, which
+    # silently disables the postgres tests.
     #
     # The `with` block below stops the container on every ordinary exit, including
-    # test failure and Ctrl-C. What is given up is recovery from a hard kill of
-    # pytest itself; that leaks one container, findable with
-    # `docker ps --filter ancestor=postgres:16-alpine`.
+    # test failure and Ctrl-C. A hard kill of pytest leaks one container, findable
+    # with `docker ps --filter ancestor=postgres:16-alpine`.
     os.environ.setdefault("TESTCONTAINERS_RYUK_DISABLED", "true")
 
     try:
@@ -101,9 +94,9 @@ def pg_dsn() -> Iterator[str]:
         with PostgresContainer(PG_IMAGE, driver=None) as container:
             yield container.get_connection_url()
     except Exception as exc:  # pragma: no cover - depends on the local machine
-        # Almost always "Docker is not running". Anything else that stops a
-        # container from starting is equally not the test's problem, and the
-        # message says which so it is not mistaken for a real failure.
+        # Usually "Docker is not running". Any failure to start the container is
+        # environmental; the message names it so the skip is not mistaken for a
+        # real failure.
         pytest.skip(f"could not start a postgres container ({type(exc).__name__}: {exc})")
 
 
@@ -139,26 +132,34 @@ def make_backend(
         dsn = request.getfixturevalue("pg_dsn")
         drop_postgres_schemas(dsn, *PG_SCHEMAS)
 
-    def factory(clock: Callable[[], float] = time.time) -> StateBackend:
+    def factory(clock: Callable[[], float] | None = None) -> StateBackend:
         # A distinct file / key / schema per backend, so a test taking two
         # backends gets two independent stores.
         nth = len(created)
+        local = clock if clock is not None else time.time
         if request.param == "memory":
-            backend: StateBackend = MemoryStateBackend(clock=clock)
+            backend: StateBackend = MemoryStateBackend(clock=local)
         elif request.param == "sqlite":
-            backend = SqliteStateBackend(str(tmp_path / f"state{nth}.db"), clock=clock)
+            backend = SqliteStateBackend(str(tmp_path / f"state{nth}.db"), clock=local)
         elif request.param == "s3":
             backend = S3StateBackend(
                 BUCKET,
                 f"state{nth}.json",
                 lock_table=LOCK_TABLE,
                 region=REGION,
-                clock=clock,
+                # The shared contract expires leases at their exact expiry, as
+                # the other backends do; the S3 skew margin has its own tests.
+                lock_skew_margin=0.0,
+                clock=local,
             )
         else:
-            from atlantide.state.postgres_backend import PostgresStateBackend
+            from atlantide.state.sql.postgres import PostgresStateBackend
 
-            backend = PostgresStateBackend(dsn, schema=PG_SCHEMAS[nth], clock=clock)
+            # No clock given: lease time is the server's, as in production. A
+            # test that injects one gets it instead, for deterministic expiry.
+            backend = PostgresStateBackend(
+                dsn, schema=PG_SCHEMAS[nth], lock_skew_margin=0.0, clock=clock
+            )
         created.append(backend)
         return backend
 

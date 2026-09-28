@@ -1,8 +1,8 @@
 """atlantide.policy: modular, per-resource policy engine.
 
 - ``enforce`` / ``@policy`` attach policies (config-level or class-level).
-- ``PolicyProvider`` + ``PolicyRegistry`` evaluate them (native-Python builtin
-  provider ships).
+- ``PolicyProvider`` and ``PolicyRegistry`` evaluate them; the builtin provider
+  is native Python.
 - Evaluated at plan time; ``mandatory`` violations block apply, ``advisory`` warn.
 """
 

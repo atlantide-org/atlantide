@@ -17,6 +17,6 @@ class Action(enum.StrEnum):
     NOOP = "noop"
 
 
-# Destructive actions (fully or partially remove a resource) — gated by
-# prevent_destroy and the deny-destroy-in-protected policy.
+# Actions that fully or partially remove a resource; gated by `prevent_destroy`
+# and the deny-destroy-in-protected policy.
 DESTRUCTIVE_ACTIONS = frozenset({Action.DELETE, Action.REPLACE})

@@ -12,8 +12,7 @@ from atlantide.ir import lower
 from atlantide.ir.canonical import to_canonical_json
 from atlantide.lang import evaluate_source
 from atlantide.secrets import KeyfileValueStore, SecretsRegistry, is_secret_ref_marker
-from atlantide.state import MemoryStateBackend
-from atlantide.state.sqlite_backend import SqliteStateBackend
+from atlantide.state import MemoryStateBackend, SqliteStateBackend
 from tests.conftest import make_engine
 from tests.support import FakeProvider, Vault, globals_of, types_of
 
@@ -49,7 +48,7 @@ def test_secret_ref_lowers_to_handle_not_value() -> None:
     assert node is not None
     assert is_secret_ref_marker(node.properties["token"])
     assert node.properties["token"] == {"$secret_ref": {"name": "vault/token", "provider": None}}
-    # the value is not even known at lowering — only the handle is in the IR bytes
+    # the value is unknown at lowering; only the handle is in the IR bytes
     assert TOKEN.encode() not in to_canonical_json(ir.to_canonical())
 
 

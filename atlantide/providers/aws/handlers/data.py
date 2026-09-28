@@ -1,18 +1,14 @@
-"""Handlers for the read-only AWS lookups.
+"""Handlers for read-only AWS lookups (data sources).
 
-A data source's create and update are both the same read, and its delete does
-nothing — atlantide did not make the thing and must not remove it. Expressed as
-an ordinary :class:`AwsHandler` so the dispatcher, the executor and the diff need
-no special case beyond the ``kind`` flag on the IR node.
+They subclass :class:`AwsHandler`, so the dispatcher, the executor and the diff
+need no special case beyond the ``kind`` flag on the IR node.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, override
 
-from typing_extensions import override
-
-from atlantide.providers.aws.handlers.base import AwsHandler
+from atlantide.providers.aws.handlers.base import AwsHandler, Client
 from atlantide.providers.aws.resources.data import (
     AwsAvailabilityZones,
     AwsCallerIdentity,
@@ -20,27 +16,26 @@ from atlantide.providers.aws.resources.data import (
 
 
 class _ReadOnlyHandler(AwsHandler[Any]):
-    """CRUD for something that already exists: read, read, read, nothing."""
+    """CRUD for an existing object: create, read and update look it up; delete is a no-op."""
 
     @override
-    def create(self, client: Any, res: Any) -> dict[str, Any]:
+    def create(self, client: Client, res: Any) -> dict[str, Any]:
         return self._lookup(client, res)
 
     @override
-    def update(self, client: Any, prior: dict[str, Any], res: Any) -> dict[str, Any]:
-        # Reached when the query itself changed, so the answer is re-read.
+    def update(self, client: Client, prior: dict[str, Any], res: Any) -> dict[str, Any]:
+        # Runs when the query changes, so the answer is re-read.
         return self._lookup(client, res)
 
     @override
-    def read(self, client: Any, res: Any) -> dict[str, Any] | None:
+    def read(self, client: Client, res: Any) -> dict[str, Any] | None:
         return self._lookup(client, res)
 
     @override
-    def delete(self, client: Any, res: Any) -> None:
-        """Nothing. Deleting a lookup would delete infrastructure this config
-        only ever read — the one thing a data source must never do."""
+    def delete(self, client: Client, res: Any) -> None:
+        """No-op: deleting a lookup would delete infrastructure this config only read."""
 
-    def _lookup(self, client: Any, res: Any) -> dict[str, Any]:
+    def _lookup(self, client: Client, res: Any) -> dict[str, Any]:
         raise NotImplementedError
 
 
@@ -49,7 +44,7 @@ class AwsCallerIdentityHandler(_ReadOnlyHandler):
     resource_type = AwsCallerIdentity
 
     @override
-    def _lookup(self, client: Any, res: AwsCallerIdentity) -> dict[str, Any]:
+    def _lookup(self, client: Client, res: AwsCallerIdentity) -> dict[str, Any]:
         identity = client.get_caller_identity()
         return {
             "account_id": identity["Account"],
@@ -63,13 +58,11 @@ class AwsAvailabilityZonesHandler(_ReadOnlyHandler):
     resource_type = AwsAvailabilityZones
 
     @override
-    def _lookup(self, client: Any, res: AwsAvailabilityZones) -> dict[str, Any]:
+    def _lookup(self, client: Client, res: AwsAvailabilityZones) -> dict[str, Any]:
         response = client.describe_availability_zones(
             Filters=[{"Name": "state", "Values": [res.state]}]
         )
-        # Sorted so two runs against one account produce the same list: the API
-        # does not promise an order, and a config that indexes into it would
-        # otherwise put a subnet in a different zone on a whim.
+        # The API does not guarantee order; sorting keeps list indices stable across runs.
         zones = sorted(response.get("AvailabilityZones", []), key=lambda z: z["ZoneName"])
         return {
             "names": [zone["ZoneName"] for zone in zones],

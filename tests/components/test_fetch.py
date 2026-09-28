@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import atlantide.components.fetch as fetch_mod
 from atlantide.components import components_dir
-from atlantide.components.fetch import fetch, tree_hash, vendor, verify
+from atlantide.components.fetch import _check_tree, fetch, tree_hash, vendor, verify
 from atlantide.components.lock import LockEntry
 from atlantide.components.source import ComponentSource
 from atlantide.core.errors import ComponentError
@@ -146,7 +151,7 @@ def test_subdir_cannot_escape_the_clone(repo: tuple[str, str], tmp_path: Path) -
 
 
 def test_tree_hash_framing_is_injective(tmp_path: Path) -> None:
-    # The pre-v2 `path\0content\0` concatenation collided for these two trees
+    # Plain `path\0content\0` concatenation collides for these two trees
     # (embedded NULs let one tree impersonate another); length framing must not.
     one = tmp_path / "one"
     one.mkdir()
@@ -164,3 +169,83 @@ def test_verify_rejects_outdated_lock_hash_format(repo: tuple[str, str], tmp_pat
     stale = LockEntry(git=url, commit=commit, hash="sha256:" + "0" * 64, subdir="pkg")
     with pytest.raises(ComponentError, match="outdated format"):
         verify("acme", stale, tmp_path)
+
+
+def _repo_with(tmp_path: Path, build: Callable[[Path], None]) -> str:
+    """A component repo whose ``pkg/`` has been shaped by ``build`` before committing."""
+    src = tmp_path / "linkrepo"
+    (src / "pkg").mkdir(parents=True)
+    build(src / "pkg")
+    make_repo(src)
+    return f"file://{src}"
+
+
+def test_symlink_out_of_the_repo_is_refused(tmp_path: Path) -> None:
+    secret = tmp_path / "credentials"
+    secret.write_text("aws_secret_access_key = hunter2\n")
+    url = _repo_with(tmp_path, lambda pkg: (pkg / "leak").symlink_to(secret))
+    project = tmp_path / "project"
+    with pytest.raises(ComponentError, match="symlink"):
+        fetch("acme", _source(url), project)
+    assert not (components_dir(project) / "acme").exists()
+
+
+def test_relative_symlink_escaping_the_subdir_is_refused(tmp_path: Path) -> None:
+    url = _repo_with(tmp_path, lambda pkg: (pkg / "up").symlink_to("../../outside"))
+    with pytest.raises(ComponentError, match="outside the component"):
+        fetch("acme", _source(url), tmp_path / "project")
+
+
+def test_in_tree_symlink_is_vendored_as_a_link(tmp_path: Path) -> None:
+    def build(pkg: Path) -> None:
+        (pkg / "real.py").write_text("X = 1\n")
+        (pkg / "alias.py").symlink_to("real.py")
+
+    url = _repo_with(tmp_path, build)
+    project = tmp_path / "project"
+    entry = fetch("acme", _source(url), project)
+    vendored = components_dir(project) / "acme"
+    assert (vendored / "alias.py").is_symlink()
+    assert (vendored / "alias.py").readlink() == Path("real.py")
+    assert entry.hash == tree_hash(vendored)
+    verify("acme", entry, project)
+
+
+def test_tree_hash_hashes_link_target_not_content(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.write_text("secret\n")
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "link").symlink_to(outside)
+    baseline = tree_hash(root)
+    outside.write_text("changed\n")  # never read through the link
+    assert tree_hash(root) == baseline
+
+    # A link never collides with a file whose bytes spell its target.
+    twin = tmp_path / "twin"
+    twin.mkdir()
+    (twin / "link").write_text(str(outside))
+    assert tree_hash(twin) != baseline
+
+
+def test_special_file_is_refused(tmp_path: Path) -> None:
+    src = tmp_path / "tree"
+    src.mkdir()
+    os.mkfifo(src / "pipe")
+    with pytest.raises(ComponentError, match="not a regular file"):
+        _check_tree(src)
+
+
+def test_git_does_not_prompt_and_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+
+    def fake_run(*args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        raise subprocess.TimeoutExpired(cmd="git", timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(fetch_mod.subprocess, "run", fake_run)
+    with pytest.raises(ComponentError, match="did not finish"):
+        fetch_mod._git("clone", "x")
+    assert seen["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert seen["stdin"] is subprocess.DEVNULL
+    assert seen["timeout"] == fetch_mod.GIT_TIMEOUT

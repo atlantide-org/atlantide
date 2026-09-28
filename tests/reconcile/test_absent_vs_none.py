@@ -15,9 +15,8 @@ from tests.support import box_harness
 
 
 def test_a_new_immutable_field_defaulting_to_none_still_replaces() -> None:
-    """Reading a missing prior key as None makes an added field look unchanged, so
-    an `immutable()` one reaches `update()` with an empty change set rather than
-    REPLACE."""
+    """An added `immutable()` field absent from prior state must REPLACE, not reach
+    `update()` with an empty change set."""
     h = box_harness(MemoryStateBackend())
     h.apply("Box('a', size=1)\n")
     node = h.backend.load().nodes["default:test.Box:a"]

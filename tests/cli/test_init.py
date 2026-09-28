@@ -1,15 +1,13 @@
-"""``atlantide init`` scaffolds projects that actually work.
+"""``atlantide init`` scaffolds working projects.
 
-The load-bearing test here is :func:`test_every_template_scaffolds_a_project_that_validates`,
-and specifically the fact that it runs ``validate`` with *no config argument*. That
-makes it assert two things at once: the template is inside the Atlas-lang subset,
-and the generated ``atlantide.toml``'s ``config`` key names a file that exists. The
-second is not hypothetical — ``examples/atlantide.toml`` pointed at a config that
-had not existed for some time, and stayed invisible because a nearer toml shadowed
-it whenever anyone ran from the directory that mattered.
+The key test is :func:`test_every_template_scaffolds_a_project_that_validates`,
+which runs ``validate`` with *no config argument*. That asserts two things at
+once: the template is inside the Atlas-lang subset, and the generated
+``atlantide.toml``'s ``config`` key names a file that exists. A stale ``config``
+key is easy to miss, because a nearer toml can shadow it.
 
-A scaffolder is also the one piece of code whose output nobody reviews before
-running it, so the safety tests below are about what it refuses to do.
+Scaffolder output is usually run without review, so the safety tests below cover
+what it refuses to do.
 """
 
 from __future__ import annotations
@@ -22,14 +20,14 @@ from pathlib import Path
 import pytest
 from returns.result import Failure
 
-from atlantide.cli.project import load_project
-from atlantide.cli.templates import (
+from atlantide.cli.commands.init.templates import (
     CONFIG_FILENAME,
     GITIGNORE_MARKER,
     STATE_FILENAME,
     TEMPLATE_NAMES,
     TEMPLATES,
 )
+from atlantide.cli.project import load_project
 from atlantide.cli.wiring import discovered_surface
 from atlantide.lang.validate import validate_source
 from atlantide.secrets import SecretsConfig
@@ -72,9 +70,8 @@ def test_the_minimal_scaffold_applies_and_is_then_a_noop(
 ) -> None:
     """The whole loop, with no credentials anywhere.
 
-    Possible only because the minimal template uses the local provider. It is
-    also the clearest demonstration the engine has: the second plan reports
-    everything unchanged without calling a provider at all.
+    Possible only because the minimal template uses the local provider. The
+    second plan reports everything unchanged without calling a provider.
     """
     project = tmp_path / "proj"
     cli.ok("init", project)
@@ -136,17 +133,48 @@ def test_the_secrets_table_is_emitted_only_when_it_says_something(tmp_path: Path
     assert "[secrets]" not in (default / TOML).read_text()
 
 
+def test_env_secrets_scaffold_an_empty_allow_list(tmp_path: Path) -> None:
+    """The env provider is deny-by-default; the generated file says where to allow."""
+    cli.ok("init", tmp_path, "--secrets", "env", "--no-validate")
+    text = (tmp_path / TOML).read_text()
+    assert "[secrets.env]" in text
+    assert load_project(tmp_path).secrets == SecretsConfig(provider="env", env_allow=())
+
+
 def test_postgres_without_a_dsn_flag_notes_where_the_dsn_comes_from(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Keeping credentials out of the repo is the supported path, so the generated
-    file should say so rather than leaving a reader to wonder what is missing."""
+    file names where the DSN comes from."""
     monkeypatch.setenv("ATLANTIDE_STATE_DSN", "postgresql://localhost/db")
     cli.ok("init", tmp_path, "--state", "postgres", "--no-validate")
     rendered = (tmp_path / TOML).read_text()
     assert "ATLANTIDE_STATE_DSN" in rendered
     assert "postgresql://localhost/db" not in rendered
     assert load_project(tmp_path).state_backend.backend == "postgres"
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "postgresql://app:hunter2@db/state",
+        "postgresql://app@db/state?password=hunter2",
+        "host=db user=app password=hunter2",
+    ],
+)
+def test_a_dsn_carrying_a_password_is_refused(tmp_path: Path, dsn: str) -> None:
+    """``atlantide.toml`` is committed; a password in it lands in git history."""
+    output = cli.fails("init", tmp_path, "--state", "postgres", "--dsn", dsn, "--no-validate")
+    text = output.output.replace("\n", "")
+    assert "ATLANTIDE_STATE_DSN" in text
+    assert "hunter2" not in text
+    assert not (tmp_path / TOML).exists()
+
+
+def test_a_dsn_without_a_password_is_written(tmp_path: Path) -> None:
+    dsn = "postgresql://app@db/state"
+    cli.ok("init", tmp_path, "--state", "postgres", "--dsn", dsn, "--no-validate")
+    assert load_project(tmp_path).state_backend.dsn == dsn
 
 
 #: ``[state]`` keys ``init`` writes out.
@@ -160,15 +188,17 @@ _NOT_SCAFFOLDED = {
     "lock_ttl",
     "lock_renew_interval",
     "node_timeout",
+    "lock_skew_margin",
+    "journal_table",
+    "write_concurrency",
 }
 
 
 def test_every_state_config_field_is_scaffolded_or_deliberately_skipped() -> None:
     """A key added to :class:`StateConfig` must be decided about here.
 
-    Without this the generator quietly becomes a second, older copy of the schema
-    in ``cli/project.py`` — right up until someone scaffolds a project missing the
-    key their backend now requires.
+    Otherwise the generator drifts from the schema in ``cli/project.py`` and
+    scaffolds projects missing keys their backend requires.
     """
     assert {f.name for f in dataclasses.fields(StateConfig)} == _EMITTED | _NOT_SCAFFOLDED
 
@@ -201,8 +231,7 @@ def test_refuses_to_nest_inside_an_enclosing_project(tmp_path: Path) -> None:
 
 
 def test_every_collision_is_reported_at_once(tmp_path: Path) -> None:
-    """Not first-wins: three re-runs to discover three collisions is three answers
-    to a question the user only asked once."""
+    """Not first-wins: one run reports every collision, rather than one per re-run."""
     (tmp_path / TOML).write_text("")
     (tmp_path / CONFIG_FILENAME).write_text("")
     output = cli.fails("init", tmp_path).output
@@ -224,7 +253,7 @@ def test_an_existing_gitignore_is_appended_to_not_replaced(tmp_path: Path) -> No
     ignored = (tmp_path / ".gitignore").read_text()
     assert "node_modules/" in ignored
     assert "atlantide.key" in ignored
-    # Appending twice would work and look fine; it is still wrong.
+    # A re-run with --force must not append the block a second time.
     assert ignored.count(GITIGNORE_MARKER) == 1
 
 
@@ -232,8 +261,8 @@ def test_an_existing_gitignore_is_appended_to_not_replaced(tmp_path: Path) -> No
 
 
 def test_s3_without_a_bucket_fails_with_the_backends_own_message(tmp_path: Path) -> None:
-    """Asserting the backend's literal wording is the point: it proves ``init``
-    carries no second copy of ``REQUIRED_KEYS``."""
+    """Asserting the backend's literal wording proves ``init`` carries no second
+    copy of ``REQUIRED_KEYS``."""
     output = cli.fails("init", tmp_path, "--state", "s3").output
     assert "requires bucket, key, lock_table" in output.replace("\n", "")
 
@@ -297,9 +326,9 @@ def test_every_backend_combination_renders_parseable_toml(
 def test_a_non_ascii_setting_survives_into_a_loadable_toml(tmp_path: Path) -> None:
     """The generated file has to be TOML, not JSON-that-looks-like-TOML.
 
-    `json.dumps` escapes astral characters as surrogate pairs, which TOML forbids
-    — so a bucket name with an emoji in it used to produce an `atlantide.toml`
-    that `tomllib` refused on the very next command.
+    `json.dumps` escapes astral characters as surrogate pairs, which TOML forbids,
+    so a bucket name with an emoji must still yield an `atlantide.toml` that
+    `tomllib` accepts.
     """
     cli.ok(
         "init",

@@ -18,6 +18,7 @@ from atlantide.policy import (
     PolicyRegistry,
     PolicyResult,
     default_policy_registry,
+    policy,
 )
 from atlantide.reconcile import Action
 from tests.support import Bucket, FakeProvider, Thing, Vault, engine_for, globals_of
@@ -219,8 +220,8 @@ def _apply(engine: Engine, src: str) -> Any:
 
 
 def test_replace_in_a_protected_stack_is_blocked() -> None:
-    """`size` is immutable, so changing it is a REPLACE — a destroy plus a
-    create, which the guard denies for every resource in the stack."""
+    """`size` is immutable, so changing it is a REPLACE (a destroy plus a
+    create), which the guard denies for every resource in the stack."""
     engine = _engine()
     assert is_successful(_apply(engine, _stacked("prod", 1)))
 
@@ -280,7 +281,7 @@ def test_require_secret_refs_accepts_a_handle() -> None:
 
 def test_require_secret_refs_rejects_a_literal() -> None:
     """A literal puts the plaintext in the config, the IR, state, and the
-    artifact — the three places SecretRef exists to keep it out of."""
+    artifact: the places SecretRef exists to keep it out of."""
     result = _secret_check(Bucket("b", bucket_name="n", token="hunter2"))
     assert not result.passed
     assert "token" in result.message and "SecretRef" in result.message
@@ -338,3 +339,62 @@ def test_enforce_types_empty_is_refused() -> None:
     result = engine.plan(src, extra_globals=GLOBALS)
     assert not is_successful(result)
     assert isinstance(result.failure(), PolicyConfigError)
+
+
+# -- a non-string policy name ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("arg", "expected"),
+    [
+        ("lambda: 1", "policy name must be a string, got function <lambda>"),
+        ("f", "policy name must be a string, got function <function f>"),
+        ("123", "policy name must be a string, got int 123"),
+        ("['a', 1]", "policy name must be a string, got list ['a', 1]"),
+    ],
+)
+def test_enforce_refuses_a_non_string_name_with_a_stable_message(arg: str, expected: str) -> None:
+    """Refused where the binding is made, not at plan time as an "unknown policy"
+    whose text embeds a function's memory address (or an unhashable lookup)."""
+    src = _ENFORCE + f"def f():\n    return 1\nenforce({arg})\nThing('a', size=1)\n"
+    messages = []
+    for _ in range(2):
+        result = _engine().plan(src, extra_globals=GLOBALS)
+        assert not is_successful(result)
+        error = result.failure()
+        assert isinstance(error, PolicyConfigError)
+        messages.append(str(error))
+    assert messages == [expected, expected]
+    assert "0x" not in expected and "Closure" not in expected
+
+
+def test_policy_decorator_refuses_a_non_string_name() -> None:
+    with pytest.raises(PolicyConfigError, match=r"^policy name must be a string, got int 5$"):
+        policy(5)  # type: ignore[arg-type]
+
+
+def test_unknown_policy_names_a_non_string_without_its_address() -> None:
+    """A binding built outside `enforce` still reaches the registry by name."""
+
+    def check(ctx: PolicyContext) -> PolicyResult:
+        return PolicyResult.ok()
+
+    ctx = PolicyContext("i", Action.CREATE, "d", None)
+    with pytest.raises(RegistryError) as raised:
+        default_policy_registry().evaluate(check, ctx)  # type: ignore[arg-type]
+    assert str(raised.value) == "unknown policy <function check>"
+
+
+def test_unknown_policy_text_for_a_string_is_unchanged() -> None:
+    ctx = PolicyContext("i", Action.CREATE, "d", None)
+    with pytest.raises(RegistryError) as raised:
+        default_policy_registry().evaluate("nope", ctx)
+    assert str(raised.value) == "unknown policy 'nope'"
+
+
+def test_malformed_policy_argument_names_a_function_by_its_type_word() -> None:
+    with pytest.raises(PolicyConfigError) as raised:
+        _tags_check({"keys": lambda: 1})(env="dev")
+    assert str(raised.value) == (
+        "require-tags: `keys` must be a name or a list of them, got function"
+    )

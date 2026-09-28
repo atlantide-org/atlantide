@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import json
-from typing import Any
-
-from typing_extensions import override
+from typing import Any, override
 
 from atlantide.providers.aws.handlers.base import (
     AwsHandler,
+    Client,
     create_or_adopt,
     sync_tags,
 )
@@ -22,33 +21,34 @@ class SqsQueueHandler(AwsHandler[SqsQueue]):
     resource_type = SqsQueue
 
     @override
-    def create(self, client: Any, res: SqsQueue) -> dict[str, Any]:
+    def create(self, client: Client, res: SqsQueue) -> dict[str, Any]:
         def make() -> dict[str, Any]:
             resp = client.create_queue(
                 QueueName=_queue_name(res), Attributes=_attributes(res), tags=res.tags or {}
             )
             return self._outputs(client, resp["QueueUrl"])
 
-        def read() -> dict[str, Any] | None:
-            url = self._url(client, res)
-            return None if url is None else self._outputs(client, url)
+        def adopt() -> dict[str, Any] | None:
+            if self._url(client, res) is None:
+                return None
+            # The live queue carries whatever settings it was created with;
+            # the update path makes its attributes and tags match config.
+            return self.update(client, {}, res)
 
-        # A re-run create whose attributes differ from the live queue's answers
-        # QueueAlreadyExists rather than returning the URL; adopt by name, as
-        # every other named-resource handler does.
-        return create_or_adopt(make, read)
+        # A create whose attributes differ from the live queue's raises
+        # QueueAlreadyExists instead of returning the URL, so adopt by name.
+        return create_or_adopt(make, adopt)
 
     @override
-    def read(self, client: Any, res: SqsQueue) -> dict[str, Any] | None:
+    def read(self, client: Client, res: SqsQueue) -> dict[str, Any] | None:
         url = self._url(client, res)
         if url is None:
             return None
         live = client.get_queue_attributes(QueueUrl=url, AttributeNames=["All"]).get(
             "Attributes", {}
         )
-        # SQS reports every attribute as a string, so the numeric ones are
-        # converted back — otherwise every comparison sees "30" against 30 and
-        # reports drift that is not there.
+        # SQS reports every attribute as a string; numeric ones are converted so
+        # "30" does not compare unequal to 30 and report drift.
         observed: dict[str, Any] = dict(self._outputs(client, url))
         for field, key in (
             ("visibility_timeout", "VisibilityTimeout"),
@@ -66,18 +66,16 @@ class SqsQueueHandler(AwsHandler[SqsQueue]):
         return observed
 
     @override
-    def update(self, client: Any, prior: dict[str, Any], res: SqsQueue) -> dict[str, Any]:
+    def update(self, client: Client, prior: dict[str, Any], res: SqsQueue) -> dict[str, Any]:
         url = self._url(client, res)
-        if url is None:  # update runs only on an existing queue
+        if url is None:
             raise not_found(res, "update", f"(queue {_queue_name(res)!r})")
-        # `FifoQueue` is immutable, so it is excluded here: sending it again is
-        # an error even when the value is unchanged.
+        # `FifoQueue` is immutable: sending it again is an error even when unchanged.
         mutable_attributes = {
             key: value for key, value in _attributes(res).items() if key != "FifoQueue"
         }
-        # SQS leaves an *omitted* attribute untouched, so removing the redrive
-        # policy or KMS key from config can never converge unless the empty
-        # string is sent explicitly to clear it.
+        # SQS leaves an *omitted* attribute untouched, so clearing the redrive
+        # policy or KMS key requires sending the empty string explicitly.
         if res.dead_letter_target_arn is None:
             mutable_attributes["RedrivePolicy"] = ""
         if res.kms_key_id is None:
@@ -92,20 +90,20 @@ class SqsQueueHandler(AwsHandler[SqsQueue]):
         return self._outputs(client, url)
 
     @override
-    def delete(self, client: Any, res: SqsQueue) -> None:
+    def delete(self, client: Client, res: SqsQueue) -> None:
         url = self._url(client, res)
         if url is not None:
             client.delete_queue(QueueUrl=url)
 
     @staticmethod
-    def _url(client: Any, res: SqsQueue) -> str | None:
+    def _url(client: Client, res: SqsQueue) -> str | None:
         try:
             return str(client.get_queue_url(QueueName=_queue_name(res))["QueueUrl"])
         except client.exceptions.QueueDoesNotExist:
             return None
 
     @staticmethod
-    def _outputs(client: Any, url: str) -> dict[str, Any]:
+    def _outputs(client: Client, url: str) -> dict[str, Any]:
         attrs = client.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])
         return {"url": url, "arn": attrs["Attributes"]["QueueArn"]}
 
@@ -122,8 +120,7 @@ def _attributes(res: SqsQueue) -> dict[str, str]:
     if res.kms_key_id is not None:
         attributes["KmsMasterKeyId"] = res.kms_key_id
     if res.dead_letter_target_arn is not None:
-        # A JSON string inside the attribute map, which is SQS's shape rather
-        # than ours.
+        # SQS expects the redrive policy as a JSON string inside the attribute map.
         attributes["RedrivePolicy"] = json.dumps(
             {
                 "deadLetterTargetArn": res.dead_letter_target_arn,

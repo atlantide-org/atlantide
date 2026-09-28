@@ -1,8 +1,8 @@
 """Marker predicates: `is_ref_marker` is strict so parsers never see bad shapes.
 
-A dict that merely carries a ``$ref`` key is data unless its value can actually
-split into ``node_id#attr`` — otherwise ``ref_from_marker`` raises a raw
-``ValueError`` from deep inside the diff or a state migration.
+A dict carrying a ``$ref`` key is data unless its value splits into
+``node_id#attr``; otherwise ``ref_from_marker`` would raise a raw ``ValueError``
+from deep inside the diff or a state migration.
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ def test_a_well_formed_marker_still_parses() -> None:
 
 
 def test_remap_passes_a_hashless_ref_key_through_as_data() -> None:
-    """The rename migration walks whole state trees; a user value that happens to
-    carry the key must ride through untouched rather than crash the migration."""
+    """The rename migration walks whole state trees; a user value carrying the key
+    must pass through untouched instead of crashing the migration."""
     value = {"outer": {"$ref": "no-hash"}, "real": {"$ref": "old#attr"}}
     remapped = remap_refs(value, {"old": "new", "no-hash": "clobbered"})
     assert remapped == {"outer": {"$ref": "no-hash"}, "real": {"$ref": "new#attr"}}

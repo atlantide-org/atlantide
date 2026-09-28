@@ -57,7 +57,7 @@ async def test_stack_reference_resolves_committed_output(tmp_path: Path) -> None
 
 
 async def test_plan_fails_when_referenced_stack_output_missing(tmp_path: Path) -> None:
-    # apply the app stack WITHOUT the network stack -> its output isn't committed
+    # plan the app stack WITHOUT the network stack -> its output isn't committed
     engine = _engine(MemoryStateBackend())
     result = engine.plan(_app_cfg(tmp_path / "app.txt"))
     assert isinstance(result, Failure)

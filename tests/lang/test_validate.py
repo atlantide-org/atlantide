@@ -33,7 +33,7 @@ REJECTED = [
 ]
 
 
-@pytest.mark.parametrize("name, source", REJECTED, ids=[n for n, _ in REJECTED])
+@pytest.mark.parametrize(("name", "source"), REJECTED, ids=[n for n, _ in REJECTED])
 def test_rejected_constructs(name: str, source: str) -> None:
     result = validate_source(source)
     assert not is_successful(result), f"{name} should be rejected"
@@ -47,7 +47,7 @@ ACCEPTED = [
     "name = f'hello-{1 + 1}'",
     "from atlantide.core import Ref",
     # A published component mounts under this namespace; the sandbox must admit it
-    # with no change (that is what makes the whole scheme work).
+    # with no change.
     "from atlantide.components.acme import SecureBucket",
     "import atlantide",
     "d = {k: v for k, v in [('a', 1)]}",
@@ -69,7 +69,7 @@ def test_error_carries_position() -> None:
 
 
 @pytest.mark.parametrize(
-    "source, needle",
+    ("source", "needle"),
     [
         ("while True:\n    pass", "bounded `for`"),
         ("class Foo:\n    pass", "provider"),
@@ -91,7 +91,7 @@ def test_syntax_error_is_language_error() -> None:
 
 # -- the one class config may declare --------------------------------------
 #
-# `ClassDef` is still absent from `_ALLOWED_NODES`: it is not a permitted node,
+# `ClassDef` is absent from `_ALLOWED_NODES`: it is not a permitted node,
 # only a permitted shape. Everything below is what that shape excludes.
 
 _SCHEMA = "from atlantide.core import EnvSchema\n"
@@ -123,7 +123,7 @@ SCHEMA_REJECTED = [
 ]
 
 
-@pytest.mark.parametrize("name, body", SCHEMA_REJECTED, ids=[n for n, _ in SCHEMA_REJECTED])
+@pytest.mark.parametrize(("name", "body"), SCHEMA_REJECTED, ids=[n for n, _ in SCHEMA_REJECTED])
 def test_schema_class_shape_is_enforced(name: str, body: str) -> None:
     result = validate_source(_SCHEMA + body)
     assert not is_successful(result), f"{name} should be rejected"
@@ -149,7 +149,7 @@ def test_schema_class_shapes_that_are_allowed(body: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "body, needle",
+    ("body", "needle"),
     [
         ("class A:\n    x: str", "EnvSchema"),
         ("class A(EnvSchema):\n    def f(self):\n        return 1", "data, no behaviour"),

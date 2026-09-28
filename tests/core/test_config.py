@@ -180,7 +180,8 @@ def test_an_envview_carries_no_instance_dict() -> None:
 def test_a_dunder_miss_is_an_attributeerror_not_a_languageerror() -> None:
     """Python probes dunders to discover protocols (copy, pickle, rich) and
     expects a miss to be an AttributeError; a LanguageError would crash the
-    probe. Config authors cannot reach a dunder — validate.py rejects it."""
+    probe. Config authors cannot reach a dunder — `atlantide.lang.validate`
+    rejects it."""
     env = Config(envs={"dev": {"region": "a"}}).env("dev")
     with pytest.raises(AttributeError):
         _ = env.__deepcopy__
@@ -190,8 +191,8 @@ def test_a_dunder_miss_is_an_attributeerror_not_a_languageerror() -> None:
 # -- EnvSchema, as ordinary Python -------------------------------------------
 #
 # The interpreter builds these classes with `type()`, but `__init_subclass__`
-# does the work either way — so the semantics are pinned here, without the
-# interpreter in the picture.
+# does the work either way, so the semantics are pinned here without the
+# interpreter.
 
 
 class AppEnv(EnvSchema):
@@ -233,7 +234,7 @@ def test_a_declared_class_validates_exactly_like_a_var_schema() -> None:
 
 
 def test_a_typo_on_a_declared_class_names_the_environment() -> None:
-    """What a generated dataclass would have answered with a bare AttributeError."""
+    """A generated dataclass would answer this with a bare AttributeError."""
     env = Config(AppEnv, envs={"dev": {"region": "r"}}).env("dev")
     with pytest.raises(LanguageError) as exc:
         _ = env.pirce_class

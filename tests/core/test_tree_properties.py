@@ -1,19 +1,15 @@
 """Laws the property-value walkers must satisfy for any tree.
 
-``core/_tree`` had no test file. It is the lowest layer in the package and every
-hash, every dependency edge and every canonical form is built on it, but it was
-only ever exercised through whatever the suites above happened to walk — so its
-guarantees were incidental rather than stated.
+``core/_tree`` is the lowest layer in the package: every hash, dependency edge
+and canonical form is built on it. These laws state its guarantees directly
+instead of relying on whatever the suites above happen to walk.
 
-The walkers were refactored recently: ``tree_any`` and ``tree_collect`` used to
-carry a five-branch container ladder each, and now share one ``_children``
-helper. That refactor was verified by "the suite still passes", which is a much
-weaker claim than the ones below, and it is exactly the kind of change these laws
-exist to make safe.
+``tree_any`` and ``tree_collect`` share one ``_children`` helper; these laws are
+what make a change to it safe.
 
-Generated rather than enumerated because the interesting inputs are *shapes* —
-a ``Ref`` three levels down inside a nested model inside a tuple inside a dict —
-and nobody writes those by hand.
+Generated rather than enumerated because the interesting inputs are *shapes*
+(a ``Ref`` three levels down inside a nested model inside a tuple inside a dict)
+that are impractical to write by hand.
 """
 
 from __future__ import annotations
@@ -41,10 +37,8 @@ def _is_ref(value: object) -> bool:
 def test_any_and_collect_answer_the_same_question(tree: object) -> None:
     """`tree_any` is "is there one?"; `tree_collect` is "which ones?".
 
-    They share `_children`, so this is the law that pins them together: a
-    container one walker descends into and the other does not shows up here and
-    nowhere else. Before the refactor they had two copies of that logic and
-    nothing checked the copies agreed.
+    They share `_children`, so this law pins them together: a container one
+    walker descends into and the other does not shows up here and nowhere else.
     """
     assert tree_any(tree, _is_ref) == bool(tree_collect(tree, _is_ref))
 
@@ -73,12 +67,10 @@ def test_a_predicate_matching_nothing_finds_nothing(tree: object) -> None:
 def _refs_by_hand(value: object) -> list[Ref]:
     """Every `Ref` in a generated tree, found without using the code under test.
 
-    An oracle, not a convenience. The obvious phrasing of the property below —
-    "wrapping a tree in a dict finds the same refs" — compares the walker to
-    *itself*, so a walker that stops at a nested model agrees with itself
-    perfectly and the property passes while the bug is live. That is not
-    hypothetical: it is what the first version of this test did, and a mutation
-    that removed model descent sailed through it.
+    An oracle: the obvious phrasing of the property below ("wrapping a tree in a
+    dict finds the same refs") compares the walker to *itself*, so a walker that
+    stops at a nested model agrees with itself and the property passes while the
+    bug is live.
 
     Knows only the shapes `property_trees` builds.
     """
@@ -97,11 +89,9 @@ def _refs_by_hand(value: object) -> list[Ref]:
 
 @given(property_trees())
 def test_every_ref_in_the_tree_is_found(tree: object) -> None:
-    """The case that motivates the whole module.
-
-    A `Ref` inside a `Transform`'s operands or inside a nested pydantic model —
-    an `SgRule`, a `Route` — is what makes a resource depend on another. A walker
-    that stopped at either boundary would drop the edge silently, and the graph
+    """A `Ref` inside a `Transform`'s operands or a nested pydantic model (an
+    `SgRule`, a `Route`) is what makes a resource depend on another. A walker
+    that stopped at either boundary would silently drop the edge, and the graph
     would apply in the wrong order.
     """
     assert sorted(map(repr, tree_collect(tree, _is_ref))) == sorted(map(repr, _refs_by_hand(tree)))
@@ -109,9 +99,9 @@ def test_every_ref_in_the_tree_is_found(tree: object) -> None:
 
 @given(property_trees())
 def test_wrapping_a_tree_does_not_change_what_is_in_it(tree: object) -> None:
-    """Depth is not supposed to matter. Weaker than the law above on its own —
-    it compares the walker to itself — but it covers the containers the oracle
-    and the walker would have to be wrong about *together*."""
+    """Depth must not matter. Weaker than the law above, since it compares the
+    walker to itself, but it covers containers the oracle and the walker would
+    have to be wrong about *together*."""
     assert tree_collect({"outer": [tree]}, _is_ref) == tree_collect(tree, _is_ref)
 
 
@@ -128,9 +118,8 @@ def test_sets_are_walked_only_when_asked(members: frozenset[int]) -> None:
 
 @given(property_trees())
 def test_mapping_with_identity_is_idempotent(tree: object) -> None:
-    """Whatever `tree_map` does to shape it must do once, not once per pass —
-    otherwise a value's canonical form would depend on how many times it had been
-    through, and the content hash with it."""
+    """`tree_map` must reshape a value once, not once per pass; otherwise its
+    canonical form, and the content hash, would depend on the number of passes."""
     once = tree_map(tree, lambda v: v)
     twice = tree_map(once, lambda v: v)
 
@@ -141,8 +130,7 @@ def test_mapping_with_identity_is_idempotent(tree: object) -> None:
 def test_a_set_never_survives_mapping(tree: object) -> None:
     """Emitting a set is never correct: it is not JSON-serializable and its
     iteration order varies with `PYTHONHASHSEED`, which would make the content
-    hash — the thing the whole product promises is stable — depend on the
-    interpreter's startup randomness.
+    hash depend on the interpreter's startup randomness.
     """
     assert not _contains_set(tree_map(tree, lambda v: v))
 
@@ -159,18 +147,17 @@ def _contains_set(value: object) -> bool:
 
 @given(st.frozensets(st.integers() | st.text(max_size=4), min_size=2, max_size=6))
 def test_a_mapped_set_comes_back_ordered(members: frozenset[object]) -> None:
-    """Lowering a set is only half the job; the resulting list has to be *sorted*.
+    """Lowering a set must also *sort* the resulting list.
 
     Set iteration order varies with `PYTHONHASHSEED`, so an unsorted lowering
-    produces a different list — and therefore a different content hash — from one
-    interpreter to the next, for a config nobody edited.
+    produces a different list, and a different content hash, from one
+    interpreter to the next for an unedited config.
 
     Asserted on a set passed in directly rather than found inside a generated
     tree: once mapped, a list that came from a set is indistinguishable from one
-    that was always a list, so the ordering can only be checked where the input
-    is known to have been a set. The first version of this test compared
-    `tree_map(t) == tree_map(t)`, which is a tautology for a pure function and
-    let a mutation that removed the `sorted()` pass untouched.
+    that was always a list, so ordering can only be checked where the input is
+    known to be a set. Comparing `tree_map(t) == tree_map(t)` instead is a
+    tautology for a pure function and would not catch a missing `sorted()` pass.
     """
     keys = [order_key(item) for item in tree_map(members, lambda v: v)]
 
@@ -181,16 +168,16 @@ def test_a_mapped_set_comes_back_ordered(members: frozenset[object]) -> None:
 def test_canonicalizing_leaves_no_live_handle_anywhere(tree: object) -> None:
     """The product-level guarantee the walkers exist to provide.
 
-    A `Ref` reaches its marker form two different ways — by descent for one
-    inside a container, and via `Transform.canonical()` for one inside a
-    transform's arguments, since a `Transform` is itself a handle and is replaced
-    whole rather than walked into. Both paths have to end with no live object
-    left, or a `Ref` gets serialized into the IR as whatever pydantic makes of it
-    instead of as `{"$ref": ...}`.
+    A `Ref` reaches its marker form two ways: by descent for one inside a
+    container, and via `Transform.canonical()` for one inside a transform's
+    arguments, since a `Transform` is itself a handle and is replaced whole
+    rather than walked into. Both paths must leave no live object, or a `Ref` is
+    serialized into the IR as whatever pydantic makes of it instead of as
+    `{"$ref": ...}`.
 
-    Asserted against `canonicalize` rather than `tree_map` for that reason: with
-    an arbitrary leaf function the two are legitimately asymmetric, and pinning
-    that asymmetry would pin an implementation detail rather than a promise.
+    Asserted against `canonicalize` rather than `tree_map`: with an arbitrary
+    leaf function the two paths are legitimately asymmetric, and pinning that
+    asymmetry would pin an implementation detail rather than a promise.
     """
     canonical = canonicalize(tree)
 
@@ -212,8 +199,8 @@ def test_stringifying_keys_preserves_every_entry(mapping: dict[int, int]) -> Non
 
 
 def test_a_key_collision_is_refused_rather_than_silently_dropped() -> None:
-    """`1` and `"1"` both encode as `"1"`. Keeping one is data loss the run would
-    never mention again."""
+    """`1` and `"1"` both encode as `"1"`; keeping only one would be silent data
+    loss."""
     with pytest.raises(IRError, match="must be distinct"):
         tree_map({1: "a", "1": "b"}, lambda v: v, stringify_keys=True)
 

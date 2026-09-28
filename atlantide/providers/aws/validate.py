@@ -3,8 +3,8 @@
 A :data:`Validator` maps a string to an error message, or ``None`` when valid.
 Compose primitives with :func:`all_of` and call :func:`check` from a resource's
 pydantic ``model_validator``, so a bad value is reported during ``plan`` instead
-of mid-``apply``. Fields holding an unresolved ``Ref`` are skipped by
-:func:`check` (only ``str`` is validated).
+of mid-``apply``. :func:`check` validates only ``str`` values, so an unresolved
+``Ref`` is skipped.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import re
 from collections.abc import Callable, Iterable
 
 #: A check on a concrete string value: returns an error message, or None if valid.
-Validator = Callable[[str], str | None]
+type Validator = Callable[[str], str | None]
 
 
 def check(value: object, validator: Validator) -> None:
@@ -23,7 +23,7 @@ def check(value: object, validator: Validator) -> None:
 
 
 def all_of(*validators: Validator) -> Validator:
-    """Run validators in order; the first error wins (short-circuits)."""
+    """Run validators in order and return the first error."""
 
     def run(value: str) -> str | None:
         for validator in validators:
@@ -35,10 +35,14 @@ def all_of(*validators: Validator) -> Validator:
 
 
 def matches(pattern: re.Pattern[str], label: str, requirement: str) -> Validator:
-    """Value must match ``pattern``; ``requirement`` describes the rule for the error."""
+    """The whole value must match ``pattern``; ``requirement`` describes the rule.
+
+    Uses ``fullmatch``: with ``match``, a ``$`` anchor also matches before a trailing
+    newline, so ``"name\\n"`` would pass.
+    """
 
     def run(value: str) -> str | None:
-        return None if pattern.match(value) else f"invalid {label} {value!r}: {requirement}"
+        return None if pattern.fullmatch(value) else f"invalid {label} {value!r}: {requirement}"
 
     return run
 
@@ -86,28 +90,25 @@ _LABEL = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
 
 #: A dotted name of two or more labels, optionally wildcarded (``*.example.com``,
 #: which ACM accepts) and optionally fully qualified with a trailing dot (which
-#: Route53 accepts). Two labels are the minimum that makes it a *domain* rather
-#: than a bare word — which is the shape a composed ``name_prefix`` produces.
-_DOMAIN = re.compile(rf"^(?:\*\.)?{_LABEL}(?:\.{_LABEL})+\.?$")
+#: Route53 accepts). The two-label minimum rejects a bare word, the shape a name
+#: composed from ``name_prefix`` has.
+_DOMAIN = re.compile(rf"(?:\*\.)?{_LABEL}(?:\.{_LABEL})+\.?")
 
 
 def domain_name(label: str = "domain name") -> Validator:
     """A dotted DNS name, e.g. ``example.com``, ``*.example.com``, ``example.com.``.
 
-    Worth checking rather than leaving to AWS, because the value can arrive
-    without anyone having typed it: a resource whose name field is
-    ``physical_name`` and omitted under a ``name_prefix`` stack has one composed
-    for it (``{prefix}-{name}-{stack}``), and that composition is a perfectly good
-    *resource* name and never a domain. Caught at plan, it names the field; left
-    to apply, it is an ACM or Route53 error about a name the config does not
-    contain.
+    Checked at plan because the value may be composed: a ``physical_name`` field
+    omitted under a ``name_prefix`` stack becomes ``{prefix}-{name}-{stack}``, which is
+    not a domain. At apply, the same value fails with an ACM or Route53 error about a
+    name absent from the config.
     """
     pattern = _DOMAIN
 
     def run(value: str) -> str | None:
         if len(value) > 253:
             return f"{label} {value!r} exceeds the 253-character limit"
-        if not pattern.match(value):
+        if not pattern.fullmatch(value):
             return (
                 f"invalid {label} {value!r}: expected a dotted name such as "
                 f"'example.com' (a name composed from a stack's name_prefix is not one)"
@@ -118,11 +119,15 @@ def domain_name(label: str = "domain name") -> Validator:
 
 
 def ipv4_cidr(label: str = "CIDR") -> Validator:
-    """An ``A.B.C.D/M`` block with octets 0-255 and a 0-32 prefix."""
-    pattern = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}/(?:\d|[12]\d|3[0-2])$")
+    """An ``A.B.C.D/M`` block with octets 0-255 and a 0-32 prefix.
+
+    ASCII digits only: ``\\d`` also matches other scripts' digits, which ``int``
+    accepts but AWS does not.
+    """
+    pattern = re.compile(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}/(?:[0-9]|[12][0-9]|3[0-2])")
 
     def run(value: str) -> str | None:
-        if not pattern.match(value):
+        if not pattern.fullmatch(value):
             return f"invalid {label} {value!r}: expected A.B.C.D/M form"
         address = value.split("/", 1)[0]
         if any(int(octet) > 255 for octet in address.split(".")):

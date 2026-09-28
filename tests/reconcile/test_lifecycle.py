@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from atlantide.engine import Engine
 from atlantide.ir import lower
 from atlantide.ir.model import IRNode
 from atlantide.lang import evaluate_source
-from atlantide.reconcile import Action, Change, ChangeSet
+from atlantide.reconcile import Action, Change, ChangeSet, type_mutability
+from atlantide.reconcile.ordering import resolve_cbd
 from atlantide.state import MemoryStateBackend, StateNode
-from tests.support import Server, engine_for
+from tests.support import Server, types_of
 
 from .conftest import GLOBALS, Harness
 
@@ -25,7 +25,7 @@ def test_ignore_changes_makes_a_changed_field_a_noop(tmp_path: object) -> None:
     h.fake().reset()
     report = h.apply(f"Box('a', size=1, label='y', {lc})\n")
     assert report.noop == [A]  # label drift ignored -> Merkle NOOP
-    assert h.fake().calls == []  # no provider touch
+    assert h.fake().calls == []
 
 
 def test_without_ignore_changes_the_same_edit_updates(tmp_path: object) -> None:
@@ -43,11 +43,10 @@ def test_cbd_replace_creates_before_destroying(tmp_path: object) -> None:
     h = Harness(MemoryStateBackend())
     h.apply("Box('a', size=1)\n")
     h.fake().reset()
-    # size is immutable -> REPLACE; the identity (immutable size) changes, so CBD
-    # is safe. Executor creates the new resource before deleting the old.
+    # size is immutable -> REPLACE; the identity changes, so CBD is safe.
     report = h.apply("Box('a', size=2, lifecycle=Lifecycle(create_before_destroy=True))\n")
     assert report.replaced == [A]
-    assert h.fake().calls == [("create", "a"), ("delete", "a")]  # create BEFORE delete
+    assert h.fake().calls == [("create", "a"), ("delete", "a")]
     node = h.backend.load().get(A)
     assert node is not None
     assert node.outputs == {"out": "a:2"}
@@ -57,16 +56,18 @@ def test_default_replace_is_destroy_before_create(tmp_path: object) -> None:
     h = Harness(MemoryStateBackend())
     h.apply("Box('a', size=1)\n")
     h.fake().reset()
-    report = h.apply("Box('a', size=2)\n")  # no CBD
+    report = h.apply("Box('a', size=2)\n")
     assert report.replaced == [A]
-    assert h.fake().calls == [("delete", "a"), ("create", "a")]  # delete BEFORE create
+    assert h.fake().calls == [("delete", "a"), ("create", "a")]
 
 
 # -- collision guard (engine downgrades CBD -> DBC when identity is unchanged) --
 
 
-def _engine() -> Engine:
-    return engine_for(Server)
+def _resolve_cbd(changeset: ChangeSet) -> tuple[ChangeSet, tuple[str, ...]]:
+    """What the planner runs over the diff, with the types an engine for ``Server`` has."""
+    types = types_of(Server)
+    return resolve_cbd(changeset, types=types, mutability=type_mutability(types)).unwrap()
 
 
 def _replace_change(*, name_desired: str, name_prior: str) -> Change:
@@ -99,10 +100,10 @@ def _replace_change(*, name_desired: str, name_prior: str) -> Change:
 
 
 def test_cbd_downgraded_when_physical_name_unchanged() -> None:
-    # zone changed but the physical name is the same -> the replacement would
-    # collide with the old resource -> fall back to destroy-before-create.
+    # Same physical name: the replacement would collide with the old resource,
+    # so fall back to destroy-before-create.
     change = _replace_change(name_desired="web", name_prior="web")
-    resolved, warnings = _engine()._planner._resolve_cbd(ChangeSet((change,)))
+    resolved, warnings = _resolve_cbd(ChangeSet((change,)))
     assert resolved.changes[0].create_before_destroy is False
     assert len(warnings) == 1
     assert "create_before_destroy not possible" in warnings[0]
@@ -110,7 +111,7 @@ def test_cbd_downgraded_when_physical_name_unchanged() -> None:
 
 def test_cbd_kept_when_physical_name_changes() -> None:
     change = _replace_change(name_desired="web2", name_prior="web")
-    resolved, warnings = _engine()._planner._resolve_cbd(ChangeSet((change,)))
+    resolved, warnings = _resolve_cbd(ChangeSet((change,)))
     assert resolved.changes[0].create_before_destroy is True
     assert warnings == ()
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from moto import mock_aws
@@ -10,9 +11,9 @@ from moto import mock_aws
 from atlantide.cli.project import load_project
 from atlantide.core.errors import LockError, StateError
 from atlantide.state import SqliteStateBackend, StateConfig, make_state_backend
-from atlantide.state.backend import DEFAULT_LOCK_POLICY
 from atlantide.state.factory import DSN_ENV
-from atlantide.state.s3_backend import S3StateBackend
+from atlantide.state.leases import DEFAULT_LOCK_POLICY, DEFAULT_SKEW_MARGIN
+from atlantide.state.s3 import S3StateBackend
 from tests.support import create_state_store, fake_aws_credentials
 
 from .conftest import BUCKET, LOCK_TABLE, REGION
@@ -38,6 +39,54 @@ def test_s3_config_builds_the_s3_backend(tmp_path: Path, monkeypatch: pytest.Mon
         assert isinstance(backend, S3StateBackend)
         assert len(backend.load()) == 0
         backend.close()
+
+
+def test_the_skew_margin_reaches_the_s3_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_aws_credentials(monkeypatch, region=REGION)
+    (tmp_path / "atlantide.toml").write_text(
+        f'[state]\nbackend = "s3"\nbucket = "{BUCKET}"\nkey = "k.json"\n'
+        f'lock_table = "{LOCK_TABLE}"\nregion = "{REGION}"\nlock_skew_margin = 5\n'
+    )
+    config = load_project(tmp_path).state_backend
+    assert config.lock_skew_margin == 5.0
+    backend = make_state_backend(config, tmp_path / "unused.db")
+    assert isinstance(backend, S3StateBackend)
+    assert backend._ctx.skew_margin == 5.0
+
+    default = make_state_backend(
+        StateConfig(backend="s3", bucket=BUCKET, key="k", lock_table=LOCK_TABLE, region=REGION),
+        tmp_path / "unused.db",
+    )
+    assert isinstance(default, S3StateBackend)
+    assert default._ctx.skew_margin == DEFAULT_SKEW_MARGIN
+
+
+def test_the_journal_settings_reach_the_s3_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_aws_credentials(monkeypatch, region=REGION)
+    (tmp_path / "atlantide.toml").write_text(
+        f'[state]\nbackend = "s3"\nbucket = "{BUCKET}"\nkey = "k.json"\n'
+        f'lock_table = "{LOCK_TABLE}"\nregion = "{REGION}"\n'
+        f'journal_table = "heads"\nwrite_concurrency = 4\n'
+    )
+    config = load_project(tmp_path).state_backend
+    backend = make_state_backend(config, tmp_path / "unused.db")
+    assert isinstance(backend, S3StateBackend)
+    assert backend._ctx.heads_table == "heads"
+    assert backend.write_concurrency == 4
+    assert S3StateBackend.write_concurrency == 16, "the override is per instance"
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "true", '"8"', "1.5"])
+def test_a_bad_write_concurrency_is_refused(tmp_path: Path, value: str) -> None:
+    from atlantide.cli.project import ProjectError
+
+    (tmp_path / "atlantide.toml").write_text(f"[state]\nwrite_concurrency = {value}\n")
+    with pytest.raises(ProjectError, match="write_concurrency"):
+        load_project(tmp_path)
 
 
 def test_unknown_backend_is_rejected(tmp_path: Path) -> None:
@@ -70,6 +119,25 @@ def test_postgres_dsn_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch
     )
 
 
+def test_the_skew_margin_reaches_the_postgres_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checked on the constructor call, so no server is needed."""
+    pytest.importorskip("psycopg", reason="postgres tests need the postgres extra")
+    from atlantide.state.sql import postgres
+
+    built: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        postgres,
+        "PostgresStateBackend",
+        lambda dsn, **kwargs: built.append({"dsn": dsn, **kwargs}),
+    )
+    config = StateConfig(backend="postgres", dsn="postgresql://db/x", lock_skew_margin=5.0)
+    make_state_backend(config, tmp_path / "unused.db")
+    make_state_backend(StateConfig(backend="postgres", dsn="postgresql://db/x"), tmp_path / "u.db")
+    assert [call["lock_skew_margin"] for call in built] == [5.0, DEFAULT_SKEW_MARGIN]
+
+
 # -- lease timings ------------------------------------------------------------
 
 
@@ -83,9 +151,8 @@ def test_a_shortened_ttl_drags_the_renew_interval_down_with_it() -> None:
     """Setting only `lock_ttl` must stay valid.
 
     A user shortening the TTL to reclaim dead runs faster would otherwise inherit
-    the default 100s interval against a 30s lease — an interval longer than the
-    thing it renews, so every run would lose its lease and it would read as flaky
-    contention rather than as a misconfiguration.
+    the default 100s renew interval against a 30s lease. Every run would then lose
+    its lease, which reads as flaky contention rather than a misconfiguration.
     """
     policy = StateConfig(lock_ttl=30.0).lock_policy()
     assert policy.ttl == 30.0

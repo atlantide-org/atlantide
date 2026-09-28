@@ -1,57 +1,30 @@
-"""The Engine: orchestrates compile -> plan -> apply/destroy.
+"""The :class:`Engine`: the library entrypoint for compile -> plan -> apply/destroy.
 
-Wires the pure stages (Atlas-lang -> IR -> graph -> Merkle -> diff) to the
-effectful ones (executor, state backend), taking the whole-state lock around any
-mutation. Plan shaping lives in :mod:`atlantide.engine.planner`, artifact
-rehydration in :mod:`atlantide.engine.hydrate`, and locking in
-:mod:`atlantide.engine.locking`.
-
-Two-tier error model: the pure/planning stages surface failure as
-``Result[..., AtlantideError]`` and compose via ``.bind``/``.map``; the async
-execution path raises, and those exceptions are collected into an
-``ExceptionGroup`` at the boundary. Do not convert one to the other.
+A façade: every method delegates to a sibling module (see ``README.md``), and
+every mutation runs under the state lock through
+:meth:`~atlantide.engine.runs.LockedRuns.run_locked`.
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
-from typing import Any, TypeVar
+from collections.abc import Awaitable, Sequence
+from typing import Any, Self, override
 
 from returns.result import Failure, Result, Success
 
-from atlantide.core import (
-    AtlantideError,
-    PolicyViolationError,
-    ProviderRegistry,
-    Resource,
-    ResourceRegistry,
-    field_mutability,
-    inline_stack_outputs,
-)
-from atlantide.core.errors import StateError
+from atlantide.core import AtlantideError, ProviderRegistry, Resource
 from atlantide.core.events import EventSink, no_sink
-from atlantide.core.node_id import stack_of
-from atlantide.engine.drift import raise_drift
-from atlantide.engine.hydrate import assemble_compiled, rehydrate_resources
-from atlantide.engine.locking import (
-    DEFAULT_LOCK_POLICY,
-    LockPolicy,
-    apply_scope,
-    lock_owner,
-    with_lock,
-)
+from atlantide.engine import compiler, selection
+from atlantide.engine.locking import apply_scope, require_no_new_nodes
 from atlantide.engine.model import Compiled, Plan
-from atlantide.engine.planner import Planner, protected_ids
-from atlantide.engine.result import forward_failure, raise_on_failure
-from atlantide.graph import build_graph
-from atlantide.graph.order import topological_order
-from atlantide.graph.select import TargetError, closure, match_targets
-from atlantide.ir import Artifact, build_artifact, lower, verify_hash
-from atlantide.ir.model import IRGraph
-from atlantide.lang import DEFAULT_SURFACE, LanguageSurface, evaluate_source
+from atlantide.engine.planner import Planner, destroy_changeset, raise_drift
+from atlantide.engine.result import catching, forward_failure, raise_on_failure
+from atlantide.engine.runs import LockedRuns, Runner
+from atlantide.ir import Artifact
+from atlantide.lang import DEFAULT_FUEL, DEFAULT_SURFACE, LanguageSurface
 from atlantide.policy import PolicyRegistry, default_policy_registry
 from atlantide.reconcile import (
-    ApplyEnv,
+    AdoptOptions,
     ApplyReport,
     ChangeSet,
     Desired,
@@ -62,26 +35,18 @@ from atlantide.reconcile import (
     ProgressCallback,
     RefreshProgress,
     adopt,
-    alias_remap,
-    diff,
     identity_fields,
-    persist_migration,
-    plan,
     refresh,
     resolve_aliases,
-    restrict,
+    type_mutability,
 )
-from atlantide.reconcile import apply as _run_changeset
-from atlantide.reconcile.context import DEFAULT_NODE_TIMEOUT, state_digraph
+from atlantide.reconcile.env import DEFAULT_NODE_TIMEOUT
 from atlantide.secrets import SecretsRegistry
-from atlantide.state import StateGraph
-from atlantide.state.backend import LeaseGuard, StateBackend
-
-_T = TypeVar("_T")
+from atlantide.state import DEFAULT_LOCK_POLICY, LockPolicy, StateBackend, StateGraph
 
 
 class Engine:
-    def __init__(
+    def __init__(  # noqa: PLR0913 - public API: keyword-only engine options
         self,
         providers: ProviderRegistry,
         backend: StateBackend,
@@ -93,6 +58,7 @@ class Engine:
         lock_policy: LockPolicy = DEFAULT_LOCK_POLICY,
         node_timeout: float = DEFAULT_NODE_TIMEOUT,
         surface: LanguageSurface = DEFAULT_SURFACE,
+        fuel: int = DEFAULT_FUEL,
     ) -> None:
         self.providers = providers
         self.backend = backend
@@ -100,30 +66,33 @@ class Engine:
         self.parallelism = parallelism
         self.lock_policy = lock_policy
         self.node_timeout = node_timeout
-        # Which modules config may import — widened by installed provider plugins.
+        # Modules config may import; installed provider plugins widen it.
         self.surface = surface
+        # Evaluation step budget for every compile. It never changes what a
+        # successful compile produces, only whether a large or runaway config finishes.
+        self.fuel = fuel
         # Where run events go, and what identifies this run in them. Both are set
         # per locked run; an unlocked or embedded caller gets a discarding sink.
         self.events: EventSink = no_sink
         self.run_id = ""
-        # The lease held by the run currently under `_locked`, handed to the
-        # executor by `_env` as a write guard. Replaced per locked run; the default
-        # holds no lease and never refuses, which is what the unlocked paths (a
-        # read-only refresh, an embedding caller) want.
-        self._lease = LeaseGuard(grace=lock_policy.renew_grace)
         self.policies = policies if policies is not None else default_policy_registry()
         # An empty registry suffices until a config declares a secret; sealing a
         # concrete sensitive value then requires a configured provider.
         self.secrets = secrets if secrets is not None else SecretsRegistry()
-        self.mutability = {name: field_mutability(cls) for name, cls in types.items()}
+        self.mutability = type_mutability(types)
         self._planner = Planner(
             mutability=self.mutability,
             types=self.types,
             secrets=self.secrets,
             policies=self.policies,
         )
+        self._runs = LockedRuns(self)
 
-    def __enter__(self) -> Engine:
+    @override
+    def __repr__(self) -> str:
+        return f"Engine(backend={self.backend!r}, parallelism={self.parallelism!r})"
+
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -142,32 +111,15 @@ class Engine:
         extra_globals: dict[str, Any] | None = None,
     ) -> Result[Compiled, AtlantideError]:
         """Evaluate Atlas-lang source into a :class:`Compiled` (IR, graph, hashes)."""
-        evaluated = evaluate_source(
+        return compiler.compile_source(
             source,
             filename,
+            providers=self.providers,
+            surface=self.surface,
+            fuel=self.fuel,
             inputs=inputs,
             envs=envs,
             extra_globals=extra_globals,
-            surface=self.surface,
-        )
-        return evaluated.bind(self._compile_registry)
-
-    def _compile_registry(self, registry: ResourceRegistry) -> Result[Compiled, AtlantideError]:
-        try:
-            # Fold in-config cross-stack refs into real graph edges before lowering,
-            # so `refs()` and the resources dict below both see the substituted Refs.
-            registry = inline_stack_outputs(registry)
-        except AtlantideError as exc:
-            return Failure(exc)
-        ir = lower(registry, self.providers)
-        return assemble_compiled(
-            ir,
-            resources={r.node_id: r for r in registry.all()},
-            bindings=registry.policy_bindings,
-            outputs=registry.outputs,
-            inputs=registry.inputs,
-            envs_declared=registry.envs_declared,
-            envs_selected=registry.envs_selected,
         )
 
     def plan(
@@ -187,115 +139,40 @@ class Engine:
         depend on; ``replace`` forces the named ones to be recreated; ``envs``
         narrows it to the named environments of the config's ``Config``.
         """
-        compiled = self.compile(
+        return self.compile(
             source, filename, inputs=inputs, envs=envs, extra_globals=extra_globals
-        )
-        return compiled.bind(
-            lambda built: self._plan_from_compiled(built, targets=targets, replace=replace)
+        ).bind(
+            lambda compiled: self._plan_from_compiled(compiled, targets=targets, replace=replace)
         )
 
     def _plan_from_compiled(
         self,
-        built: Compiled,
+        compiled: Compiled,
         *,
         targets: Sequence[str] = (),
         replace: Sequence[str] = (),
+        prior: StateGraph | None = None,
     ) -> Result[Plan, AtlantideError]:
+        # `prior` is state the caller has already read; otherwise it is loaded here.
         # Map renamed resources (Lifecycle.aliases) onto their existing state
         # nodes before diffing, so a rename is a NOOP rather than destroy+create.
-        migrated, _ = resolve_aliases(self.backend.load(), built.ir)
-        try:
-            selected = self._selection(built, migrated, targets)
-            selected = self._within_envs(built, migrated, selected, targets)
-            forced = self._match_only(built, migrated, replace)
-        except AtlantideError as exc:
-            return Failure(exc)
+        loaded = prior if prior is not None else self.backend.load()
+        migrated, _ = resolve_aliases(loaded, compiled.ir)
+        chosen = catching(lambda: selection.narrowing(compiled, migrated, targets, replace))
+        if isinstance(chosen, Failure):
+            return forward_failure(chosen)
+        selected, forced = chosen.unwrap()
         return self._planner.build(
-            built,
+            compiled,
             migrated,
-            self._stack_outputs(),
+            self._runs.stack_outputs(),
             selected=selected,
             replace=forced,
         )
 
-    @staticmethod
-    def _known_ids(built: Compiled, prior: StateGraph) -> set[str]:
-        """Every node id a pattern may name: the desired graph plus what state holds.
-
-        Ids in state but absent from the desired graph are matchable too — a
-        resource being deleted no longer has a node in the config.
-        """
-        return set(built.graph.node_ids) | set(prior.nodes)
-
-    def _selection(
-        self, built: Compiled, prior: StateGraph, patterns: Sequence[str]
-    ) -> frozenset[str] | None:
-        """Node ids the patterns name, closed over their dependencies.
-
-        ``None`` when nothing was asked for — distinct from an empty set, which
-        would mean "act on nothing".
-        """
-        if not patterns:
-            return None
-        seeds = match_targets(patterns, self._known_ids(built, prior))
-        return closure(built.graph, seeds & set(built.graph.node_ids), reverse=False) | seeds
-
-    def _within_envs(
-        self,
-        built: Compiled,
-        prior: StateGraph,
-        selected: frozenset[str] | None,
-        patterns: Sequence[str],
-    ) -> frozenset[str] | None:
-        """Drop state nodes belonging to a declared-but-unselected environment.
-
-        Under ``--env prod`` the config declares no dev resources, so every dev
-        node in state would otherwise diff as a delete. An unselected
-        environment is out of scope for this run rather than undeclared, so its
-        nodes leave the selection instead of being planned.
-
-        Stacks declared outside ``config.envs()`` — a shared ``common`` — are not
-        in ``envs_declared`` and are unaffected.
-        """
-        excluded = set(built.envs_excluded)
-        if not excluded:
-            return selected
-        in_scope = frozenset(
-            node_id
-            for node_id in self._known_ids(built, prior)
-            if stack_of(node_id) not in excluded
-        )
-        if selected is None:
-            return in_scope
-        narrowed = selected & in_scope
-        if selected and not narrowed:
-            # Named explicitly: otherwise this reads as "--target matched nothing".
-            raise TargetError(
-                f"--target {', '.join(patterns)} matched only resources in "
-                f"environment(s) {', '.join(built.envs_excluded)}, which --env excluded"
-            )
-        return narrowed
-
-    def _match_only(
-        self, built: Compiled, prior: StateGraph, patterns: Sequence[str]
-    ) -> frozenset[str]:
-        """Exactly the node ids the patterns name — no dependency closure.
-
-        ``--replace`` recreates what the operator named and nothing else. Closing
-        over dependencies (what ``--target`` wants) would force-replace the whole
-        upstream tree — a subnet's VPC and everything beside it.
-        """
-        if not patterns:
-            return frozenset()
-        return match_targets(patterns, self._known_ids(built, prior))
-
-    def _stack_outputs(self) -> dict[str, Any]:
-        """Committed cross-stack outputs, with any sealed sensitive value unsealed."""
-        return {k: self.secrets.unseal(v) for k, v in self.backend.outputs().items()}
-
     # -- effectful stages -------------------------------------------------
 
-    async def apply(
+    async def apply(  # noqa: PLR0913 - public API: keyword-only run options
         self,
         source: str,
         filename: str = "<config>",
@@ -312,19 +189,23 @@ class Engine:
         """Compile, plan, and execute the changeset under the state lock.
 
         ``expect`` is the changeset the caller showed a human and had approved.
-        The apply re-diffs once it holds the lease — it has to, or a node another
-        run created in the meantime would still be marked CREATE — so what
-        executes is not necessarily what was approved. Passing ``expect`` turns
-        that difference into a :class:`PlanDriftError` instead of a silent
-        substitution.
+        The apply re-diffs once it holds the lease, so that a node another run
+        created meanwhile is not marked CREATE; what executes may therefore differ
+        from what was approved. Passing ``expect`` turns that difference into a
+        :class:`~atlantide.core.errors.PlanDriftError`.
         """
         compiled = self.compile(
             source, filename, inputs=inputs, envs=envs, extra_globals=extra_globals
         )
         if isinstance(compiled, Failure):
             return forward_failure(compiled)
-        return await self._apply_compiled(
-            compiled.unwrap(), on_failure, progress, expect, targets=targets, replace=replace
+        return await self.apply_compiled(
+            compiled.unwrap(),
+            on_failure=on_failure,
+            progress=progress,
+            expect=expect,
+            targets=targets,
+            replace=replace,
         )
 
     # -- build / deploy (portable artifacts) ------------------------------
@@ -344,21 +225,13 @@ class Engine:
         ``component_pins`` (alias -> resolved commit, from the project's lock) is
         recorded in the artifact as provenance for any published components used.
         """
-        compiled = self.compile(
+        return self.compile(
             source, filename, inputs=inputs, envs=envs, extra_globals=extra_globals
-        )
-        return compiled.map(
-            lambda c: build_artifact(
-                c.ir, c.policy_bindings, c.outputs, component_pins, envs=c.envs_selected
-            )
-        )
+        ).map(lambda compiled: compiler.artifact_of(compiled, component_pins))
 
     def verify_artifact(self, artifact: Artifact) -> Result[None, AtlantideError]:
         """Check the artifact's IR hash and that every pinned provider is compatible."""
-        hashed = verify_hash(artifact)
-        if isinstance(hashed, Failure):
-            return forward_failure(hashed)
-        return self._check_pins(artifact)
+        return compiler.verify_artifact(artifact, self.providers)
 
     async def deploy(
         self,
@@ -367,7 +240,7 @@ class Engine:
         on_failure: OnFailure = "rollback",
         progress: ProgressCallback | None = None,
     ) -> Result[ApplyReport, AtlantideError]:
-        """Apply an artifact directly from its IR — no source, no re-execution.
+        """Apply an artifact directly from its IR, without source or re-execution.
 
         Secrets are references, not values, so a source-less deploy resolves each
         handle from the *target* environment's secrets backend at apply time.
@@ -375,89 +248,67 @@ class Engine:
         verified = self.verify_artifact(artifact)
         if isinstance(verified, Failure):
             return forward_failure(verified)
-        built = self._compiled_from_artifact(artifact)
-        if isinstance(built, Failure):
-            return forward_failure(built)
-        return await self._apply_compiled(built.unwrap(), on_failure, progress)
-
-    def _check_pins(self, artifact: Artifact) -> Result[None, AtlantideError]:
-        for name, version in sorted(artifact.provider_pins.items()):
-            result = self.providers.check_compatible(name, version)
-            if isinstance(result, Failure):
-                return forward_failure(result)
-        return Success(None)
-
-    def _compiled_from_artifact(self, artifact: Artifact) -> Result[Compiled, AtlantideError]:
-        ir = artifact.ir
-        try:
-            resources = rehydrate_resources(ir, self.types)
-        except AtlantideError as exc:
-            return Failure(exc)
-        return assemble_compiled(
-            ir, resources=resources, bindings=artifact.policies, outputs=artifact.outputs
+        compiled = compiler.compiled_from_artifact(artifact, self.types)
+        if isinstance(compiled, Failure):
+            return forward_failure(compiled)
+        return await self.apply_compiled(
+            compiled.unwrap(), on_failure=on_failure, progress=progress
         )
 
-    async def _apply_compiled(
+    async def apply_compiled(
         self,
         compiled: Compiled,
-        on_failure: OnFailure,
+        *,
+        on_failure: OnFailure = "rollback",
         progress: ProgressCallback | None = None,
         expect: ChangeSet | None = None,
         targets: Sequence[str] = (),
         replace: Sequence[str] = (),
     ) -> Result[ApplyReport, AtlantideError]:
+        """:meth:`apply` for a config already compiled, typically the plan's.
+
+        Saves re-evaluating the source when the caller has just planned it (the
+        CLI shows the plan, then applies it). Everything past compilation is
+        identical: the gating plan, the lock, and the re-diff under the lease.
+        Planning only reads a :class:`Compiled`, so reusing one is safe.
+        """
         # The gating plan carries the same narrowing the run will use: judging
         # `prevent_destroy` or a mandatory policy against the *full* changeset
-        # would block a targeted apply for nodes it was never going to touch.
-        planned = self._plan_from_compiled(compiled, targets=targets, replace=replace)
+        # would block a targeted apply for nodes it does not touch. The same read
+        # of state sizes the lock scope.
+        snapshot = self.backend.load()
+        planned = self._plan_from_compiled(
+            compiled, targets=targets, replace=replace, prior=snapshot
+        )
         if isinstance(planned, Failure):
             return forward_failure(planned)
         plan_obj = planned.unwrap()
         # Report a policy denial before taking the lock. This plan's changeset
         # sizes the scope; `run_replanned` computes the one that is executed.
-        blocked = self._runner_for_plan(plan_obj, on_failure, progress)
+        blocked = self._runs.runner_for_plan(plan_obj, on_failure, progress)
         if isinstance(blocked, Failure):  # async boundary: unwrap before awaiting
             return forward_failure(blocked)
         ir = plan_obj.compiled.ir
-        prior = self.backend.load()
-        scope = apply_scope(plan_obj, prior) | frozenset(alias_remap(prior, ir))
+        scope = apply_scope(plan_obj, snapshot)
 
         def run_replanned(prior: StateGraph) -> Awaitable[ApplyReport]:
-            # Re-diff against the state read after the lease was taken: a node
-            # another run created meanwhile is still CREATE in the pre-lock
-            # changeset, and applying that creates a second resource. The re-diff
-            # keeps the same narrowing, so a targeted apply cannot widen once it
-            # holds the lock.
+            # Re-diffed under the lease, against the state `run_locked` read
+            # there: a node another run created meanwhile is still CREATE in the
+            # pre-lock changeset. The re-diff keeps the same narrowing, so a
+            # targeted apply cannot widen once it holds the lock. A row created
+            # meanwhile is outside `scope`, and would otherwise diff as a DELETE
+            # the lease does not cover.
+            require_no_new_nodes(prior, scope, "apply", "re-run apply")
             fresh = raise_on_failure(
-                self._plan_from_compiled(compiled, targets=targets, replace=replace)
+                self._plan_from_compiled(compiled, targets=targets, replace=replace, prior=prior)
             )
             if expect is not None:
                 raise_drift(expect, fresh.changeset)
-            runner = raise_on_failure(self._runner_for_plan(fresh, on_failure, progress))
-            return runner(prior)
+            return raise_on_failure(self._runs.runner_for_plan(fresh, on_failure, progress))(prior)
 
-        return await self._locked(run_replanned, scope, prepare=self._alias_migration(ir))
-
-    def _runner_for_plan(
-        self,
-        plan_obj: Plan,
-        on_failure: OnFailure = "halt",
-        progress: ProgressCallback | None = None,
-    ) -> Result[Callable[[StateGraph], Awaitable[ApplyReport]], AtlantideError]:
-        if plan_obj.blocked:
-            joined = "; ".join(f"{v.policy}: {v.message}" for v in plan_obj.blocked)
-            return Failure(
-                PolicyViolationError(f"policy denied apply: {joined}", list(plan_obj.blocked))
-            )
-        c = plan_obj.compiled
-        desired = Desired(
-            ir=c.ir,
-            graph=c.graph,
-            hashes=c.hashes,
-            resources=c.resources,
-            output_decls=c.outputs,
+        return await self._runs.run_locked(
+            run_replanned, scope, prepare=self._runs.alias_migration(ir)
         )
-        return Success(self._runner(plan_obj.changeset, desired, on_failure, progress))
 
     async def destroy(
         self,
@@ -467,73 +318,46 @@ class Engine:
     ) -> Result[ApplyReport, AtlantideError]:
         """Destroy everything in state, or only ``targets`` and their dependents.
 
-        A targeted destroy closes over *dependents*, not dependencies: removing a
-        VPC means removing what still points at it. The opposite closure would
-        destroy the things the target is built from and leave the target itself
-        dangling.
+        A targeted destroy closes over dependents, not dependencies: removing a
+        VPC also removes what still points at it.
         """
         prior = self.backend.load()
-        empty = IRGraph(nodes=())
-        empty_graph = build_graph(empty).unwrap()  # empty IR is acyclic
-        desired = Desired(ir=empty, graph=empty_graph, hashes={}, resources={})
-
-        def changeset_for(state: StateGraph) -> Result[ChangeSet, AtlantideError]:
-            changes = diff(empty, {}, state, self.mutability)
-            if targets:
-                try:
-                    changes = restrict(changes, self._destroy_selection(state, targets))
-                except AtlantideError as exc:
-                    return Failure(exc)
-            return plan(changes, protected_ids(state))
-
         # Validate patterns and `prevent_destroy` before locking, so the common
         # refusals surface as a clean Failure without contending for the lease.
-        gate = changeset_for(prior)
+        gate = destroy_changeset(prior, self.mutability, targets)
         if isinstance(gate, Failure):
             return forward_failure(gate)
         # destroy touches every recorded node, so lock the whole prior graph.
         scope = frozenset(prior.nodes)
+        return await self._runs.run_locked(self._destroy_runner(scope, targets, progress), scope)
+
+    def _destroy_runner(
+        self, scope: frozenset[str], targets: Sequence[str], progress: ProgressCallback | None
+    ) -> Runner:
+        """The destroy run, re-diffed against the state read under the lease.
+
+        A row created while waiting for the lock is outside ``scope``, so the run
+        refuses rather than report success while that resource remains.
+        """
+        desired = Desired.empty()
 
         def run_replanned(fresh: StateGraph) -> Awaitable[ApplyReport]:
-            # Re-diff against the state read after the lease was taken, exactly
-            # as apply does: a row created while waiting for the lock is not in
-            # the pre-lock changeset (nor in the lease's scope), and silently
-            # completing without it reports success while the resource lives on.
-            created = set(fresh.nodes) - scope
-            if created:
-                raise StateError(
-                    "state gained node(s) while destroy waited for the lock: "
-                    + ", ".join(sorted(created))
-                    + " — re-run destroy to include them"
-                )
-            changeset = raise_on_failure(changeset_for(fresh))
-            return self._runner(changeset, desired, "halt", progress)(fresh)
+            require_no_new_nodes(fresh, scope, "destroy", "re-run destroy to include them")
+            changeset = raise_on_failure(destroy_changeset(fresh, self.mutability, targets))
+            return self._runs.runner(changeset, desired, "halt", progress)(fresh)
 
-        return await self._locked(run_replanned, scope)
+        return run_replanned
 
     def destroy_targets(self, patterns: Sequence[str]) -> Result[list[str], AtlantideError]:
         """What a targeted destroy would remove, for the confirmation preview.
 
-        The preview has to be the selection, not the whole store: showing every
-        recorded node before a `--target` destroy would ask the operator to
-        approve a list that is not what happens.
+        The preview is the selection, not the whole store, so the operator
+        approves exactly what a `--target` destroy removes.
         """
         prior = self.backend.load()
         if not patterns:
             return Success(sorted(prior.nodes))
-        try:
-            return Success(sorted(self._destroy_selection(prior, patterns)))
-        except AtlantideError as exc:
-            return Failure(exc)
-
-    def _destroy_selection(self, prior: StateGraph, patterns: Sequence[str]) -> frozenset[str]:
-        """Targets plus everything that still depends on them, from state alone.
-
-        The desired graph is empty during a destroy, so the edges come from what
-        each stored node recorded as its dependencies.
-        """
-        seeds = match_targets(patterns, set(prior.nodes))
-        return closure(state_digraph(prior), seeds, reverse=True)
+        return catching(lambda: sorted(selection.destroy_selection(prior, patterns)))
 
     async def import_nodes(
         self,
@@ -550,15 +374,15 @@ class Engine:
         inputs resolve against its dependencies' recorded outputs, so a VPC has to
         be adopted before the subnet referencing it can be read at all.
 
-        The lock covers only the nodes being adopted — the rows nothing else is
-        touching — rather than the whole state, so an import can run alongside an
-        apply to a disjoint subgraph. ``write=False`` is a pure read and takes no
-        lock, exactly as a read-only ``refresh`` does.
+        The lock covers only the adopted nodes rather than the whole state, so an
+        import can run alongside an apply to a disjoint subgraph. ``write=False``
+        is a pure read and takes no lock, as with a read-only ``refresh``.
         """
-        try:
-            ordered = self._import_order(compiled, requests)
-        except AtlantideError as exc:
-            return Failure(exc)
+        ordered_or_error = catching(lambda: selection.import_order(compiled, requests))
+        if isinstance(ordered_or_error, Failure):
+            return forward_failure(ordered_or_error)
+        ordered = ordered_or_error.unwrap()
+        options = AdoptOptions(write=write, allow_drift=allow_drift, force=force)
 
         async def run(prior: StateGraph) -> list[ImportOutcome]:
             # `prior` is loaded inside the lock for a write run: the
@@ -569,32 +393,20 @@ class Engine:
                 ir=compiled.ir,
                 hashes=compiled.hashes,
                 prior=prior,
-                env=self._env(),
-                write=write,
-                allow_drift=allow_drift,
-                force=force,
+                env=self._runs.env(),
+                options=options,
             )
 
         if not write:
             return Success(await run(self.backend.load()))
-        return await self._locked(run, frozenset(request.node_id for request in ordered))
-
-    @staticmethod
-    def _import_order(compiled: Compiled, requests: Sequence[ImportRequest]) -> list[ImportRequest]:
-        """Requests in dependency order; ones naming no known node keep their place.
-
-        An unknown node id is not rejected here — ``adopt`` reports it per request,
-        so a typo in a twenty-node batch does not abort the nineteen that are fine.
-        """
-        rank = {node_id: i for i, node_id in enumerate(topological_order(compiled.graph))}
-        return sorted(requests, key=lambda r: rank.get(r.node_id, len(rank)))
+        return await self._runs.run_locked(run, frozenset(request.node_id for request in ordered))
 
     def identity_fields(self, compiled: Compiled, node_ids: Sequence[str]) -> dict[str, str | None]:
-        """Per node, the id field its type is located by — ``None`` if found by name.
+        """Per node, the id field its type is located by, or ``None`` if found by name.
 
-        Reads nothing — not state, not the providers — so the listing that
-        precedes an import is free. Deliberately not routed through ``_env()``,
-        which would query committed stack outputs this answer does not need.
+        Reads neither state nor providers, so the listing that precedes an import
+        does no I/O. Not routed through the run environment, which would query
+        committed stack outputs this answer does not need.
         """
         return identity_fields(
             ir=compiled.ir, types=self.types, providers=self.providers, node_ids=node_ids
@@ -603,9 +415,8 @@ class Engine:
     def importable(self, compiled: Compiled) -> list[str]:
         """Node ids this config declares that state does not yet track.
 
-        Exactly the nodes a plan would report as CREATE, which is the same
-        question asked from the other side: each is either a resource that does
-        not exist yet, or one that does and could be imported.
+        Exactly the nodes a plan would report as CREATE: each is either a resource
+        that does not exist yet, or one that does and could be imported.
         """
         prior = self.backend.load()
         return sorted(node.id for node in compiled.ir.nodes if node.id not in prior.nodes)
@@ -621,112 +432,32 @@ class Engine:
 
         Read-only by default; ``write=True`` syncs detected drift back into state
         (and takes the whole-state lock, since it mutates). ``prune=True``
-        additionally drops rows whose resource the provider could not find — see
-        :func:`~atlantide.reconcile.refresh.refresh` on why that is opt-in.
+        additionally drops rows whose resource the provider could not find (see
+        :func:`~atlantide.reconcile.refresh.refresh` on why that is opt-in).
         """
         prior = self.backend.load()
         if not write:
             return Success(
-                await refresh(prior=prior, env=self._env(), write=False, progress=progress)
+                await refresh(prior=prior, env=self._runs.env(), write=False, progress=progress)
             )
-        # The pre-lock snapshot only sizes the lock scope. The rows to refresh are
-        # re-read once the lease is held: refreshing the snapshot would re-write
-        # rows a run holding the lock meanwhile deleted — resurrecting state for
-        # cleanly-destroyed resources. Rows created meanwhile are outside the
-        # lease and are left for the next refresh rather than written unheld.
+        # The pre-lock snapshot only sizes the lock scope; the rows are re-read
+        # under the lease (see `run_locked`), since refreshing the snapshot would
+        # resurrect rows a run holding the lock meanwhile deleted. Rows created
+        # meanwhile are outside the lease and are left for the next refresh.
         scope = frozenset(prior.nodes)
 
         async def run(fresh: StateGraph) -> DriftReport:
-            covered = StateGraph(nodes={i: node for i, node in fresh.nodes.items() if i in scope})
             return await refresh(
-                prior=covered, env=self._env(), write=True, prune=prune, progress=progress
-            )
-
-        return await self._locked(run, scope)
-
-    def _runner(
-        self,
-        changeset: ChangeSet,
-        desired: Desired,
-        on_failure: OnFailure = "halt",
-        progress: ProgressCallback | None = None,
-    ) -> Callable[[StateGraph], Awaitable[ApplyReport]]:
-        """Bind a changeset to the shared executor; ``_locked`` supplies prior state."""
-
-        def run(prior: StateGraph) -> Awaitable[ApplyReport]:
-            return _run_changeset(
-                changeset=changeset,
-                desired=desired,
-                prior=prior,
-                env=self._env(),
-                on_failure=on_failure,
+                prior=_covered(fresh, scope),
+                env=self._runs.env(),
+                write=True,
+                prune=prune,
                 progress=progress,
             )
 
-        return run
+        return await self._runs.run_locked(run, scope)
 
-    def _env(self) -> ApplyEnv:
-        """The run environment; ``stack_outputs`` snapshots committed outputs now."""
-        extra: dict[str, Any] = {"parallelism": self.parallelism} if self.parallelism else {}
-        return ApplyEnv(
-            types=self.types,
-            providers=self.providers,
-            backend=self.backend,
-            secrets=self.secrets,
-            stack_outputs=self._stack_outputs(),
-            lease=self._lease,
-            node_timeout=self.node_timeout,
-            events=self.events,
-            run_id=self.run_id,
-            **extra,
-        )
 
-    async def _locked(
-        self,
-        run: Callable[[StateGraph], Awaitable[_T]],
-        scope: frozenset[str],
-        *,
-        prepare: Callable[[StateGraph], StateGraph] | None = None,
-    ) -> Result[_T, AtlantideError]:
-        """Run under the state lock, feeding ``run`` the state loaded post-acquire.
-
-        The one locked-run scaffold: apply, destroy, ``refresh --write`` and
-        import all route through it, so they share the fresh guard, owner/run-id
-        wiring, and events plumbing. ``prepare`` (apply only) may rewrite
-        persisted state first — the alias rekey — and returns the state the run
-        should see.
-        """
-
-        def under_lock() -> Awaitable[_T]:
-            prior = self.backend.load()
-            return run(prepare(prior) if prepare is not None else prior)
-
-        # A fresh guard per locked run: `_env` reads it when the executor is
-        # built, which happens inside `under_lock`, after the lease is taken.
-        self._lease = LeaseGuard(grace=self.lock_policy.renew_grace)
-        # The lock owner already encodes host + pid + a per-run token, so it is the
-        # "who" an audit record needs; a second identifier could only disagree.
-        self.run_id = lock_owner()
-        return await with_lock(
-            self.backend,
-            scope,
-            under_lock,
-            policy=self.lock_policy,
-            guard=self._lease,
-            owner=self.run_id,
-            events=self.events,
-            run_id=self.run_id,
-        )
-
-    def _alias_migration(self, ir: IRGraph) -> Callable[[StateGraph], StateGraph]:
-        """A ``_locked`` prepare-hook that persists any alias rekey, so the executor
-        and future runs see the renamed nodes' new ids."""
-
-        def prepare(prior: StateGraph) -> StateGraph:
-            migrated, remap = resolve_aliases(prior, ir)
-            if not remap:
-                return prior
-            persist_migration(self.backend, prior, migrated, remap)
-            return self.backend.load()
-
-        return prepare
+def _covered(graph: StateGraph, scope: frozenset[str]) -> StateGraph:
+    """The part of ``graph`` whose rows ``scope`` covers."""
+    return StateGraph(nodes={i: node for i, node in graph.nodes.items() if i in scope})

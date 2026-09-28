@@ -33,9 +33,8 @@ def test_check_compatible_accepts_a_newer_same_major_provider() -> None:
 
 
 def test_check_compatible_rejects_a_downgrade() -> None:
-    """Compatibility is directional. A plan pinned at 1.9.0 encodes resources and
-    fields 1.4.2 may not have — the exact mismatch the pin exists to catch, and
-    the alternative is a provider crash mid-apply."""
+    """Compatibility is directional: a plan pinned at 1.9.0 may use resources and
+    fields 1.4.2 lacks, which would crash the provider mid-apply."""
     result = check_compatible("1.9.0", "1.4.2")
     assert not is_successful(result)
     assert "incompatible" in str(result.failure())

@@ -10,12 +10,11 @@ reference).
 from __future__ import annotations
 
 import time
-from typing import Any
-
-from typing_extensions import override
+from typing import Any, override
 
 from atlantide.providers.aws.handlers.base import (
     AwsHandler,
+    Client,
     create_or_adopt,
     ignore_missing,
     known_id,
@@ -30,8 +29,8 @@ from atlantide.providers.aws.resources.cloudfront import CACHING_OPTIMIZED
 
 _ORIGIN_ID = "s3-origin"
 
-#: Bounded poll for a distribution to reach ``Deployed`` before delete; on real
-#: AWS this takes several minutes after a disable.
+#: Bounded poll for a distribution to reach ``Deployed`` before delete; AWS takes
+#: several minutes after a disable.
 _DEPLOY_POLL_ATTEMPTS = 120
 _DEPLOY_POLL_DELAY = 15.0
 
@@ -42,20 +41,30 @@ class CloudFrontOacHandler(AwsHandler[OriginAccessControl]):
     identity_field = "oac_id"
 
     @override
-    def create(self, client: Any, res: OriginAccessControl) -> dict[str, Any]:
-        resp = client.create_origin_access_control(
-            OriginAccessControlConfig={
-                "Name": res.oac_name,
-                "Description": res.description,
-                "OriginAccessControlOriginType": "s3",
-                "SigningBehavior": "always",
-                "SigningProtocol": "sigv4",
-            }
-        )
-        return {"oac_id": resp["OriginAccessControl"]["Id"]}
+    def create(self, client: Client, res: OriginAccessControl) -> dict[str, Any]:
+        def make() -> dict[str, Any]:
+            resp = client.create_origin_access_control(
+                OriginAccessControlConfig={
+                    "Name": res.oac_name,
+                    "Description": res.description,
+                    "OriginAccessControlOriginType": "s3",
+                    "SigningBehavior": "always",
+                    "SigningProtocol": "sigv4",
+                }
+            )
+            return {"oac_id": resp["OriginAccessControl"]["Id"]}
+
+        def adopt() -> dict[str, Any] | None:
+            oid = self._find(client, res.oac_name)
+            return None if oid is None else {"oac_id": oid}
+
+        # OAC names are unique per account and the create takes no caller
+        # reference, so a create retried after a timeout that did reach AWS
+        # answers OriginAccessControlAlreadyExists; adopt the control by name.
+        return create_or_adopt(make, adopt)
 
     @override
-    def read(self, client: Any, res: OriginAccessControl) -> dict[str, Any] | None:
+    def read(self, client: Client, res: OriginAccessControl) -> dict[str, Any] | None:
         oid = known_id(res, self.identity_field) or self._find(client, res.oac_name)
         if oid is None:
             return None
@@ -65,7 +74,7 @@ class CloudFrontOacHandler(AwsHandler[OriginAccessControl]):
 
     @override
     def update(
-        self, client: Any, prior: dict[str, Any], res: OriginAccessControl
+        self, client: Client, prior: dict[str, Any], res: OriginAccessControl
     ) -> dict[str, Any]:
         oid = prior.get(self.identity_field) or known_id(res, self.identity_field)
         if oid is None:  # update runs only on an existing control
@@ -79,7 +88,7 @@ class CloudFrontOacHandler(AwsHandler[OriginAccessControl]):
         return {"oac_id": oid}
 
     @override
-    def delete(self, client: Any, res: OriginAccessControl) -> None:
+    def delete(self, client: Client, res: OriginAccessControl) -> None:
         oid = known_id(res, self.identity_field)
         if oid is None:
             return
@@ -88,10 +97,9 @@ class CloudFrontOacHandler(AwsHandler[OriginAccessControl]):
             client.delete_origin_access_control(Id=oid, IfMatch=got["ETag"])
 
     @staticmethod
-    def _find(client: Any, name: str) -> str | None:
-        # Every page, not just the first: an account past one page of OACs would
-        # otherwise read a healthy control as absent — refresh classifies it
-        # MISSING and `refresh --write` drops its state row.
+    def _find(client: Client, name: str) -> str | None:
+        # Scans every page: a control beyond the first page would otherwise read
+        # as absent, and `refresh --write` would drop its state row.
         pages = marker_pages(client.list_origin_access_controls, "OriginAccessControlList")
         return next((str(item["Id"]) for item in pages if item.get("Name") == name), None)
 
@@ -102,7 +110,7 @@ class CloudFrontDistributionHandler(AwsHandler[CloudFrontDistribution]):
     identity_field = "distribution_id"
 
     @override
-    def create(self, client: Any, res: CloudFrontDistribution) -> dict[str, Any]:
+    def create(self, client: Client, res: CloudFrontDistribution) -> dict[str, Any]:
         def make() -> dict[str, Any]:
             config = _distribution_config(res)
             if res.tags:
@@ -116,19 +124,18 @@ class CloudFrontDistributionHandler(AwsHandler[CloudFrontDistribution]):
                 resp = client.create_distribution(DistributionConfig=config)
             return _distribution_outputs(resp["Distribution"])
 
-        # The stable CallerReference makes a re-run create answer
-        # DistributionAlreadyExists rather than provision a second distribution;
-        # adopting the one holding the reference is what makes that idempotent
-        # rather than merely an error.
+        # A retried create with the same CallerReference fails with
+        # DistributionAlreadyExists; adopting the distribution holding that
+        # reference makes create idempotent.
         return create_or_adopt(make, lambda: self._find_by_reference(client, res.node_id))
 
     @staticmethod
-    def _find_by_reference(client: Any, reference: str) -> dict[str, Any] | None:
+    def _find_by_reference(client: Client, reference: str) -> dict[str, Any] | None:
         """The distribution created under this ``CallerReference``, or ``None``.
 
-        Distribution summaries do not carry the reference, so each candidate
-        costs a ``get``; adoption only runs on a create conflict, never on the
-        steady-state path. Every page, for the same reason as the OAC ``_find``.
+        Distribution summaries omit the reference, so each candidate needs a
+        ``get``; this runs only on a create conflict. Scans every page, as
+        ``CloudFrontOacHandler._find`` does.
         """
         for item in marker_pages(client.list_distributions, "DistributionList"):
             got = client.get_distribution(Id=item["Id"])["Distribution"]
@@ -137,7 +144,7 @@ class CloudFrontDistributionHandler(AwsHandler[CloudFrontDistribution]):
         return None
 
     @override
-    def read(self, client: Any, res: CloudFrontDistribution) -> dict[str, Any] | None:
+    def read(self, client: Client, res: CloudFrontDistribution) -> dict[str, Any] | None:
         did = known_id(res, self.identity_field)
         if did is None:
             return None
@@ -148,7 +155,7 @@ class CloudFrontDistributionHandler(AwsHandler[CloudFrontDistribution]):
 
     @override
     def update(
-        self, client: Any, prior: dict[str, Any], res: CloudFrontDistribution
+        self, client: Client, prior: dict[str, Any], res: CloudFrontDistribution
     ) -> dict[str, Any]:
         did = prior.get(self.identity_field) or known_id(res, self.identity_field)
         if did is None:  # update runs only on an existing distribution
@@ -157,7 +164,7 @@ class CloudFrontDistributionHandler(AwsHandler[CloudFrontDistribution]):
         config = _apply_desired(got["Distribution"]["DistributionConfig"], res)
         updated = client.update_distribution(Id=did, IfMatch=got["ETag"], DistributionConfig=config)
         outputs = _distribution_outputs(updated["Distribution"])
-        # CloudFront wraps both directions in an `Items` envelope.
+        # CloudFront wraps tags in an `Items` envelope on both read and write.
         arn = outputs["arn"]
         sync_tags(
             res.tags,
@@ -170,7 +177,7 @@ class CloudFrontDistributionHandler(AwsHandler[CloudFrontDistribution]):
         return outputs
 
     @override
-    def delete(self, client: Any, res: CloudFrontDistribution) -> None:
+    def delete(self, client: Client, res: CloudFrontDistribution) -> None:
         did = known_id(res, self.identity_field)
         if did is None:
             return
@@ -187,7 +194,7 @@ class CloudFrontDistributionHandler(AwsHandler[CloudFrontDistribution]):
             client.delete_distribution(Id=did, IfMatch=etag)
 
     @staticmethod
-    def _wait_deployed(client: Any, did: str, etag: str) -> str:
+    def _wait_deployed(client: Client, did: str, etag: str) -> str:
         for _ in range(_DEPLOY_POLL_ATTEMPTS):
             got = client.get_distribution(Id=did)
             etag = got["ETag"]
@@ -201,8 +208,7 @@ def _apply_desired(config: dict[str, Any], res: CloudFrontDistribution) -> dict[
     """Write every mutable field of ``res`` onto ``config``.
 
     Shared by create (over a fresh skeleton) and update (over the fetched live
-    config), so a field added to the resource cannot land in one and not the
-    other — which would make it a silent no-op on update.
+    config) so both apply the same set of fields.
     """
     config["Comment"] = res.comment
     config["Enabled"] = res.enabled
@@ -218,7 +224,7 @@ def _distribution_config(res: CloudFrontDistribution) -> dict[str, Any]:
     """The full create payload: the immutable skeleton plus the mutable fields."""
     return _apply_desired(
         {
-            "CallerReference": res.node_id,  # stable reference; a retried create is idempotent
+            "CallerReference": res.node_id,
             "Origins": {
                 "Quantity": 1,
                 "Items": [
@@ -243,10 +249,9 @@ def _distribution_config(res: CloudFrontDistribution) -> dict[str, Any]:
 def _viewer_certificate(res: CloudFrontDistribution) -> dict[str, Any]:
     """Which certificate serves the aliases, or CloudFront's own.
 
-    Without a certificate a distribution is reachable only at its
-    ``*.cloudfront.net`` name — which is why an `AcmCertificate` existed with
-    nothing able to consume it. ``SNI-only`` is the modern default; dedicated IPs
-    cost money and buy compatibility with clients that no longer exist.
+    Without an ACM certificate the distribution serves only its
+    ``*.cloudfront.net`` name. ``sni-only`` avoids the cost of dedicated IPs,
+    which only serve clients without SNI support.
     """
     if res.certificate_arn is None:
         return {"CloudFrontDefaultCertificate": True}

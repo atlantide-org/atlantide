@@ -2,7 +2,7 @@
 
 Compose an :class:`IamPolicy` from ``allow(...)`` / ``deny(...)`` calls; the
 provider serializes the statements to a policy document at apply time (see
-``handlers._policy_document``).
+:func:`policy_json`).
 
 A ``resource`` may be an ARN string, a list of ARNs, or a ``Ref`` to an upstream
 output (e.g. ``bucket.arn``); nested Refs become dependency edges and resolve to
@@ -11,10 +11,11 @@ concrete ARNs before the policy is written.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
-Statement = dict[str, Any]
+from atlantide.util.jsonfmt import compact_json
+
+type Statement = dict[str, Any]
 
 _VERSION = "2012-10-17"
 
@@ -48,7 +49,7 @@ def allow(
 
     ``principal`` is required by resource policies (e.g. S3 bucket policies:
     ``"*"`` or ``{"AWS": role.arn}``) and omitted from identity policies.
-    ``condition`` adds a ``Condition`` block — e.g. a CloudFront OAC bucket policy
+    ``condition`` adds a ``Condition`` block; e.g. a CloudFront OAC bucket policy
     scopes access to one distribution with
     ``condition={"StringEquals": {"AWS:SourceArn": dist.arn}}``.
     """
@@ -93,7 +94,7 @@ def policy_document(statements: list[Statement]) -> dict[str, Any]:
 
 def policy_json(statements: list[Statement]) -> str:
     """Serialize policy statements to a deterministic IAM policy-document JSON."""
-    return json.dumps(policy_document(statements), sort_keys=True, separators=(",", ":"))
+    return compact_json(policy_document(statements))
 
 
 def assume_role(*services: str) -> str:
@@ -105,7 +106,6 @@ def assume_role(*services: str) -> str:
     if not services:
         raise ValueError("assume_role needs at least one service principal")
     principal = services[0] if len(services) == 1 else list(services)
-    document = policy_document(
+    return policy_json(
         [{"Effect": "Allow", "Principal": {"Service": principal}, "Action": "sts:AssumeRole"}]
     )
-    return json.dumps(document, sort_keys=True, separators=(",", ":"))

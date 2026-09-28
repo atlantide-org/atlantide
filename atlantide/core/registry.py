@@ -15,7 +15,7 @@ from atlantide.core.provider import Provider
 
 _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
-Semver = tuple[int, int, int]
+type Semver = tuple[int, int, int]
 
 
 def parse_semver(version: str) -> Result[Semver, RegistryError]:
@@ -30,9 +30,9 @@ def check_compatible(pinned: str, actual: str) -> Result[None, RegistryError]:
     """Success unless ``actual`` cannot satisfy a plan pinned at ``pinned``.
 
     Semver compatibility is directional: same major and not older. A plan built
-    against ``1.5.0`` encodes resources and fields ``1.0.0`` may not have, so a
-    downgrade is the mismatch the pin exists to catch. ``0.x`` carries no
-    compatibility guarantee and must match exactly.
+    against ``1.5.0`` may use resources and fields ``1.0.0`` lacks, so a
+    downgrade is incompatible. ``0.x`` carries no compatibility guarantee and
+    must match exactly.
     """
     parsed = parse_semver(pinned).bind(
         lambda pinned_v: parse_semver(actual).map(lambda actual_v: (pinned_v, actual_v))
@@ -70,7 +70,6 @@ class ProviderRegistry:
         name = getattr(provider, "name", "")
         if not name:
             return Failure(RegistryError(f"provider {type(provider).__name__} declares no name"))
-        # Validate the semver, then insert; propagate a bad version.
         return parse_semver(getattr(provider, "version", "")).bind(
             lambda _: self._register_named(name, provider)
         )

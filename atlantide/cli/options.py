@@ -1,8 +1,14 @@
 """Option types and prompts shared by more than one command module.
 
-Typer builds a command's interface from its signature, so an option reused across
-commands is otherwise re-declared — and drifts. These aliases keep one spelling,
-one help string, and one short flag per concept.
+Typer builds a command's interface from its signature; these aliases give each
+shared option one spelling, one help string and one short flag.
+
+``--env``, ``--fuel``, ``--confirm`` and ``--var`` have no ``ATLANTIDE_*``
+environment-variable counterpart. Each changes what a run does (target
+environment, evaluation budget, ``destroy`` approval, plan inputs), so it must come
+from the command line or a reviewed file (the checked-in toml, a ``--var-file``),
+not the shell. An exported variable would approve a ``destroy`` for every command
+in that shell.
 """
 
 from __future__ import annotations
@@ -16,12 +22,12 @@ from typing import Annotated, Any, get_args
 import typer
 
 from atlantide.cli.errors import fail
+from atlantide.cli.project import MAX_FUEL
 from atlantide.reconcile import OnFailure
 
 ConfigArg = Annotated[Path | None, typer.Argument(help="Atlas-lang config (.py).")]
-#: The same config, as an option rather than a positional. For commands whose
-#: subject is a resource — ``import`` — where the config is context and, in a
-#: project with an ``atlantide.toml``, never typed at all.
+#: The config as an option rather than a positional, for commands whose subject
+#: is a resource (``import``); with an ``atlantide.toml`` it is usually omitted.
 ConfigOpt = Annotated[Path | None, typer.Option("--config", "-c", help="Atlas-lang config (.py).")]
 StateOpt = Annotated[Path | None, typer.Option("--state", help="State database file.")]
 ConfirmOpt = Annotated[
@@ -46,8 +52,7 @@ VarFileOpt = Annotated[
     list[Path] | None,
     typer.Option("--var-file", help="TOML file of config inputs (repeatable)."),
 ]
-#: No ``ATLANTIDE_ENV`` counterpart: the environment a run acts on is passed on
-#: the command line, not inherited from the shell.
+#: No ``ATLANTIDE_ENV``: see the module docstring.
 EnvOpt = Annotated[
     list[str] | None,
     typer.Option("--env", "-e", help="Act only on this Config environment (repeatable)."),
@@ -64,30 +69,33 @@ ReplaceOpt = Annotated[
     list[str] | None,
     typer.Option("--replace", help="Force this resource to be recreated (repeatable)."),
 ]
+#: No ``ATLANTIDE_FUEL``: see the module docstring.
+FuelOpt = Annotated[
+    int | None,
+    typer.Option(
+        "--fuel",
+        min=1,
+        max=MAX_FUEL,
+        help="Atlas-lang evaluation step budget (overrides \\[lang] fuel; default 5,000,000).",
+    ),
+]
 
 
 def stdin_is_tty() -> bool:
     """Whether there is a terminal to prompt on.
 
-    A function rather than an inline check so it can be substituted: a test
-    driving the prompt through `CliRunner` supplies stdin as a plain stream,
-    which is not a tty, and would otherwise only ever exercise the guard.
+    A function so tests can substitute it: ``CliRunner`` stdin is never a tty.
     """
     return sys.stdin.isatty()
 
 
-def require_confirm(confirm: bool, question: str) -> None:
+def require_confirm(question: str, *, confirm: bool) -> None:
     """Prompt before a mutating action unless ``--confirm`` was passed (aborts on no).
 
-    With no terminal to prompt on, say so instead of prompting. A ``confirm``
-    call against a closed stdin aborts with "EOF when reading a line", which
-    names the mechanism and not the fix — and it is the *first* thing every user
-    hits when they move a working command into CI. The diagnostic below names the
-    flag they need.
+    With no terminal, fail with a diagnostic naming the flag instead of prompting;
+    ``typer.confirm`` on a closed stdin aborts with only "EOF when reading a line".
 
-    Deliberately no ``ATLANTIDE_CONFIRM`` environment variable: a variable that
-    silently approves a ``destroy`` for every command in a shell is not a default
-    worth introducing, and ``--confirm`` is one flag away.
+    No ``ATLANTIDE_CONFIRM``: see the module docstring.
     """
     if confirm:
         return
@@ -107,14 +115,11 @@ def resolve_inputs(
 ) -> dict[str, Any]:
     """Merge config inputs, most specific last: toml, then files, then flags.
 
-    Values keep the type TOML gave them; a ``-var`` value is a string, because
-    that is what a shell hands over and guessing between ``"2"``, ``2`` and
-    ``True`` is how a config silently takes the wrong branch. A config wanting a
-    number writes ``int(atlantide.input("count"))``.
+    TOML values keep their type; a ``--var`` value stays a string, since guessing
+    between ``"2"``, ``2`` and ``True`` can send a config down the wrong branch. A
+    config needing a number writes ``int(atlantide.input("count"))``.
 
-    Deliberately no ``ATLANTIDE_VAR_*`` environment variable: a value that
-    changes the plan should be visible in the command or in a file under review,
-    not inherited from whatever the shell happened to export.
+    No ``ATLANTIDE_VAR_*``: see the module docstring.
     """
     merged: dict[str, Any] = dict(project_inputs)
     for path in var_files or ():
@@ -128,8 +133,7 @@ def resolve_inputs(
 
 
 def _read_var_file(path: Path) -> Mapping[str, Any]:
-    """A TOML table of inputs. TOML rather than a bespoke dialect: the project
-    already parses it, and it carries types."""
+    """Read a ``--var-file``: a TOML table of inputs, with typed values."""
     try:
         with path.open("rb") as handle:
             return tomllib.load(handle)
@@ -139,6 +143,6 @@ def _read_var_file(path: Path) -> Mapping[str, Any]:
         fail(f"--var-file {path} is not valid TOML: {exc}")
 
 
-#: The literal values `--on-failure` accepts, derived from the type so the flag
-#: and the engine cannot drift.
+#: The values ``--on-failure`` accepts, derived from ``OnFailure`` so the flag
+#: matches the engine.
 ON_FAILURE_CHOICES: tuple[str, ...] = get_args(OnFailure)

@@ -117,10 +117,8 @@ def secret(
     )
 
 
-#: Per-class field-metadata cache. Keyed by the model class itself; pydantic
-#: model classes never change their ``model_fields`` after creation, so a
-#: cached scan is safe — and every diff/plan/refresh consults these maps per
-#: node, which made the repeated per-call re-parse the hottest cold code here.
+#: Per-class field metadata. Safe to cache: a pydantic model's ``model_fields``
+#: do not change after class creation.
 _META_CACHE: dict[type[BaseModel], dict[str, dict[str, Any]]] = {}
 
 
@@ -137,11 +135,8 @@ def _atl_meta(model: type[BaseModel]) -> dict[str, dict[str, Any]]:
     return cached
 
 
-#: Derived views of :data:`_META_CACHE`, cached for the same reason it is: both
-#: are read once per node per run — ``field_mutability`` from ``Resource``'s
-#: ``input_values``, on every attribute pass over every resource — and rebuilding
-#: the mapping each time was pure repeat work over an input that cannot change.
-#: Returned by reference, so callers must treat them as read-only.
+#: Derived views of :data:`_META_CACHE`, read per node on every run. Returned by
+#: reference, so callers must treat them as read-only.
 _MUTABILITY_CACHE: dict[type[BaseModel], dict[str, Mutability]] = {}
 _SENSITIVE_CACHE: dict[type[BaseModel], list[str]] = {}
 

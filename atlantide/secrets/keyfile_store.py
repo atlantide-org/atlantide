@@ -1,9 +1,10 @@
 """Default secrets backend: a local AES-256-GCM value-store (``name -> value``).
 
-Creds-free. The store file holds ``AES-GCM(JSON {name: value})``; the key lives
-in a sibling ``0600`` keyfile, auto-generated on first write. Managed out-of-band
-via the CLI (``atlantide secret set/rm/list``) — values are never written to
-config, the IR, or engine state.
+Needs no credentials. The store file holds
+``STORE_V1_MAGIC || AES-GCM(JSON {name: value})``, authenticated with a store-only
+AAD; the key lives in a sibling ``0600`` keyfile generated on first write. Values
+are managed out-of-band via the CLI (``atlantide secret set/rm/list``) and never
+written to config, the IR, or engine state.
 """
 
 from __future__ import annotations
@@ -12,17 +13,25 @@ import fcntl
 import json
 import os
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, override
 
 from cryptography.exceptions import InvalidTag
-from typing_extensions import override
 
 from atlantide.core.check import FAIL, OK, Check
 from atlantide.core.errors import SecretsError
-from atlantide.secrets._aesgcm import OWNER_ONLY_MODE, decrypt, encrypt, load_or_create_key
-from atlantide.secrets.backend import SecretsProvider
+from atlantide.secrets._aesgcm import decrypt, encrypt, load_key, load_or_create_key
+from atlantide.secrets.base import SecretsProvider
+from atlantide.util.fs import OWNER_ONLY_MODE, write_private
+
+#: Header of the only accepted store format. A headerless file (bare
+#: ``nonce || ciphertext``, no AAD) is refused.
+STORE_V1_MAGIC = b"ATLSTORE1\n"
+
+#: AAD binding the store file to this use of the key, so the store blob cannot
+#: be replayed as a ``{"$sealed": ...}`` value under the same key (and vice versa).
+_STORE_V1_AAD = b"atlantide/store/v1"
 
 
 class KeyfileValueStore(SecretsProvider):
@@ -75,12 +84,9 @@ class KeyfileValueStore(SecretsProvider):
     def check(self) -> Check:
         """Confirm the store opens with the key this install holds.
 
-        The failure worth catching is a store encrypted under a *different* key —
-        a keyfile not shared with the rest of the team, or one regenerated after
-        being lost. Resolution only happens mid-apply, and the symptom there
-        (every secret unreadable) does not name its cause.
-
-        An absent store is not a failure: a project may simply have no secrets.
+        Detects a store encrypted under a different key (an unshared or
+        regenerated keyfile), which mid-apply resolution reports only as
+        unreadable secrets. An absent store passes: a project may have no secrets.
         """
         if not self._store.exists():
             return self._check(OK, f"no store yet at {self._store}")
@@ -91,12 +97,11 @@ class KeyfileValueStore(SecretsProvider):
         return self._check(OK, f"{len(values)} secret(s) in {self._store}")
 
     def _why(self, exc: SecretsError) -> str:
-        """Explain a failed open, in terms of what the operator can act on.
+        """Describe a failed open in actionable terms.
 
-        A decryption failure is identified by what it wraps, not by its wording.
-        AES-GCM authentication cannot say whether the key is wrong or the bytes
-        are damaged — the two are the same failure — so the message names both
-        instead of guessing.
+        A decryption failure is identified by its ``__cause__``, not its message.
+        AES-GCM authentication cannot distinguish a wrong key from damaged bytes,
+        so the message names both.
         """
         if isinstance(exc.__cause__, InvalidTag | ValueError):
             return (
@@ -111,9 +116,8 @@ class KeyfileValueStore(SecretsProvider):
     def _locked(self) -> Iterator[None]:
         """Hold an exclusive advisory lock around load-modify-save.
 
-        Two concurrent CLI writes are otherwise an unlocked read-modify-write
-        over the store file, and one of them vanishes silently. ``flock`` on a
-        sibling lock file covers darwin and linux; closing the fd releases it.
+        Serializes concurrent CLI writes so none is lost. ``flock`` on a sibling
+        lock file works on darwin and linux; closing the fd releases it.
         """
         self._store.parent.mkdir(parents=True, exist_ok=True)
         lock = self._store.with_suffix(self._store.suffix + ".lock")
@@ -125,37 +129,35 @@ class KeyfileValueStore(SecretsProvider):
             os.close(fd)
 
     def _load(self) -> dict[str, str]:
+        """Decrypt the store; a missing file is an empty store."""
         if not self._store.exists():
             return {}
-        raw = decrypt(self._load_key(), self._store.read_bytes())
+        blob = self._store.read_bytes()
+        if not blob.startswith(STORE_V1_MAGIC):
+            raise SecretsError(
+                f"{self._store} is not an ATLSTORE1 secrets store (a legacy headerless "
+                f"store is no longer supported) — move it aside and re-create each "
+                f"secret with `atlantide secret set`"
+            )
+        raw = decrypt(self._load_key(create=False), blob[len(STORE_V1_MAGIC) :], aad=_STORE_V1_AAD)
         data = json.loads(raw)
         if not isinstance(data, dict):
             raise SecretsError("corrupt secrets store: expected a JSON object")
         return {str(k): str(v) for k, v in data.items()}
 
     def _save(self, values: dict[str, str]) -> None:
-        blob = encrypt(self._load_key(), json.dumps(values, sort_keys=True).encode("utf-8"))
+        plaintext = json.dumps(values, sort_keys=True).encode("utf-8")
+        blob = STORE_V1_MAGIC + encrypt(self._load_key(), plaintext, aad=_STORE_V1_AAD)
         self._store.parent.mkdir(parents=True, exist_ok=True)
-        # Write to an owner-only temp file, fsync, and replace atomically: the
-        # store is never world-readable, a crash cannot leave it half-written,
-        # and — since this file is the only copy of every secret — a power loss
-        # right after the replace cannot leave it empty or truncated.
-        tmp = self._store.with_suffix(self._store.suffix + ".tmp")
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, OWNER_ONLY_MODE)
-        try:
-            os.write(fd, blob)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, self._store)
-        with suppress(OSError):  # best-effort durability of the rename itself
-            dir_fd = os.open(str(self._store.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+        # Owner-only fresh temp file, fsync, atomic replace, directory fsync: the
+        # store is never world-readable or written through a planted symlink, and
+        # neither a crash nor a power loss can leave this sole copy of every
+        # secret truncated or empty. Callers hold ``_locked``.
+        write_private(self._store, blob, overwrite=True)
 
-    def _load_key(self) -> bytes:
+    def _load_key(self, *, create: bool = True) -> bytes:
+        """The key; ``create=False`` refuses to generate one (decrypt-only paths)."""
         if self._key is None:
-            self._key = load_or_create_key(self._key_path)
+            load = load_or_create_key if create else load_key
+            self._key = load(self._key_path)
         return self._key

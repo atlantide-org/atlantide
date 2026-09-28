@@ -1,8 +1,8 @@
 """Structured logging and the audit trail.
 
-The question these exist to answer is asked after something has gone wrong, by
-someone who was not there: who changed this, when, and what happened. A report
-rendered to a terminal and discarded cannot answer it.
+An audit trail answers, after the fact and for someone who was not there: who
+changed this, when, and what happened. A report rendered to a terminal and
+discarded cannot.
 """
 
 from __future__ import annotations
@@ -64,8 +64,7 @@ def test_an_apply_records_its_events(tmp_path: Path) -> None:
 
 
 def test_the_header_says_who_ran_what_against_which_state(tmp_path: Path) -> None:
-    """Events without an identity are a list of things that happened to nothing
-    in particular."""
+    """Events are only meaningful when tied to a command, config and state."""
     cfg = _config(tmp_path)
     log = tmp_path / "audit.jsonl"
     cli.ok("--audit-log", log, "apply", cfg, "--state", tmp_path / "s.db", "-y")
@@ -79,7 +78,7 @@ def test_the_header_says_who_ran_what_against_which_state(tmp_path: Path) -> Non
 
 def test_every_event_carries_the_run_id(tmp_path: Path) -> None:
     """Two runs appending to one file have to be separable, and the id is also
-    the lock owner — so a lease conflict and an audit line name the same thing."""
+    the lock owner, so a lease conflict and an audit line name the same thing."""
     cfg = _config(tmp_path)
     log = tmp_path / "audit.jsonl"
     for content in ("one", "two"):  # each run has real work, so each emits events
@@ -104,9 +103,8 @@ def test_the_file_is_appended_to_not_replaced(tmp_path: Path) -> None:
 
 
 def test_a_run_that_changed_nothing_is_still_recorded(tmp_path: Path) -> None:
-    """ "Someone ran apply against prod at 03:00 and it was a no-op" is a fact an
-    audit trail gets asked for. A trail that omits runs is incomplete in a way
-    nobody notices until they are relying on it."""
+    """A no-op run is still an auditable fact, e.g. an apply against prod at
+    03:00 that changed nothing."""
     cfg = _config(tmp_path)
     log = tmp_path / "audit.jsonl"
     cli.ok("--audit-log", log, "apply", cfg, "--state", tmp_path / "s.db", "-y")
@@ -122,7 +120,7 @@ def test_a_run_that_changed_nothing_is_still_recorded(tmp_path: Path) -> None:
 
 
 def test_a_failed_run_still_closes_its_record(tmp_path: Path) -> None:
-    """An audit trail that only logs successes is not one."""
+    """A failed run is recorded as completely as a successful one."""
     blocker = tmp_path / "blocker"
     blocker.write_text("x")
     cfg = tmp_path / "bad.py"
@@ -165,14 +163,14 @@ def test_an_unwritable_audit_path_is_a_diagnostic(tmp_path: Path) -> None:
 
 
 def test_a_secret_handle_never_reaches_a_record() -> None:
-    """Redaction is by construction rather than by discipline at each call site:
-    the one place that forgets is the one that matters."""
+    """Redaction is by construction rather than by discipline at each call site,
+    so no call site can forget it."""
     assert redact({"$secret_ref": "app/key"}) == REDACTED
     assert redact({"$sealed": "ciphertext"}) == REDACTED
 
 
 def test_redaction_reaches_nested_values() -> None:
-    """A secret is exactly as leaked three dicts down."""
+    """Secrets nested inside dicts and lists are redacted too."""
     payload = {"properties": {"token": {"$secret_ref": "app/key"}, "size": 1}}
     assert redact(payload) == {"properties": {"token": REDACTED, "size": 1}}
     assert redact([{"$sealed": "x"}]) == [REDACTED]
@@ -215,8 +213,7 @@ def test_the_json_formatter_carries_the_extras() -> None:
 
 def test_logs_go_to_stderr_not_stdout(tmp_path: Path) -> None:
     """`--json` promises stdout is one parseable document; a log line in the
-    middle of it breaks a consumer on exactly the runs that had something to say.
-    """
+    middle of it would break the consumer."""
     cfg = _config(tmp_path)
     result = cli.run("--log-level", "info", "plan", cfg, "--state", tmp_path / "s.db", "--json")
     json.loads(result.stdout)  # parses on its own
@@ -232,8 +229,8 @@ def test_an_unknown_log_level_is_refused(tmp_path: Path) -> None:
 
 
 def test_fanout_survives_a_broken_sink() -> None:
-    """An audit file on a full disk is a problem; an apply aborting half-way
-    because of one is a bigger problem."""
+    """A failing sink, such as an audit file on a full disk, must not abort an
+    apply half-way."""
     seen: list[str] = []
 
     def broken(_event: ApplyEvent) -> None:

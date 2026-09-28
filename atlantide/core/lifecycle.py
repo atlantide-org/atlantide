@@ -11,15 +11,17 @@ from atlantide.core.node_id import require_sequence
 class Lifecycle:
     """Instance-level overrides consumed by diff / planner / executor.
 
-    - ``prevent_destroy`` — a planned DELETE (or a REPLACE's destroy half) on
+    - ``prevent_destroy``: a planned DELETE (or a REPLACE's destroy half) on
       this resource fails the whole plan.
-    - ``create_before_destroy`` — a REPLACE creates the new resource *before*
-      destroying the old one (no downtime). Falls back to destroy-before-create
+    - ``create_before_destroy``: a REPLACE creates the new resource *before*
+      destroying the old one (no downtime). Everything this resource depends
+      on, transitively, is replaced create-before-destroy too, so none is
+      deleted while this one still uses it. Falls back to destroy-before-create
       when the replacement would collide with the old resource's identity.
-    - ``ignore_changes`` — field names whose drift is ignored: excluded from the
+    - ``ignore_changes``: field names whose drift is ignored: excluded from the
       Merkle ``input_hash`` and from the diff's changed-field set, so a change to
       one of them never triggers UPDATE/REPLACE.
-    - ``aliases`` — prior node ids (or bare old logical names, resolved against
+    - ``aliases``: prior node ids (or bare prior logical names, resolved against
       this resource's stack + type) this resource has been *renamed from*. When
       the new id is absent from state but an alias id is present, the plan maps
       the existing state node to the new id instead of destroy + create.

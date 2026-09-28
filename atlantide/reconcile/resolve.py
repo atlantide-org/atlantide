@@ -1,10 +1,8 @@
 """Handle resolution: Refs, secret handles, and stack-output handles -> values.
 
-Everything here is pure with respect to providers — resolution reads live
-outputs, the secrets registry, and committed stack outputs, never the cloud.
-``reconstruct`` is the inverse of persistence: it rebuilds a live ``Resource``
-from a stored :class:`StateNode` so delete/read/refresh can call providers with
-a typed object.
+Resolution never calls providers: it reads live outputs, the secrets registry and
+committed stack outputs only. ``reconstruct`` rebuilds a ``Resource`` from a stored
+:class:`StateNode` so delete, read and refresh can pass providers a typed object.
 """
 
 from __future__ import annotations
@@ -16,6 +14,7 @@ from atlantide.core._tree import tree_any, tree_collect, tree_map
 from atlantide.core.errors import ProviderError
 from atlantide.core.fields import sensitive_fields
 from atlantide.core.markers import (
+    STACK_OUTPUT_KEY,
     is_ref_marker,
     is_ref_or_marker,
     is_stack_output_marker,
@@ -27,13 +26,13 @@ from atlantide.core.markers import (
 from atlantide.core.node_id import field_scope, local_name_of, type_name_of
 from atlantide.core.resource import Resource
 from atlantide.core.types import Ref, SecretRef, StackOutputRef, Transform, format_template
-from atlantide.reconcile.context import ApplyEnv, LiveOutputs
+from atlantide.reconcile.env import ApplyEnv, LiveOutputs
 from atlantide.secrets import (
     SecretsRegistry,
     is_secret_ref_marker,
     secret_ref_from_marker,
 )
-from atlantide.state.backend import StateGraph, StateNode
+from atlantide.state import StateGraph, StateNode
 
 
 def resolve_value(value: Any, outputs: LiveOutputs, *, strict: bool = True) -> Any:
@@ -69,11 +68,10 @@ def resolve_value(value: Any, outputs: LiveOutputs, *, strict: bool = True) -> A
 def _eval_transform(op: str, args: list[Any], outputs: LiveOutputs, *, strict: bool) -> Any:
     """Evaluate a deferred ``$transform`` once its operand refs resolve.
 
-    Operands resolve through ``resolve_value``, so nested refs and transforms are
-    supported, then reduce through a fixed allowlist of pure ops. No arbitrary code
-    runs, so apply stays deterministic: ``interpolate`` reduces through
-    :func:`~atlantide.core.types.format_template` rather than ``str.format``,
-    whose field syntax walks attributes on live objects.
+    Operands resolve through ``resolve_value`` (so they may nest), then reduce through
+    a fixed allowlist of pure ops. ``interpolate`` uses
+    :func:`~atlantide.core.types.format_template` rather than ``str.format``, whose
+    field syntax walks attributes on live objects.
     """
     resolved = [resolve_value(arg, outputs, strict=strict) for arg in args]
     reducer = _TRANSFORM_OPS.get(op)
@@ -82,13 +80,26 @@ def _eval_transform(op: str, args: list[Any], outputs: LiveOutputs, *, strict: b
     return reducer(resolved)
 
 
-#: Pure reducers over resolved operands. Every entry is deterministic and
-#: side-effect free.
+#: Deterministic, side-effect-free reducers over resolved operands.
 _TRANSFORM_OPS: dict[str, Callable[[list[Any]], Any]] = {
     "concat": lambda a: "".join(str(x) for x in a),
     "interpolate": lambda a: format_template(str(a[0]), *a[1:]),
     "join": lambda a: str(a[0]).join(str(x) for x in a[1]),
 }
+
+
+def resolve_properties(
+    properties: dict[str, Any], outputs: LiveOutputs, *, strict: bool = True
+) -> dict[str, Any]:
+    """Lowered (IR or state) properties with every ``$ref``/``$transform`` resolved.
+
+    Secret and stack-output handles stay markers: they compare symbolically, as
+    in the diff. ``strict`` as for :func:`resolve_value`.
+    """
+    return {
+        name: resolve_value(value, outputs, strict=strict) if needs_resolution(value) else value
+        for name, value in properties.items()
+    }
 
 
 def needs_resolution(value: Any) -> bool:
@@ -104,9 +115,8 @@ _KEEP = object()
 def _updated_inputs(res: Resource, rewrite: Callable[[str, Any], Any]) -> Resource:
     """A copy of ``res`` with each input field passed through ``rewrite``.
 
-    The shared shape behind the three resolution passes: ``rewrite`` returns the
-    replacement value, or :data:`_KEEP` to leave the field alone; the copy is
-    skipped entirely when nothing changed.
+    ``rewrite`` returns the replacement value, or :data:`_KEEP` to leave the field
+    alone. Returns ``res`` itself when nothing changed.
     """
     updates = {
         name: replaced
@@ -133,26 +143,57 @@ def resolve_secret_refs(res: Resource, secrets: SecretsRegistry) -> Resource:
 def resolve_stack_refs(
     res: Resource, stack_outputs: dict[str, Any], *, strict: bool = True
 ) -> Resource:
-    """Replace each ``StackOutputRef`` field with the referenced stack's output.
+    """Replace each ``StackOutputRef`` with the referenced stack's output.
+
+    A handle nested in a container or a ``Transform`` operand is replaced too. A
+    ``Transform`` left with only concrete operands is then evaluated; one still
+    holding a ``Ref`` is rebuilt for :func:`resolve_refs` to evaluate, so this
+    must run first.
 
     ``strict`` (apply) raises if the referenced output is absent; ``strict=False``
-    (rebuilding from partial state) leaves the handle in place, which delete and
+    (rebuilding from partial state) leaves the field as it was, which delete and
     read do not consume.
     """
 
     def rewrite(_: str, value: Any) -> Any:
-        if not isinstance(value, StackOutputRef):
+        if not tree_any(value, lambda v: isinstance(v, StackOutputRef)):
             return _KEEP
-        key = f"{value.stack}:{value.name}"
-        if key in stack_outputs:
-            return stack_outputs[key]
-        if strict:
-            raise ProviderError(
-                f"stack output {key!r} not found — apply stack {value.stack!r} first"
-            )
-        return _KEEP
+        missing = False
+
+        def leaf(v: Any) -> Any:
+            nonlocal missing
+            if isinstance(v, Transform):
+                # `tree_map` does not rebuild a Transform (see core/inline.py).
+                return Transform(v.op, tuple(tree_map(arg, leaf) for arg in v.args))
+            if not isinstance(v, StackOutputRef):
+                return v
+            key = f"{v.stack}:{v.name}"
+            if key in stack_outputs:
+                return stack_outputs[key]
+            if strict:
+                raise ProviderError(
+                    f"stack output {key!r} not found — apply stack {v.stack!r} first"
+                )
+            missing = True
+            return v
+
+        substituted = tree_map(value, leaf)
+        if missing:
+            return _KEEP
+        if needs_resolution(substituted) or not tree_any(substituted, _is_transform):
+            return substituted
+        return resolve_value(substituted, {})
 
     return _updated_inputs(res, rewrite)
+
+
+def _is_transform(value: Any) -> bool:
+    return isinstance(value, Transform)
+
+
+def cbd_companion_id(node_id: str) -> str:
+    """Companion state id recording the still-live old half of a CBD REPLACE."""
+    return f"{node_id}~replaced"
 
 
 def reconstruct(node: StateNode, env: ApplyEnv, outputs: LiveOutputs) -> Resource:
@@ -162,24 +203,35 @@ def reconstruct(node: StateNode, env: ApplyEnv, outputs: LiveOutputs) -> Resourc
     validation; ``$ref`` markers resolve against outputs. Handles then resolve to
     values (secrets to plaintext, stack refs to committed outputs) leniently, since
     delete and read do not require a missing cross-stack value.
+
+    A create-before-destroy companion row (``<id>~replaced``) rebuilds under its
+    resource's own name: the suffix is not a valid resource name.
     """
     cls = env.types.get(node.type)
     if cls is None:
         raise ProviderError(
             f"cannot delete {node.id!r}: resource type {node.type!r} is unavailable"
         )
-    name = local_name_of(node.id)
+    name = local_name_of(node.id).removesuffix(cbd_companion_id(""))
+
+    def committed(value: Any) -> Any:
+        """A nested ``$stack_output`` marker's committed value, if there is one."""
+        if is_stack_output_marker(value):
+            return env.stack_outputs.get(value[STACK_OUTPUT_KEY], value)
+        return value
 
     def rebuild(value: Any) -> Any:
         if is_secret_ref_marker(value):
             return secret_ref_from_marker(value)
         if is_stack_output_marker(value):
             return stack_output_from_marker(value)
+        if tree_any(value, is_stack_output_marker):
+            value = tree_map(value, committed)
         return resolve_value(value, outputs, strict=False)
 
     props: dict[str, Any] = {key: rebuild(value) for key, value in node.properties.items()}
-    # Restore persisted outputs onto their computed fields so read/delete can use
-    # them. Declared fields only, excluding any already set as inputs.
+    # Restore persisted outputs onto declared computed fields for read/delete,
+    # without overriding inputs.
     for key, value in node.outputs.items():
         if key in cls.model_fields and key not in props:
             props[key] = env.secrets.unseal(value)  # sensitive outputs are sealed at rest
@@ -211,12 +263,10 @@ def unseal_outputs(outputs: dict[str, Any], secrets: SecretsRegistry) -> dict[st
 
 
 def live_outputs(prior: StateGraph, secrets: SecretsRegistry) -> LiveOutputs:
-    """Plaintext outputs of every recorded node, the seed ``Ref`` resolution needs.
+    """Plaintext outputs of every recorded node, used to seed ``Ref`` resolution.
 
-    Rows are sealed at rest and refs resolve against plaintext, so apply, refresh
-    and adopt each begin by unsealing the whole prior graph. Written once here so
-    that "sealed at rest, plaintext for resolution" is one statement rather than
-    three copies to keep in step.
+    Rows are sealed at rest; refs resolve against plaintext. Apply, refresh and
+    adopt all seed resolution from here.
     """
     return {nid: unseal_outputs(node.outputs, secrets) for nid, node in prior.nodes.items()}
 

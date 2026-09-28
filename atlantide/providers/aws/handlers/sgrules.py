@@ -1,100 +1,108 @@
 """Translation between a declared :class:`SgRule` and EC2's ``IpPermission``.
 
-Pure data mapping in both directions, kept apart from the handlers because it is
-the fiddliest thing in the module and the easiest to reason about in isolation:
-what a rule *permits* versus what merely describes it decides whether a config
-edit revokes and re-authorizes real firewall rules.
+Pure data mapping in both directions. The split between what a rule permits and
+what only describes it decides whether a config edit revokes and re-authorizes
+firewall rules.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from atlantide.providers.aws.resources.networking import SgRule
 
 
 def rule_to_aws(rule: SgRule) -> dict[str, Any]:
-    """One :class:`SgRule` as an ``IpPermission``."""
+    """One :class:`SgRule` as an ``IpPermission``.
+
+    AWS stores a description per range, so the rule's description is written to
+    every range and group pair.
+    """
     permission: dict[str, Any] = {"IpProtocol": rule.protocol}
     if rule.protocol != "-1":
         permission["FromPort"] = rule.from_port
         permission["ToPort"] = rule.to_port
+    described = {"Description": rule.description} if rule.description else {}
     if rule.cidr_blocks:
-        permission["IpRanges"] = [
-            {"CidrIp": cidr, "Description": rule.description}
-            if rule.description
-            else {"CidrIp": cidr}
-            for cidr in rule.cidr_blocks
-        ]
+        permission["IpRanges"] = [{"CidrIp": cidr, **described} for cidr in rule.cidr_blocks]
     if rule.ipv6_cidr_blocks:
-        permission["Ipv6Ranges"] = [{"CidrIpv6": cidr} for cidr in rule.ipv6_cidr_blocks]
+        permission["Ipv6Ranges"] = [
+            {"CidrIpv6": cidr, **described} for cidr in rule.ipv6_cidr_blocks
+        ]
     if rule.source_security_group_id:
-        permission["UserIdGroupPairs"] = [{"GroupId": rule.source_security_group_id}]
+        permission["UserIdGroupPairs"] = [{"GroupId": rule.source_security_group_id, **described}]
     return permission
 
 
 def rules_from_aws(permissions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Live ``IpPermission``s in the shape a declared rule stores.
+    """``IpPermission``s as single-source rules in the shape a declared rule stores.
 
-    Comparable with what config declared, so refresh can flag a rule added or
-    removed out of band. Sorted for a stable comparison — AWS returns no order.
+    Lets refresh flag a rule added or removed out of band. EC2 merges every range
+    sharing ``(protocol, from, to)`` into one permission, so rules are split to one
+    source each (see :func:`atomic_units`); sorted and deduplicated because AWS
+    returns no stable order. Declared rules passed through :func:`rule_to_aws`
+    normalize to the same form.
     """
-    rules = [
-        {
-            "protocol": str(p.get("IpProtocol", "")),
-            "from_port": p.get("FromPort"),
-            "to_port": p.get("ToPort"),
-            "cidr_blocks": sorted(r["CidrIp"] for r in p.get("IpRanges", [])),
-            "ipv6_cidr_blocks": sorted(r["CidrIpv6"] for r in p.get("Ipv6Ranges", [])),
-            "source_security_group_id": next(
-                (g["GroupId"] for g in p.get("UserIdGroupPairs", [])), None
-            ),
-            # Read back rather than blanked. AWS stores the description on each
-            # range, so a hardcoded "" differs from any rule that declared one —
-            # including the allow-all egress `SecurityGroup` supplies by default,
-            # which made every untouched security group report drift forever.
-            "description": _description(p),
-        }
-        for p in permissions
+    rules = {}
+    for unit in atomic_units(permissions):
+        rule = _unit_rule(unit)
+        rules[json.dumps(rule, sort_keys=True)] = rule
+    return [rules[key] for key in sorted(rules)]
+
+
+def _unit_rule(unit: dict[str, Any]) -> dict[str, Any]:
+    """One single-source ``IpPermission`` unit as a rule mapping."""
+    source = _source(unit)
+    return {
+        "protocol": str(unit.get("IpProtocol", "")),
+        "from_port": unit.get("FromPort"),
+        "to_port": unit.get("ToPort"),
+        "cidr_blocks": [source["CidrIp"]] if "CidrIp" in source else [],
+        "ipv6_cidr_blocks": [source["CidrIpv6"]] if "CidrIpv6" in source else [],
+        "source_security_group_id": source.get("GroupId"),
+        # AWS stores the description per range; it must be read back to match
+        # declared rules, including `ALLOW_ALL_EGRESS`, without spurious drift.
+        "description": description(unit),
+    }
+
+
+def _source(unit: dict[str, Any]) -> dict[str, Any]:
+    """A one-range unit's only range or group pair, or ``{}`` if it has none."""
+    entries = [
+        *unit.get("IpRanges", []),
+        *unit.get("Ipv6Ranges", []),
+        *unit.get("UserIdGroupPairs", []),
     ]
-    return sorted(rules, key=lambda r: (r["protocol"], str(r["from_port"]), r["cidr_blocks"]))
+    return entries[0] if entries else {}
 
 
-def _description(permission: dict[str, Any]) -> str:
-    """The description AWS holds for this permission's first described range.
-
-    One string for the whole rule because that is how :class:`SgRule` declares it,
-    while AWS attaches one per range; `rule_to_aws` writes the same text to every
-    range, so reading any of them back recovers what was declared.
-    """
-    ranges = [*permission.get("IpRanges", []), *permission.get("Ipv6Ranges", [])]
-    return next((r["Description"] for r in ranges if r.get("Description")), "")
+def description(unit: dict[str, Any]) -> str:
+    """The description AWS holds for a one-range unit (see :func:`atomic_units`)."""
+    return str(_source(unit).get("Description", ""))
 
 
 def atomic_units(permissions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Each ``IpPermission`` split into one-range units.
 
-    EC2 coalesces live rules by ``(protocol, from, to)`` and merges every range
-    into one permission, so two declared rules for the same port with different
-    CIDRs read back as a single merged permission. Comparing whole permissions
-    then matches nothing: already-present ranges are re-authorized
-    (``InvalidPermission.Duplicate`` fails the update) and merged live rules are
-    revoked wholesale. Units are the grain EC2 actually authorizes and revokes
-    at, so the delta is computed over them.
+    EC2 merges every range with the same ``(protocol, from, to)`` into one live
+    permission, so whole-permission comparison re-authorizes present ranges
+    (``InvalidPermission.Duplicate``) and revokes merged rules wholesale. Units
+    are the grain EC2 authorizes and revokes at.
     """
     units: list[dict[str, Any]] = []
     for permission in permissions:
-        # Annotated because the literal key tuple would otherwise infer a
-        # `Literal[...]` key type, which does not unpack into a `str`-keyed dict.
+        # Annotated: the literal key tuple otherwise infers `Literal[...]` keys,
+        # which do not unpack into a `str`-keyed dict.
         base: dict[str, Any] = {
             k: permission[k] for k in ("IpProtocol", "FromPort", "ToPort") if k in permission
         }
-        for entry in permission.get("IpRanges", []):
-            units.append({**base, "IpRanges": [entry]})
-        for entry in permission.get("Ipv6Ranges", []):
-            units.append({**base, "Ipv6Ranges": [entry]})
-        for entry in permission.get("UserIdGroupPairs", []):
-            units.append({**base, "UserIdGroupPairs": [entry]})
+        units.extend({**base, "IpRanges": [entry]} for entry in permission.get("IpRanges", []))
+        units.extend({**base, "Ipv6Ranges": [entry]} for entry in permission.get("Ipv6Ranges", []))
+        units.extend(
+            {**base, "UserIdGroupPairs": [entry]}
+            for entry in permission.get("UserIdGroupPairs", [])
+        )
         if not (
             permission.get("IpRanges")
             or permission.get("Ipv6Ranges")
@@ -107,9 +115,8 @@ def atomic_units(permissions: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def identity(permission: dict[str, Any]) -> tuple[Any, ...]:
     """What makes two rules the same rule, ignoring description.
 
-    Description is metadata AWS attaches to a range rather than part of what the
-    rule permits; treating it as identity would revoke and re-authorize a rule
-    every time a comment changed.
+    Description is range metadata, not part of what the rule permits; including it
+    would revoke and re-authorize a rule whenever its description changed.
     """
     return (
         permission.get("IpProtocol"),
@@ -123,3 +130,22 @@ def identity(permission: dict[str, Any]) -> tuple[Any, ...]:
 
 def has_rule(permissions: list[dict[str, Any]], permission: dict[str, Any]) -> bool:
     return any(identity(p) == identity(permission) for p in permissions)
+
+
+def redescribed(
+    desired: list[dict[str, Any]], current: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The ``desired`` units present live under a different description.
+
+    :func:`identity` ignores descriptions, so the authorize/revoke delta never
+    applies a description-only edit; these units go through
+    ``update_security_group_rule_descriptions_*`` instead.
+    """
+    return [
+        unit
+        for unit in desired
+        if any(
+            identity(live) == identity(unit) and description(live) != description(unit)
+            for live in current
+        )
+    ]

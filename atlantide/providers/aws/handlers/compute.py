@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
-
-from typing_extensions import override
+from typing import Any, override
 
 from atlantide.core.errors import ProviderError
 from atlantide.providers.aws.handlers.base import (
     AwsHandler,
+    Client,
     create_or_adopt,
     ignore_missing,
     sync_tags,
@@ -23,7 +22,7 @@ class LambdaFunctionHandler(AwsHandler[LambdaFunction]):
     resource_type = LambdaFunction
 
     @override
-    def create(self, client: Any, res: LambdaFunction) -> dict[str, Any]:
+    def create(self, client: Client, res: LambdaFunction) -> dict[str, Any]:
         def make() -> dict[str, Any]:
             resp = client.create_function(
                 FunctionName=res.function_name,
@@ -38,13 +37,23 @@ class LambdaFunctionHandler(AwsHandler[LambdaFunction]):
             )
             return {"arn": resp["FunctionArn"]}
 
-        # Adopt to the *create* shape, not the read shape: `read` also reports the
-        # mutable inputs, and storing those as outputs would shadow the inputs they
-        # mirror on the next refresh.
-        return create_or_adopt(make, lambda: self._outputs(client, res))
+        def adopt() -> dict[str, Any] | None:
+            if self._outputs(client, res) is None:
+                return None  # vanished between the conflict and the read
+            # The adopted function keeps whatever configuration and code it had,
+            # while state records the declared inputs, so the next plan would see
+            # no diff. Converge it now, as an update would. A function created
+            # moments ago is still Pending and rejects configuration changes.
+            _wait_active(client, res.function_name)
+            return self.update(client, {}, res)
 
-    def _outputs(self, client: Any, res: LambdaFunction) -> dict[str, Any] | None:
-        """Just what a create returns: the arn, or None if there is no function."""
+        # Adopt with the create-shaped outputs (`update` returns them too): `read`
+        # also reports the mutable inputs, which stored as outputs would shadow
+        # those inputs on refresh.
+        return create_or_adopt(make, adopt)
+
+    def _outputs(self, client: Client, res: LambdaFunction) -> dict[str, Any] | None:
+        """The create-shaped outputs: the arn, or None if there is no function."""
         try:
             resp = client.get_function(FunctionName=res.function_name)
         except client.exceptions.ResourceNotFoundException:
@@ -52,23 +61,16 @@ class LambdaFunctionHandler(AwsHandler[LambdaFunction]):
         return {"arn": resp["Configuration"]["FunctionArn"]}
 
     @override
-    def read(self, client: Any, res: LambdaFunction) -> dict[str, Any] | None:
+    def read(self, client: Client, res: LambdaFunction) -> dict[str, Any] | None:
         try:
             resp = client.get_function(FunctionName=res.function_name)
         except client.exceptions.ResourceNotFoundException:
             return None
         config = resp["Configuration"]
-        # Observe the mutable inputs alongside the arn, so refresh detects a handler
-        # repointed or a timeout raised in the console instead of reporting an
-        # unchecked "in sync".
-        #
-        # `CodeSha256` is deliberately absent: AWS reports it base64-encoded while
-        # `code_sha256` is hex, so comparing them would flag drift on every run.
-        # The coverage report names it as unchecked instead.
-        # Only keys the API actually returned: falling back to the desired value
-        # reports config as though it had been observed, which is exactly how
-        # the refresh coverage machinery gets fooled (an omitted key is
-        # *unchecked*, and refresh renders that truthfully).
+        # Report the mutable inputs alongside the arn so refresh detects console
+        # edits. Only keys the API returned are reported; an omitted key shows as
+        # unchecked in refresh coverage. `CodeSha256` is omitted: AWS reports it
+        # base64-encoded while `code_sha256` is hex.
         observed: dict[str, Any] = {"arn": config["FunctionArn"]}
         for name, key in (
             ("runtime", "Runtime"),
@@ -82,9 +84,9 @@ class LambdaFunctionHandler(AwsHandler[LambdaFunction]):
         return observed
 
     @override
-    def update(self, client: Any, prior: dict[str, Any], res: LambdaFunction) -> dict[str, Any]:
-        # Configuration and code are separate APIs; the code call uploads the
-        # package, so it runs only when there is one to upload.
+    def update(self, client: Client, prior: dict[str, Any], res: LambdaFunction) -> dict[str, Any]:
+        # Configuration and code are separate APIs; the code call runs only when
+        # there is a package to upload.
         resp = client.update_function_configuration(
             FunctionName=res.function_name,
             Role=res.role_arn,
@@ -96,9 +98,8 @@ class LambdaFunctionHandler(AwsHandler[LambdaFunction]):
         )
         arn = resp["FunctionArn"]
         if _has_code(res):
-            # The configuration update leaves LastUpdateStatus=InProgress for a
-            # while, and a code upload during it raises ResourceConflictException
-            # on real AWS. Wait for the update to settle first.
+            # A code upload while LastUpdateStatus=InProgress raises
+            # ResourceConflictException, so wait for the configuration update.
             _wait_updated(client, res.function_name)
             client.update_function_code(FunctionName=res.function_name, **_code(res))
         sync_tags(
@@ -110,17 +111,26 @@ class LambdaFunctionHandler(AwsHandler[LambdaFunction]):
         return {"arn": arn}
 
     @override
-    def delete(self, client: Any, res: LambdaFunction) -> None:
+    def delete(self, client: Client, res: LambdaFunction) -> None:
         with ignore_missing():
             client.delete_function(FunctionName=res.function_name)
 
 
-def _wait_updated(client: Any, function_name: str) -> None:
+def _wait_updated(client: Client, function_name: str) -> None:
     """Block until the function's last update reaches a terminal status."""
     try:
         waiter = client.get_waiter("function_updated_v2")
-    except ValueError:  # a botocore old enough to lack the v2 waiter
+    except ValueError:  # botocore versions without the v2 waiter
         waiter = client.get_waiter("function_updated")
+    waiter.wait(FunctionName=function_name)
+
+
+def _wait_active(client: Client, function_name: str) -> None:
+    """Block until the function leaves ``Pending`` (a fresh create)."""
+    try:
+        waiter = client.get_waiter("function_active_v2")
+    except ValueError:  # botocore versions without the v2 waiter
+        waiter = client.get_waiter("function_active")
     waiter.wait(FunctionName=function_name)
 
 
@@ -131,10 +141,8 @@ def _has_code(res: LambdaFunction) -> bool:
 def _code(res: LambdaFunction) -> dict[str, Any]:
     """The ``Code`` payload: the package this function is supposed to run.
 
-    There is deliberately no default. A function created from a placeholder
-    deploys, reports success, and then fails at its first invocation running code
-    nobody wrote — the worst shape a failure can take, because every signal up to
-    that point says it worked.
+    There is no placeholder default: a function created from one deploys
+    successfully and fails at its first invocation.
     """
     if res.s3_bucket is not None:
         code: dict[str, Any] = {"S3Bucket": res.s3_bucket, "S3Key": res.s3_key}
@@ -164,8 +172,8 @@ def _lambda_env(res: LambdaFunction) -> dict[str, Any]:
     """The ``Environment`` kwarg: declared variables plus the signing secret.
 
     Always present, even when empty: omitting ``Environment`` from
-    ``update_function_configuration`` leaves the live variables untouched, so an
-    empty map is what clears a removed variable.
+    ``update_function_configuration`` leaves the live variables untouched; an
+    empty map clears removed variables.
     """
     variables: dict[str, Any] = dict(res.environment)
     if res.signing_secret is not None:

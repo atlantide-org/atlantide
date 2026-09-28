@@ -1,7 +1,7 @@
 """Secret-reference markers and the rotation digest.
 
 A :class:`~atlantide.core.types.SecretRef` serializes to ``{"$secret_ref":
-{"name", "provider"}}`` in canonical inputs, the IR, and persisted state — a
+{"name", "provider"}}`` in canonical inputs, the IR, and persisted state: a
 handle, never a value. State also keeps a salted digest of the *resolved* value
 so a rotation (same name, new value) is detectable without storing the value.
 
@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+from atlantide.core.markers import single_key_marker
 from atlantide.core.types import SECRET_REF_KEY as _MARKER_KEY
 from atlantide.core.types import SecretRef
 
@@ -35,7 +36,7 @@ def secret_digest(scope: str, plaintext: str, *, salt: bytes = _FALLBACK_SALT) -
 
 def is_secret_ref_marker(value: Any) -> bool:
     """Whether ``value`` is a ``{"$secret_ref": {...}}`` handle marker."""
-    return isinstance(value, dict) and len(value) == 1 and isinstance(value.get(_MARKER_KEY), dict)
+    return isinstance(single_key_marker(value, _MARKER_KEY), dict)
 
 
 def secret_ref_from_marker(value: Any) -> SecretRef:

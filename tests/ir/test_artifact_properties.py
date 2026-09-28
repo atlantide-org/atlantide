@@ -2,26 +2,23 @@
 
 An artifact is the promotion unit: build once in CI, deploy the same bytes to
 staging and then to production. Everything that makes that safe is a property of
-this one serialize/parse pair, and each one fails in a way examples are bad at
-catching.
+this one serialize/parse pair, and each fails in ways examples rarely catch.
 
 * **The round trip.** ``deploy`` plans from a parsed artifact, never from source.
-  A field that survives ``dumps`` but not ``loads`` does not raise anything — it
-  reappears as a default, and the plan built from it is quietly a plan for a
-  different config. The dangerous instance is ``aliases``: lose it and a rename
-  lowers to a destroy plus a create, against live infrastructure.
+  A field that survives ``dumps`` but not ``loads`` raises nothing: it reappears
+  as a default, and the plan built from it is a plan for a different config. The
+  dangerous instance is ``aliases``: lose it and a rename lowers to a destroy
+  plus a create, against live infrastructure.
 * **The hash anchor.** ``ir_hash`` is what makes a corrupted or edited artifact
-  detectable at all. It has to survive the round trip *and* it has to actually
-  move when the IR does — a hash that verifies whatever you hand it is worse than
-  no hash, because the deploy path trusts it.
+  detectable. It must survive the round trip *and* move when the IR does; the
+  deploy path trusts it, so a hash that verifies any input is worse than none.
 * **Failing closed on garbage.** ``loads`` takes a file off disk or out of an
   artifact store. Returning a *wrong* artifact from a damaged one would plan
-  against a config nobody wrote. Refusing is the only acceptable answer, and it
-  has to be the answer for arbitrary input rather than for the malformed strings
-  someone thought of.
+  against a config nobody wrote. It must refuse, for arbitrary input rather than
+  only for hand-picked malformed strings.
 
 ``loads`` returns a ``Result`` rather than raising, so failure here is a
-``Failure`` value — not something ``pytest.raises`` would see.
+``Failure`` value, not something ``pytest.raises`` would see.
 """
 
 from __future__ import annotations
@@ -59,7 +56,7 @@ def policy_bindings() -> st.SearchStrategy[PolicyBinding]:
 def artifacts() -> st.SearchStrategy[Artifact]:
     """A built artifact. Constructed through ``build_artifact`` rather than
     assembled field by field, so ``ir_hash`` and ``provider_pins`` are whatever
-    the real builder derives — an artifact with a hand-set hash would make
+    the real builder derives; an artifact with a hand-set hash would make
     ``verify_hash`` vacuous."""
     return st.builds(
         build_artifact,
@@ -72,8 +69,7 @@ def artifacts() -> st.SearchStrategy[Artifact]:
 
 @given(artifacts())
 def test_an_artifact_survives_a_round_trip(artifact: Artifact) -> None:
-    """The whole promise: the bytes written by ``build`` parse back to the
-    artifact ``deploy`` acts on."""
+    """The bytes written by ``build`` parse back to the artifact ``deploy`` acts on."""
     assert loads(artifact.dumps()) == Success(artifact)
 
 
@@ -94,11 +90,10 @@ def test_the_hash_still_verifies_after_a_round_trip(artifact: Artifact) -> None:
 
 @given(artifacts(), st.data())
 def test_a_tampered_ir_no_longer_verifies(artifact: Artifact, data: st.DataObject) -> None:
-    """The anchor has to move when the IR does, or it is not an anchor.
+    """The hash must move when the IR does.
 
-    Perturbing one node's properties is the edit that matters — it is what an
-    attacker changing an instance size or a bucket policy would do, and it leaves
-    the artifact structurally valid.
+    Perturbing one node's properties models an attacker changing an instance size
+    or a bucket policy, and leaves the artifact structurally valid.
     """
     index = data.draw(st.integers(min_value=0, max_value=len(artifact.ir.nodes) - 1))
     target = artifact.ir.nodes[index]
@@ -124,8 +119,8 @@ def test_arbitrary_text_is_refused_rather_than_misread(text: str) -> None:
         case Failure(_):
             return
         case Success(artifact):
-            # Anything that did parse must re-serialize to itself — i.e. it really
-            # was an artifact, not garbage that happened to survive the parse.
+            # Anything that parsed must re-serialize to itself, i.e. be a real
+            # artifact rather than garbage that survived the parse.
             assert loads(artifact.dumps()) == Success(artifact)
 
 
@@ -151,13 +146,12 @@ def test_a_rename_directive_survives_the_round_trip_without_moving_the_hash(
     ir: IRGraph, aliases: list[str], ordering: list[str]
 ) -> None:
     """`aliases` and `depends_on` are migration and ordering directives, not
-    identity — the contract stated on `IRNode`.
+    identity (the contract stated on `IRNode`).
 
-    Both halves matter and they pull opposite ways. They must survive `dumps`
-    (that is what `to_stored` is for; without them a deploy lowers a rename to a
-    destroy plus a create) while staying out of the hash (adding an ordering hint
-    would otherwise re-hash the node and everything below it, producing an UPDATE
-    on resources whose configuration did not change).
+    They must survive `dumps` (that is what `to_stored` is for; without them a
+    deploy lowers a rename to a destroy plus a create) while staying out of the
+    hash (adding an ordering hint would otherwise re-hash the node and everything
+    below it, producing an UPDATE on resources whose configuration did not change).
     """
     directed = IRGraph(
         nodes=tuple(

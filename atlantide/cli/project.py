@@ -1,110 +1,17 @@
 """Optional per-project defaults read from ``atlantide.toml``.
 
-Sets a default config file, state db, secrets store, AWS connection, and
-parallelism. Explicit CLI arguments win; a missing file is not an error.
+Explicit CLI arguments win; a missing file is not an error. The file is looked
+up in the working directory and then in each parent, as git and cargo do, so a
+command run from a subdirectory still finds it; without it, a remote ``[state]``
+table would be missed and the command would use a fresh local database.
+Relative paths in the file resolve against the directory it was found in
+(:attr:`ProjectConfig.root`), not the working directory.
 
-The file is looked up in the working directory and then in each parent, as git
-and cargo do, so commands behave the same from anywhere inside a project. Without
-that walk, running from a subdirectory silently drops the whole file — including
-a remote ``[state]`` table, which turns a shared-state command into one against a
-fresh empty local database. Every relative path in the file resolves against the
-directory the file was found in (:attr:`ProjectConfig.root`), not the working
-directory, so the same paths mean the same thing from either place.
-
-Profiles overlay the top level, so one project can describe several
-environments without duplicating a file per directory::
-
-    state = "dev.db"
-
-    [profile.prod]
-    parallelism = 16
-
-    [profile.prod.state]
-    backend = "s3"
-    bucket  = "acme-atlantide-state"
-    key     = "prod/atlantide.json"
-
-``atlantide --profile prod apply`` (or ``ATLANTIDE_PROFILE=prod``) merges
+``atlantide --profile prod`` (or ``ATLANTIDE_PROFILE=prod``) merges
 ``[profile.prod]`` over the top-level keys, table by table.
 
-Recognized keys (top level)::
-
-    config        = "infra.py"          # default Atlas-lang config
-    state         = "atlantide.db"      # default state database
-    secrets_key   = "atlantide.key"     # secrets-store encryption keyfile
-    secrets_store = "atlantide.secrets" # encrypted name->value store
-    aws_region    = "eu-north-1"        # default AWS region
-    aws_profile   = "prod"              # AWS shared-config profile
-    aws_endpoint  = "http://localhost:4566"  # send every AWS call here instead
-    parallelism   = 16                  # max concurrent provider operations
-
-Remote state — shared across machines, with cross-host per-subgraph locking. The
-``state``/``--state`` file above is the local default; this table replaces it::
-
-    [state]
-    backend    = "s3"                   # "local" (default) | "s3" | "postgres"
-    bucket     = "acme-atlantide-state" # s3: bucket holding the state object
-    key        = "prod/atlantide.json"  # s3: object key
-    lock_table = "atlantide-locks"      # s3: DynamoDB table holding the leases
-    kms_key_id = "alias/atlantide"      # s3: optional SSE-KMS key (else AES256)
-    region     = "eu-north-1"           # s3
-    endpoint   = "http://localhost:4566"  # s3: send state calls here instead
-    # backend = "postgres"
-    # dsn    = "postgresql://..."       # or the ATLANTIDE_STATE_DSN env var
-    # schema = "atlantide"
-    lock_ttl            = 300           # seconds a lease lasts before it lapses
-    lock_renew_interval = 100           # how often a live run pushes that out
-    node_timeout        = 2400          # ceiling on one resource's reconcile
-
-The lease is renewed for as long as a run is alive, so ``lock_ttl`` bounds how
-long a *dead* run blocks its teammates rather than how long a live one may take —
-a lower value is a faster recovery, not a shorter deadline. The interval must be
-well under the TTL so a single slow renewal is survivable.
-
-Secret resolution — which backend a ``SecretRef`` resolves against by default::
-
-    [secrets]
-    provider = "ssm"                    # "keyfile" (default) | "env" | "ssm"
-    prefix   = "/atlantide/prod/"       # ssm: prepended to the secret name
-    region   = "eu-north-1"             # ssm
-
-Alternate accounts (a resource selects one via ``provider_alias=``)::
-
-    [aws.aliases.prod]
-    profile  = "prod-account"                # AWS shared-config profile
-    endpoint = "http://localhost:4566"       # optional endpoint override
-
-Per-run inputs the config reads with ``atlantide.input(name)``::
-
-    [inputs]
-    instance_count = 2
-
-    [profile.prod.inputs]
-    instance_count = 10
-
-``--var-file f.toml`` overrides these, and ``-var name=value`` overrides both.
-
-Environments are declared with :class:`~atlantide.core.config.Config` in the
-config file and selected with ``--env``, not with inputs. The three mechanisms:
-
-- ``[inputs]`` / ``--var`` — a per-run value from outside the repository (a CI
-  build number, a fork's name prefix). Untyped, since it arrives as text.
-- ``Config(AppEnv, envs=...)`` — the checked-in, typed environment matrix,
-  validated when the config is evaluated. ``AppEnv`` is an ``EnvSchema``
-  subclass, so an editor completes each variable.
-- ``[profile.<name>]`` — where the run points: state backend, AWS
-  profile/region, parallelism, plus an ``[inputs]`` overlay.
-
-``--profile`` and ``--env`` are orthogonal; neither implies the other.
-
-Published components fetched from public git repos (see
-:mod:`atlantide.components`); config imports them as
-``atlantide.components.<alias>``::
-
-    [components.acme]
-    git    = "https://github.com/acme/atlantide-secure-bucket"
-    ref    = "v1.2.0"                         # tag/branch/commit requested
-    subdir = "src"                            # optional: package location in the repo
+Every recognized key is listed in ``atlantide/cli/README.md``, under
+"atlantide.toml keys".
 """
 
 from __future__ import annotations
@@ -112,37 +19,51 @@ from __future__ import annotations
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypedDict
 
 from atlantide.components.source import ComponentSource
 from atlantide.core.errors import AtlantideError
+from atlantide.lang import DEFAULT_FUEL
 from atlantide.secrets import SecretsConfig
+from atlantide.secrets.factory import parse_env_allow
 from atlantide.state import StateConfig
+from atlantide.util.project import PROJECT_FILENAME, find_project_file
 
 # Re-exported: `[components.*]`, `[state]` and `[secrets]` are parsed here but the
-# types live with the domain they configure.
+# types live with the domain they configure; the project file's name and lookup
+# are shared with the local provider, which may not import the CLI.
 __all__ = [
+    "MAX_FUEL",
     "PROJECT_FILENAME",
+    "AwsAliasSettings",
     "ComponentSource",
     "ProjectConfig",
     "ProjectError",
     "SecretsConfig",
     "StateConfig",
+    "check_fuel",
     "find_project_file",
     "load_project",
 ]
+
+
+class AwsAliasSettings(TypedDict):
+    """One ``[aws.aliases.<name>]`` table: an alternate account to reach."""
+
+    profile: str | None
+    endpoint: str | None
 
 
 class ProjectError(AtlantideError):
     """``atlantide.toml`` asks for something it does not define (e.g. a profile)."""
 
 
-#: The project file every command looks for, walking up from the cwd.
-#: Public because `atlantide init` writes exactly this name, and the two
-#: must not be able to disagree.
-PROJECT_FILENAME = "atlantide.toml"
+#: Ceiling on ``[lang] fuel`` and ``--fuel``. This budget already allows minutes of
+#: CPU, so a larger value is rejected as a likely typo.
+MAX_FUEL = 100_000_000
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ProjectConfig:
     #: Directory ``atlantide.toml`` was found in; relative paths resolve against
     #: it. ``None`` when there is no file, in which case the cwd is the root.
@@ -157,38 +78,36 @@ class ProjectConfig:
     aws_profile: str | None = None
     aws_endpoint: str | None = None
     parallelism: int | None = None
-    #: alias name -> {"profile": ..., "endpoint": ...} for alternate accounts.
-    aws_aliases: dict[str, dict[str, str | None]] = field(default_factory=dict)
+    #: alias name -> its ``[aws.aliases.<name>]`` table, for alternate accounts.
+    aws_aliases: dict[str, AwsAliasSettings] = field(default_factory=dict)
     #: alias -> git source for published components imported by config.
     components: dict[str, ComponentSource] = field(default_factory=dict)
-    #: `[inputs]` — per-project values `atlantide.input()` reads. Overridden by
-    #: --var-file, then by -var.
+    #: ``[inputs]``: per-project values ``atlantide.input()`` reads; overridden by
+    #: ``--var-file``, then by ``--var``.
     inputs: dict[str, object] = field(default_factory=dict)
-    #: `[state]` — where state lives (local sqlite by default, or s3/postgres).
+    #: ``[state]``: where state lives (local sqlite by default, or s3/postgres).
     state_backend: StateConfig = field(default_factory=StateConfig)
-    #: `[secrets]` — which provider resolves secret values (keyfile by default).
+    #: ``[secrets]``: which provider resolves secret values (keyfile by default).
     secrets: SecretsConfig = field(default_factory=SecretsConfig)
+    #: ``[provider.<name>]``: each provider's settings table, passed to its plugin
+    #: factory (see :mod:`atlantide.core.plugin`).
+    provider_tables: dict[str, dict[str, object]] = field(default_factory=dict)
+    #: ``[lang] fuel``: the evaluation step budget; ``--fuel`` overrides it.
+    fuel: int = DEFAULT_FUEL
 
     @property
     def directory(self) -> Path:
-        """The project root — the cwd when there is no ``atlantide.toml``."""
+        """The project root, or the cwd when there is no ``atlantide.toml``."""
         return self.root if self.root is not None else Path.cwd()
 
     def resolve(self, path: str | Path) -> Path:
-        """Anchor a project-relative path to the root, so it means the same thing
-        whichever subdirectory the command ran from. Absolute paths pass through."""
+        """Anchor a project-relative path to the project root.
+
+        The result does not depend on the subdirectory the command ran from.
+        Absolute paths pass through.
+        """
         candidate = Path(path)
         return candidate if candidate.is_absolute() else self.directory / candidate
-
-
-def find_project_file(start: Path | None = None) -> Path | None:
-    """``atlantide.toml`` in ``start`` or the nearest ancestor holding one."""
-    directory = (start or Path.cwd()).resolve()
-    for candidate in (directory, *directory.parents):
-        path = candidate / PROJECT_FILENAME
-        if path.is_file():
-            return path
-    return None
 
 
 def load_project(start: Path | None = None, *, profile: str | None = None) -> ProjectConfig:
@@ -196,8 +115,8 @@ def load_project(start: Path | None = None, *, profile: str | None = None) -> Pr
 
     Returns an all-``None`` config when no file is found. ``profile`` names a
     ``[profile.<name>]`` table to overlay; naming one that does not exist is an
-    error rather than a silent fall-through to the base config, since the whole
-    point of asking for a profile is to not run against the other environment.
+    error rather than a fall-through to the base config, which may target a
+    different environment.
     """
     path = find_project_file(start)
     if path is None:
@@ -206,33 +125,33 @@ def load_project(start: Path | None = None, *, profile: str | None = None) -> Pr
         try:
             data = tomllib.load(fh)
         except tomllib.TOMLDecodeError as exc:
-            # A typed error, not a raw traceback: every command loads the
-            # project file, so a syntax error here otherwise crashes all of
-            # them (and emits non-JSON garbage under --json).
+            # Typed error: every command loads this file, and a traceback would
+            # break --json output.
             raise AtlantideError(f"cannot parse {path}: {exc}") from exc
     data = _apply_profile(data, profile, path)
-
-    def _str(key: str) -> str | None:
-        value = data.get(key)
-        return value if isinstance(value, str) else None
-
     parallelism = data.get("parallelism")
     return ProjectConfig(
         root=path.parent,
         profile=profile,
-        config=_str("config"),
-        state=_str("state"),
-        secrets_key=_str("secrets_key"),
-        secrets_store=_str("secrets_store"),
-        aws_region=_str("aws_region"),
-        aws_profile=_str("aws_profile"),
-        aws_endpoint=_str("aws_endpoint"),
+        config=_opt_str(data, "config"),
+        state=_opt_str(data, "state"),
+        secrets_key=_opt_str(data, "secrets_key"),
+        secrets_store=_opt_str(data, "secrets_store"),
+        aws_region=_opt_str(data, "aws_region"),
+        aws_profile=_opt_str(data, "aws_profile"),
+        aws_endpoint=_opt_str(data, "aws_endpoint"),
         parallelism=parallelism if isinstance(parallelism, int) else None,
         aws_aliases=_aws_aliases(data),
         components=_components(data),
         inputs=dict(_table(data, "inputs")),
         state_backend=_state(data),
         secrets=_secrets(data),
+        provider_tables={
+            name: dict(table)
+            for name, table in _table(data, "provider").items()
+            if isinstance(table, dict)
+        },
+        fuel=_fuel(data, path),
     )
 
 
@@ -272,90 +191,102 @@ def _table(data: dict[str, object], name: str) -> dict[str, object]:
     return table if isinstance(table, dict) else {}
 
 
-def _key(table: dict[str, object], key: str) -> str | None:
+def _opt_str(table: dict[str, object], key: str) -> str | None:
+    """``table[key]`` when it is a string, else ``None`` (absent or mistyped)."""
     value = table.get(key)
     return value if isinstance(value, str) else None
 
 
 def _seconds(table: dict[str, object], key: str) -> float | None:
-    """A duration in seconds. Accepts an int, since TOML ``300`` is not ``300.0``."""
+    """A duration in seconds; accepts an int, since TOML parses ``300`` as one."""
     value = table.get(key)
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
     return float(value)
 
 
+def check_fuel(value: object, where: str) -> int:
+    """``value`` as a fuel budget: a positive int no larger than :data:`MAX_FUEL`.
+
+    Out-of-range values are refused, not clamped, since clamping would change the
+    evaluation budget.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_FUEL:
+        raise ProjectError(f"{where} must be an integer between 1 and {MAX_FUEL:_}, got {value!r}")
+    return value
+
+
+def _fuel(data: dict[str, object], path: Path) -> int:
+    """Parse ``[lang] fuel``; absent means :data:`~atlantide.lang.DEFAULT_FUEL`."""
+    table = _table(data, "lang")
+    if "fuel" not in table:
+        return DEFAULT_FUEL
+    return check_fuel(table["fuel"], f"[lang] fuel in {path}")
+
+
 def _state(data: dict[str, object]) -> StateConfig:
     """Parse the ``[state]`` table (remote backend selection and its connection)."""
     table = _table(data, "state")
     return StateConfig(
-        backend=_key(table, "backend") or "local",
-        bucket=_key(table, "bucket"),
-        key=_key(table, "key"),
-        lock_table=_key(table, "lock_table"),
-        kms_key_id=_key(table, "kms_key_id"),
-        region=_key(table, "region"),
-        profile=_key(table, "profile"),
-        endpoint=_key(table, "endpoint"),
-        dsn=_key(table, "dsn"),
-        schema=_key(table, "schema"),
+        backend=_opt_str(table, "backend") or "local",
+        bucket=_opt_str(table, "bucket"),
+        key=_opt_str(table, "key"),
+        lock_table=_opt_str(table, "lock_table"),
+        kms_key_id=_opt_str(table, "kms_key_id"),
+        region=_opt_str(table, "region"),
+        profile=_opt_str(table, "profile"),
+        endpoint=_opt_str(table, "endpoint"),
+        dsn=_opt_str(table, "dsn"),
+        schema=_opt_str(table, "schema"),
         lock_ttl=_seconds(table, "lock_ttl"),
         lock_renew_interval=_seconds(table, "lock_renew_interval"),
         node_timeout=_seconds(table, "node_timeout"),
+        lock_skew_margin=_seconds(table, "lock_skew_margin"),
+        journal_table=_opt_str(table, "journal_table"),
+        write_concurrency=_positive_int(table, "write_concurrency"),
     )
+
+
+def _positive_int(table: dict[str, object], key: str) -> int | None:
+    """A positive integer setting; anything else is refused, naming the key."""
+    if key not in table:
+        return None
+    value = table[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ProjectError(f"[state].{key} must be a positive integer, got {value!r}")
+    return value
 
 
 def _secrets(data: dict[str, object]) -> SecretsConfig:
     """Parse the ``[secrets]`` table (which provider resolves secret values)."""
     table = _table(data, "secrets")
     return SecretsConfig(
-        provider=_key(table, "provider") or "keyfile",
-        prefix=_key(table, "prefix") or "",
-        region=_key(table, "region"),
-        profile=_key(table, "profile"),
-        endpoint=_key(table, "endpoint"),
+        provider=_opt_str(table, "provider") or "keyfile",
+        prefix=_opt_str(table, "prefix") or "",
+        region=_opt_str(table, "region"),
+        profile=_opt_str(table, "profile"),
+        endpoint=_opt_str(table, "endpoint"),
+        env_allow=parse_env_allow(_table(table, "env").get("allow")),
     )
 
 
 def _components(data: dict[str, object]) -> dict[str, ComponentSource]:
     """Parse the ``[components.<alias>]`` tables into ``{alias: ComponentSource}``.
 
-    Entries without a string ``git`` are skipped (a source with no repo to fetch
-    is meaningless).
+    Entries without a string ``git`` are skipped.
     """
-    tables = data.get("components")
-    if not isinstance(tables, dict):
-        return {}
-    result: dict[str, ComponentSource] = {}
-    for alias, body in tables.items():
-        if not isinstance(body, dict):
-            continue
-        git = body.get("git")
-        if not isinstance(git, str):
-            continue
-        ref = body.get("ref")
-        subdir = body.get("subdir")
-        result[alias] = ComponentSource(
-            git=git,
-            ref=ref if isinstance(ref, str) else None,
-            subdir=subdir if isinstance(subdir, str) else None,
-        )
-    return result
+    return {
+        alias: ComponentSource(git=git, ref=_opt_str(body, "ref"), subdir=_opt_str(body, "subdir"))
+        for alias, body in _table(data, "components").items()
+        if isinstance(body, dict) and (git := _opt_str(body, "git")) is not None
+    }
 
 
-def _aws_aliases(data: dict[str, object]) -> dict[str, dict[str, str | None]]:
+def _aws_aliases(data: dict[str, object]) -> dict[str, AwsAliasSettings]:
     """Parse the ``[aws.aliases.<name>]`` tables into ``{name: {profile, endpoint}}``."""
-    aws = data.get("aws")
-    aliases = aws.get("aliases") if isinstance(aws, dict) else None
-    if not isinstance(aliases, dict):
-        return {}
-    result: dict[str, dict[str, str | None]] = {}
-    for name, body in aliases.items():
-        if isinstance(body, dict):
-            profile = body.get("profile")
-            endpoint = body.get("endpoint")
-            result[name] = {
-                "profile": profile if isinstance(profile, str) else None,
-                "endpoint": endpoint if isinstance(endpoint, str) else None,
-            }
-    return result
+    aliases = _table(_table(data, "aws"), "aliases")
+    return {
+        name: {"profile": _opt_str(body, "profile"), "endpoint": _opt_str(body, "endpoint")}
+        for name, body in aliases.items()
+        if isinstance(body, dict)
+    }

@@ -14,6 +14,10 @@ from atlantide.cli.project import (
     StateConfig,
     load_project,
 )
+from tests.cli.conftest import file_config
+from tests.support import Cli
+
+cli = Cli()
 
 
 def test_missing_file_is_empty_config(tmp_path: Path) -> None:
@@ -159,3 +163,12 @@ def test_unknown_profile_is_an_error(tmp_path: Path) -> None:
     (tmp_path / "atlantide.toml").write_text("[profile.prod]\nparallelism = 4\n")
     with pytest.raises(ProjectError, match=r"no \[profile\.staging\].*defined: prod"):
         load_project(tmp_path, profile="staging")
+
+
+def test_project_config_supplies_defaults(tmp_path: Path, monkeypatch) -> None:
+    cfg = file_config(tmp_path)
+    (tmp_path / "atlantide.toml").write_text(f'config = {cfg.name!r}\nstate = "infra.db"\n')
+    monkeypatch.chdir(tmp_path)
+    result = cli.run("plan")  # no config/state flags
+    assert result.exit_code == 0, result.output
+    assert "create" in result.output

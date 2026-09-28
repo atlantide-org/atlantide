@@ -1,7 +1,7 @@
-"""atlantide.lang: Atlas-lang — a deterministic Python-syntax config subset.
+"""Atlas-lang: a deterministic Python-syntax config subset.
 
 Public entrypoint: :func:`evaluate_source`, which validates the subset, runs it
-on our own interpreter, and returns the collected resources as a
+on the Atlas-lang interpreter, and returns the collected resources as a
 ``Result[ResourceRegistry, AtlantideError]``.
 """
 
@@ -14,10 +14,11 @@ from typing import Any
 from pydantic import ValidationError
 from returns.result import Failure, Result, Success
 
+from atlantide.core._describe import describe_type, describe_value, is_plain_data, scrub_addresses
 from atlantide.core.config import EnvSelection, selecting
 from atlantide.core.errors import AtlantideError, LanguageError
 from atlantide.core.resource import ResourceRegistry, collecting
-from atlantide.lang.builtins import build_globals
+from atlantide.lang.builtins import build_globals, consumed_inputs
 from atlantide.lang.interp import DEFAULT_FUEL, Interpreter, Scope
 from atlantide.lang.validate import DEFAULT_SURFACE, LanguageSurface, validate_source
 
@@ -40,7 +41,7 @@ def evaluate_source(
     surface: LanguageSurface = DEFAULT_SURFACE,
     fuel: int = DEFAULT_FUEL,
 ) -> Result[ResourceRegistry, AtlantideError]:
-    """Validate + evaluate Atlas-lang source into a resource registry.
+    """Validate and evaluate Atlas-lang source into a resource registry.
 
     ``envs`` narrows which environments a ``Config`` in the source yields;
     ``None`` means every one it declares. ``extra_globals`` injects additional
@@ -52,14 +53,12 @@ def evaluate_source(
         namespace.update(extra_globals)
     api = namespace["atlantide"]
 
-    # Validate first; `bind` short-circuits on a validation Failure, so the run
-    # step only ever sees a valid module.
     validated: Result[ast.Module, AtlantideError] = validate_source(source, filename, surface)
     with selecting(envs) as selection:
         evaluated = validated.bind(lambda module: _run_module(module, namespace, fuel, surface))
-    # Record what the config actually read, so the caller can show it and an
-    # unconsumed input cannot look like part of the plan's identity.
-    return evaluated.bind(lambda registry: _finish(registry, api.consumed, selection))
+    # Only the inputs the config read are recorded: an unread input is not part of
+    # the plan's identity.
+    return evaluated.bind(lambda registry: _finish(registry, consumed_inputs(api), selection))
 
 
 def _finish(
@@ -69,9 +68,7 @@ def _finish(
     registry.envs_declared = selection.declared
     registry.envs_selected = selection.selected
     if selection.requested is not None and not selection.consumed:
-        # The only place that knows both that `--env` was asked for and that no
-        # `Config` answered it; without this the run would narrow nothing and
-        # still report success.
+        # `--env` narrows nothing when no `Config` consumes it, so it is an error.
         return Failure(
             LanguageError(
                 "--env was given but the config declares no Config(...) — "
@@ -94,10 +91,33 @@ def _run_module(
     except AtlantideError as exc:
         return Failure(exc)
     except ValidationError as exc:
-        return Failure(LanguageError(f"invalid resource inputs: {exc}"))
+        return Failure(LanguageError(f"invalid resource inputs: {_validation_message(exc)}"))
     except Exception as exc:
-        # A native runtime error from config evaluation (ZeroDivisionError,
-        # KeyError, ValueError from int('x'), RecursionError). Config-level errors
-        # must return a Failure rather than crash the engine.
-        return Failure(LanguageError(f"evaluation error: {type(exc).__name__}: {exc}"))
+        # Native runtime errors (ZeroDivisionError, KeyError, RecursionError) become
+        # a Failure. Their text can embed a memory address (`[1].index(f)` embeds
+        # `repr(f)`), so addresses are scrubbed to keep the message deterministic.
+        message = scrub_addresses(f"{type(exc).__name__}: {exc}")
+        return Failure(LanguageError(f"evaluation error: {message}"))
     return Success(registry)
+
+
+def _validation_message(exc: ValidationError) -> str:
+    """Pydantic's error text, with inputs that are not plain data rendered deterministically.
+
+    Pydantic renders each input by ``repr``, which for a function embeds a memory
+    address. Such inputs are rendered through :func:`describe_value` instead, in the
+    same layout.
+    """
+    errors = exc.errors()
+    if all(is_plain_data(error["input"]) for error in errors):
+        return str(exc)
+    count = len(errors)
+    lines = [f"{count} validation error{'s' if count != 1 else ''} for {exc.title}"]
+    for error in errors:
+        value = error["input"]
+        lines.append(".".join(str(part) for part in error["loc"]))
+        lines.append(
+            f"  {error['msg']} [type={error['type']}, input_value={describe_value(value)}, "
+            f"input_type={describe_type(value)}]"
+        )
+    return "\n".join(lines)

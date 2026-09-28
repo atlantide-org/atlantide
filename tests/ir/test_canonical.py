@@ -75,18 +75,15 @@ def test_shuffled_dict_same_encoding(d: dict[str, int]) -> None:
 
 @given(json_values())
 def test_it_agrees_with_the_standard_library(value: object) -> None:
-    """A differential law, against an oracle nobody here wrote.
+    """Differential property against the standard library as an independent oracle.
 
-    Every other property in this file compares the encoder to itself, which
-    catches instability but not a systematically wrong encoding — the whole
-    corpus could be subtly off and every self-comparison would still hold.
-    `json.dumps` with sorted keys and compact separators produces the same bytes
-    for the subset both accept, so disagreement means one of them is wrong and it
-    is almost certainly not the standard library.
+    The other properties here compare the encoder to itself, which catches
+    instability but not a systematically wrong encoding. `json.dumps` with sorted
+    keys and compact separators produces the same bytes for the subset both
+    accept, so a disagreement points at the encoder.
 
     Floats are excluded from the strategy: JCS and `json.dumps` legitimately
-    differ on their shortest representation, and that difference is its own test
-    rather than noise in this one.
+    differ on their shortest representation, which belongs in its own test.
     """
     expected = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -95,20 +92,18 @@ def test_it_agrees_with_the_standard_library(value: object) -> None:
 
 @given(json_values())
 def test_the_encoding_is_valid_json_that_reads_back(value: object) -> None:
-    """Canonical bytes still have to be *JSON* — a hand-rolled encoder that
-    emitted something almost-JSON would hash consistently and be unreadable by
-    everything else."""
+    """Canonical bytes must still be *JSON*: an encoder emitting almost-JSON would
+    hash consistently but be unreadable by everything else."""
     assert json.loads(to_canonical_json(value)) == value
 
 
 def test_ir_hash_is_stable_across_hash_seeds() -> None:
-    """The headline claim: two runs of the same config produce a byte-identical
-    IR and a stable content hash.
+    """Two runs of the same config produce a byte-identical IR and a stable hash.
 
-    A guard rather than a regression test — set ordering is asserted directly in
-    `tests/core/test_silent_coercions.py`. This one runs the whole lowering
-    pipeline in a fresh interpreter per seed, so a future container lowered in
-    iteration order is caught here even if no unit test covers it.
+    Set ordering is asserted directly in `tests/core/test_silent_coercions.py`.
+    This runs the whole lowering pipeline in a fresh interpreter per seed, so a
+    container lowered in iteration order is caught here even if no unit test
+    covers it.
     """
     prog = (
         "from atlantide.core import ProviderRegistry, Stack, output\n"

@@ -1,15 +1,12 @@
 """atlantide.secrets: reference secrets by name; resolve values at apply.
 
-A resource field holds a :class:`~atlantide.core.types.SecretRef` (a name, never a
-value). Config, IR, and state carry only the handle; the plaintext is resolved
-from a pluggable :class:`SecretsProvider` (keyfile value-store default, env for
-dev, SSM Parameter Store for shared setups) in-memory at apply and never
-persisted. State keeps a salted digest of the resolved value so a rotation is
-detectable, and *seals* sensitive computed
-outputs at rest (see :class:`~atlantide.secrets.material.KeyMaterial`).
+Config, IR and state carry only a :class:`~atlantide.core.types.SecretRef` handle;
+the plaintext is resolved in memory at apply from a pluggable
+:class:`SecretsProvider` and never persisted. See ``README.md`` for the providers,
+the rotation digest and sealed outputs.
 """
 
-from atlantide.secrets.backend import SecretsProvider
+from atlantide.secrets.base import SecretsProvider
 from atlantide.secrets.digest import (
     is_secret_ref_marker,
     secret_digest,

@@ -1,9 +1,6 @@
-"""atlantide.engine: compile -> plan -> apply/destroy.
+"""atlantide.engine: compile -> plan -> apply/destroy, behind the :class:`Engine` façade.
 
-The :class:`Engine` itself lives in :mod:`atlantide.engine.engine`; plan shaping
-in :mod:`atlantide.engine.planner`, artifact rehydration in
-:mod:`atlantide.engine.hydrate`, locking in :mod:`atlantide.engine.locking`, and
-the Result<->raise bridges in :mod:`atlantide.engine.result`.
+See ``README.md`` for the module index and the error model.
 """
 
 from atlantide.engine.engine import Engine

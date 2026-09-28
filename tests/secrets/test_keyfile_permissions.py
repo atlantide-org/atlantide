@@ -1,7 +1,7 @@
 """A keyfile others can read is refused.
 
 Creation is 0600, but a key restored from a backup or copied under a lax umask
-arrives readable by everyone — and it decrypts the local secret store.
+can arrive readable by everyone, and it decrypts the local secret store.
 """
 
 from __future__ import annotations
@@ -15,8 +15,6 @@ from atlantide.secrets._aesgcm import load_or_create_key
 
 
 def test_a_world_readable_keyfile_is_refused(tmp_path: Path) -> None:
-    """Creation is 0600, but a key restored from a backup or copied under a lax
-    umask can arrive readable by everyone."""
     path = tmp_path / "key"
     load_or_create_key(path)  # created 0600
     path.chmod(0o644)

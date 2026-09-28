@@ -4,16 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from atlantide.engine import Engine
-from atlantide.providers import local
-from atlantide.providers.local import LocalProvider
 from atlantide.reconcile import Action
-from atlantide.state.sqlite_backend import SqliteStateBackend
-from tests.conftest import make_engine
-
-
-def _engine(tmp: Path) -> Engine:
-    return make_engine(local.TYPES, LocalProvider(), backend=None)  # memory backend
+from atlantide.state import SqliteStateBackend
+from tests.support import local_engine
 
 
 def _config(tmp: Path, *, name: str = "a", alias: str | None = None) -> str:
@@ -28,7 +21,7 @@ def _config(tmp: Path, *, name: str = "a", alias: str | None = None) -> str:
 
 
 async def test_rename_is_noop_not_replace(tmp_path: Path) -> None:
-    engine = _engine(tmp_path)
+    engine = local_engine()
 
     (await engine.apply(_config(tmp_path, name="a"))).unwrap()
     assert set(engine.backend.load().nodes) == {
@@ -60,7 +53,7 @@ async def test_rename_is_noop_not_replace(tmp_path: Path) -> None:
 
 
 async def test_rename_without_alias_is_destroy_create(tmp_path: Path) -> None:
-    engine = _engine(tmp_path)
+    engine = local_engine()
     (await engine.apply(_config(tmp_path, name="a"))).unwrap()
 
     planned = engine.plan(_config(tmp_path, name="a2")).unwrap()
@@ -71,11 +64,11 @@ async def test_rename_without_alias_is_destroy_create(tmp_path: Path) -> None:
 
 async def test_rename_persists_across_sqlite_reopen(tmp_path: Path) -> None:
     db = str(tmp_path / "state.db")
-    first = make_engine(local.TYPES, LocalProvider(), backend=SqliteStateBackend(db))
+    first = local_engine(backend=SqliteStateBackend(db))
     (await first.apply(_config(tmp_path, name="a"))).unwrap()
     first.backend.close()
 
-    reopened = make_engine(local.TYPES, LocalProvider(), backend=SqliteStateBackend(db))
+    reopened = local_engine(backend=SqliteStateBackend(db))
     (await reopened.apply(_config(tmp_path, name="a2", alias="a"))).unwrap()
     assert set(reopened.backend.load().nodes) == {
         "default:local.File:a2",
@@ -85,7 +78,7 @@ async def test_rename_persists_across_sqlite_reopen(tmp_path: Path) -> None:
 
 
 async def test_alias_accepts_full_node_id(tmp_path: Path) -> None:
-    engine = _engine(tmp_path)
+    engine = local_engine()
     (await engine.apply(_config(tmp_path, name="a"))).unwrap()
     renamed = _config(tmp_path, name="a2", alias="default:local.File:a")  # full old id
     planned = engine.plan(renamed).unwrap()
@@ -94,7 +87,7 @@ async def test_alias_accepts_full_node_id(tmp_path: Path) -> None:
 
 async def test_rename_plus_real_change_still_updates(tmp_path: Path) -> None:
     """A rename must not mask a genuine edit to the same resource."""
-    engine = _engine(tmp_path)
+    engine = local_engine()
     (await engine.apply(_config(tmp_path, name="a"))).unwrap()
 
     # a2 aliases a, but also changes content -> UPDATE, not a masked NOOP.

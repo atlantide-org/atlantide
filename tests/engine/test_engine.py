@@ -6,16 +6,9 @@ import hashlib
 from pathlib import Path
 
 from atlantide.core import is_successful
-from atlantide.engine import Engine
 from atlantide.ir import loads
-from atlantide.providers import local
-from atlantide.providers.local import LocalProvider
 from atlantide.reconcile import Action
-from tests.conftest import make_engine
-
-
-def _engine() -> Engine:
-    return make_engine(local.TYPES, LocalProvider())
+from tests.support import local_engine
 
 
 def _config(tmp: Path, a_content: str = "alpha") -> str:
@@ -28,7 +21,7 @@ def _config(tmp: Path, a_content: str = "alpha") -> str:
 
 
 async def test_full_loop(tmp_path: Path) -> None:
-    engine = _engine()
+    engine = local_engine()
     cfg = _config(tmp_path)
 
     # plan on empty state -> two creates
@@ -70,7 +63,7 @@ def _one_file(path: Path) -> str:
 
 
 async def test_immutable_path_change_replaces(tmp_path: Path) -> None:
-    engine = _engine()
+    engine = local_engine()
     old = tmp_path / "old.txt"
     new = tmp_path / "new.txt"
     await engine.apply(_one_file(old))
@@ -88,7 +81,7 @@ def _source_config(path: Path) -> str:
 
 
 async def test_sourcefile_rechecked_on_every_plan(tmp_path: Path) -> None:
-    engine = _engine()
+    engine = local_engine()
     src = tmp_path / "src.txt"
     src.write_text("one")
     cfg = _source_config(src)
@@ -114,7 +107,7 @@ async def test_sourcefile_rechecked_on_every_plan(tmp_path: Path) -> None:
 
 
 async def test_sourcefile_content_is_consumable(tmp_path: Path) -> None:
-    engine = _engine()
+    engine = local_engine()
     src = tmp_path / "src.txt"
     src.write_text("payload")
     out = tmp_path / "out.txt"
@@ -130,7 +123,7 @@ async def test_sourcefile_content_is_consumable(tmp_path: Path) -> None:
 async def test_cycle_is_reported(tmp_path: Path) -> None:
     # Not expressible via refs (would need mutual computed reads), so check a
     # clean compile error path instead: invalid Atlas-lang.
-    engine = _engine()
+    engine = local_engine()
     result = engine.plan("while True:\n    pass\n")
     assert not is_successful(result)
 
@@ -138,7 +131,7 @@ async def test_cycle_is_reported(tmp_path: Path) -> None:
 async def test_apply_blocked_by_lock_on_a_dependency(tmp_path: Path) -> None:
     # Another owner holds 'a'. Applying a+b must fail: b depends on a, so a is in
     # the lock scope (dependency closure), even though only b would change.
-    engine = _engine()
+    engine = local_engine()
     engine.backend.acquire_lock("other-client", 300, {"default:local.File:a"})
     result = await engine.apply(_config(tmp_path))
     assert not is_successful(result)
@@ -148,7 +141,7 @@ async def test_apply_blocked_by_lock_on_a_dependency(tmp_path: Path) -> None:
 
 async def test_apply_proceeds_when_lock_is_disjoint(tmp_path: Path) -> None:
     # A lock on an unrelated subgraph does not block this apply.
-    engine = _engine()
+    engine = local_engine()
     engine.backend.acquire_lock("other-client", 300, {"other:stack:node"})
     result = await engine.apply(_config(tmp_path))
     assert is_successful(result)
@@ -160,14 +153,14 @@ async def test_apply_proceeds_when_lock_is_disjoint(tmp_path: Path) -> None:
 
 async def test_build_deploy_from_artifact_no_source(tmp_path: Path) -> None:
     # Build once, then deploy purely from the artifact's IR (source gone).
-    build_engine = _engine()
+    build_engine = local_engine()
     artifact = build_engine.build(_config(tmp_path)).unwrap()
     assert artifact.provider_pins == {"local": "1.0.0"}
     assert len(artifact.ir) == 2
 
     # round-trip the .atlas body, then deploy on a *fresh* engine + state
     reloaded = loads(artifact.dumps()).unwrap()
-    deploy_engine = _engine()
+    deploy_engine = local_engine()
     assert is_successful(deploy_engine.verify_artifact(reloaded))
 
     report = (await deploy_engine.deploy(reloaded)).unwrap()
@@ -180,7 +173,7 @@ async def test_build_deploy_from_artifact_no_source(tmp_path: Path) -> None:
 
 
 def test_verify_rejects_tampered_ir(tmp_path: Path) -> None:
-    engine = _engine()
+    engine = local_engine()
     artifact = engine.build(_config(tmp_path)).unwrap()
     tampered = loads(artifact.dumps().replace("alpha", "TAMPERED")).unwrap()
     result = engine.verify_artifact(tampered)
@@ -189,7 +182,7 @@ def test_verify_rejects_tampered_ir(tmp_path: Path) -> None:
 
 
 async def test_deploy_unknown_provider_version_is_incompatible(tmp_path: Path) -> None:
-    engine = _engine()
+    engine = local_engine()
     artifact = engine.build(_config(tmp_path)).unwrap()
     # bump only the pin (IR untouched, so the hash still verifies) to a future major
     bad = loads(artifact.dumps().replace('"local": "1.0.0"', '"local": "2.0.0"')).unwrap()
@@ -209,7 +202,7 @@ async def test_destroy_tolerates_dangling_dependency(tmp_path: Path) -> None:
     # node's $ref to the gone dependency's output can't be resolved.
     from atlantide.state import StateNode
 
-    engine = _engine()
+    engine = local_engine()
     target = tmp_path / "b.txt"
     target.write_text("x")
     engine.backend.put(
@@ -233,7 +226,7 @@ async def test_destroy_tolerates_dangling_dependency(tmp_path: Path) -> None:
 
 
 async def test_replace_forces_only_the_named_node(tmp_path: Path) -> None:
-    engine = _engine()
+    engine = local_engine()
     cfg = _config(tmp_path)
     (await engine.apply(cfg)).unwrap()
 
@@ -245,7 +238,7 @@ async def test_replace_forces_only_the_named_node(tmp_path: Path) -> None:
 
 
 async def test_replace_reexamines_dependents(tmp_path: Path) -> None:
-    engine = _engine()
+    engine = local_engine()
     cfg = _config(tmp_path)
     (await engine.apply(cfg)).unwrap()
 
@@ -261,7 +254,7 @@ async def test_targeted_apply_tolerates_unresolvable_outputs(tmp_path: Path) -> 
     """An output over an unselected CREATE has no value under a targeted apply;
     the run must succeed and leave the output uncommitted rather than fail after
     the selected mutations already landed."""
-    engine = _engine()
+    engine = local_engine()
     cfg = (
         "from atlantide.core import output\n"
         "from atlantide.providers.local import File\n"
@@ -273,3 +266,8 @@ async def test_targeted_apply_tolerates_unresolvable_outputs(tmp_path: Path) -> 
     assert report.created == ["default:local.File:a"]
     assert "b_sum" not in report.outputs
     assert (tmp_path / "a.txt").exists() and not (tmp_path / "b.txt").exists()
+
+
+def test_an_engine_names_its_backend_and_parallelism() -> None:
+    engine = local_engine(parallelism=3)
+    assert repr(engine) == f"Engine(backend={engine.backend!r}, parallelism=3)"

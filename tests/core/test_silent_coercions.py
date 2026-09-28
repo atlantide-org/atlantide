@@ -155,8 +155,8 @@ def test_join_refuses_a_bare_string() -> None:
 
 
 def test_interpolate_rejects_mixed_placeholder_numbering() -> None:
-    """Mixed `{}`/`{0}` passes per-field checks but explodes in vformat at
-    apply; it must fail the plan instead."""
+    """Mixed `{}`/`{0}` passes per-field checks but raises in vformat at apply;
+    it must fail the plan instead."""
     import pytest
 
     from atlantide.core.errors import LanguageError

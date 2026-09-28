@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from typing_extensions import override
+from typing import override
 
+from atlantide.core._describe import describe_type
 from atlantide.core.actions import DESTRUCTIVE_ACTIONS
 from atlantide.core.errors import PolicyConfigError
 from atlantide.core.fields import Mutability, field_mutability, sensitive_fields
@@ -11,7 +12,7 @@ from atlantide.core.resource import Resource
 from atlantide.policy.base import PolicyContext, PolicyFn, PolicyProvider, PolicyResult
 from atlantide.policy.registry import PolicyRegistry
 
-#: Policy names. The destroy guard is also reachable under its earlier name.
+#: Policy names. ``DENY_DESTROY_ALIAS`` is an alternate name for the destroy guard.
 REQUIRE_TAGS = "require-tags"
 REQUIRE_SECRET_REFS = "require-secret-refs"
 DENY_DESTROY = "deny-destroy-in-protected"
@@ -21,15 +22,14 @@ DENY_DESTROY_ALIAS = "deny-destroy-in-prod"
 def _names(ctx: PolicyContext, policy: str, param: str) -> frozenset[str]:
     """The binding's ``param`` as a set of names, validated.
 
-    A bare string is one name, not a sequence of characters: ``frozenset("prod")``
-    would otherwise mean four names, ``p``, ``r``, ``o``, and ``d``.
+    A bare string is one name, not a sequence of characters.
     """
     value = ctx.param(param, ())
     if isinstance(value, str):
         return frozenset({value})
     if not isinstance(value, (list, tuple, set, frozenset)):
         raise PolicyConfigError(
-            f"{policy}: `{param}` must be a name or a list of them, got {type(value).__name__}"
+            f"{policy}: `{param}` must be a name or a list of them, got {describe_type(value)}"
         )
     return frozenset(str(item) for item in value)
 
@@ -39,7 +39,7 @@ def _require_tags(ctx: PolicyContext) -> PolicyResult:
 
     ``enforce("require-tags", keys=["env", "owner"])`` demands those keys;
     ``enforce("require-tags")`` demands only that the resource is tagged. A key
-    present with an empty value counts as missing — a blank tag carries nothing.
+    present with an empty value counts as missing.
     """
     res = ctx.resource
     if res is None or "tags" not in type(res).model_fields:
@@ -59,10 +59,9 @@ def _require_tags(ctx: PolicyContext) -> PolicyResult:
 def _literal_secrets(res: Resource) -> list[str]:
     """Names of ``sensitive`` fields holding a plaintext value.
 
-    Computed fields are skipped — their value comes from the provider, not the
-    config — and so is an empty one, which is the field's unset default rather
-    than a secret. Anything else non-``str`` is a handle (``SecretRef``, or a
-    ``Ref`` resolved at apply) and carries no plaintext.
+    Computed fields are skipped because the provider sets their value, and so are
+    empty strings, which are the field's unset default. A non-``str`` value is a
+    handle (``SecretRef``, or a ``Ref`` resolved at apply) and holds no plaintext.
     """
     cls = type(res)
     mutability = field_mutability(cls)
@@ -86,8 +85,7 @@ def _require_secret_refs(ctx: PolicyContext) -> PolicyResult:
     A field declared with :func:`~atlantide.core.fields.secret` is typed
     ``SecretRef | None``, so pydantic already refuses a literal there. This
     covers what the annotation does not: a field declared
-    ``mutable(..., sensitive=True)`` on a plain ``str``, which a provider author
-    is free to write and which accepts plaintext silently.
+    ``mutable(..., sensitive=True)`` on a plain ``str``, which accepts plaintext.
     """
     if ctx.resource is None:
         return PolicyResult.ok()  # pure DELETE: nothing is being declared
@@ -103,8 +101,8 @@ def _require_secret_refs(ctx: PolicyContext) -> PolicyResult:
 def _deny_destroy(ctx: PolicyContext) -> PolicyResult:
     """Deny destructive changes (DELETE/REPLACE) in the binding's ``stacks``.
 
-    With no ``stacks`` the policy passes everything: which stacks are protected
-    is the config author's call, so there is no name to assume.
+    With no ``stacks`` the policy passes everything: the config author names the
+    protected stacks, so no default is assumed.
     """
     if ctx.stack in _names(ctx, DENY_DESTROY, "stacks") and ctx.action in DESTRUCTIVE_ACTIONS:
         return PolicyResult.fail(
@@ -114,10 +112,10 @@ def _deny_destroy(ctx: PolicyContext) -> PolicyResult:
 
 
 class BuiltinPolicyProvider(PolicyProvider):
-    """Ships a small set of native-Python policies.
+    """Provides the builtin native-Python policies.
 
-    The configurable ones read their arguments from the binding, so the provider
-    itself needs none::
+    Configurable policies read their arguments from the binding, so the provider
+    takes none::
 
         enforce("require-tags", keys=["env", "owner"])
         enforce("deny-destroy-in-protected", stacks=["prod"])

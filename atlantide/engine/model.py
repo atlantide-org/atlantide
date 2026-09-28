@@ -9,7 +9,7 @@ from atlantide.core import PolicyBinding, PolicyLevel, Resource
 from atlantide.graph.model import DiGraph
 from atlantide.ir.model import IRGraph
 from atlantide.policy import Violation
-from atlantide.reconcile import ChangeSet
+from atlantide.reconcile import ChangeSet, Desired
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,13 +20,11 @@ class Compiled:
     resources: dict[str, Resource]
     policy_bindings: tuple[PolicyBinding, ...] = ()
     outputs: dict[str, Any] = field(default_factory=dict)
-    #: The config inputs this evaluation actually read. Shown above the plan, so a
-    #: plan that differs from yesterday's can be accounted for.
+    #: The config inputs this evaluation read, shown above the plan to explain
+    #: differences between plans.
     inputs: dict[str, Any] = field(default_factory=dict)
     #: Every environment the config's ``Config`` declared, and the subset this
-    #: run selected. Equal (or both empty) when nothing was narrowed. The planner
-    #: reads both to keep an unselected environment's existing state out of the
-    #: diff, which would otherwise plan as a delete.
+    #: run selected. Equal, or both empty, when nothing was narrowed.
     envs_declared: tuple[str, ...] = ()
     envs_selected: tuple[str, ...] = ()
 
@@ -34,11 +32,22 @@ class Compiled:
     def envs_excluded(self) -> tuple[str, ...]:
         """Environments the config declared that this run did not select.
 
-        Empty unless ``--env`` narrowed the run. Read by both the planner (which
-        keeps these out of the diff) and the plan header (which names them).
+        Empty unless ``--env`` narrowed the run. The planner keeps their existing
+        state out of the diff, where it would otherwise plan as a delete; the plan
+        header names them.
         """
         selected = set(self.envs_selected)
         return tuple(name for name in self.envs_declared if name not in selected)
+
+    def desired(self) -> Desired:
+        """This config as the executor consumes it."""
+        return Desired(
+            ir=self.ir,
+            graph=self.graph,
+            hashes=self.hashes,
+            resources=self.resources,
+            output_decls=self.outputs,
+        )
 
 
 @dataclass(frozen=True, slots=True)

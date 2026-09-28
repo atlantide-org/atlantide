@@ -1,44 +1,19 @@
 """The typed environment matrix: one ``Config`` holding every environment.
 
-A config file declares the environments its system has and what differs between
-them, once, in one place::
+A config declares its environments and what differs between them once: an
+:class:`EnvSchema` subclass (or a mapping of :func:`var` declarations) plus
+``Config(AppEnv, envs={"dev": {...}, "prod": {...}})``. ``config.envs()`` then
+yields each environment as an object whose variables are ordinary attributes.
+The user guide lives in the docs site's ``reference/authoring.md``.
 
-    class AppEnv(EnvSchema):
-        domain: str
-        size: int = 1
+A ``Config`` is the checked-in matrix, validated eagerly and identical for every
+run; ``atlantide.input()`` is a per-run parameter. ``region``, ``tags`` and
+``name_prefix`` are well-known keys every schema carries implicitly.
 
-    config = Config(
-        AppEnv,
-        envs={
-            "dev":  {"region": "eu-north-1", "domain": "dev.x.io"},
-            "prod": {"region": "us-east-1",  "domain": "x.io", "size": 5},
-        },
-    )
-
-    for env in config.envs():           # env: AppEnv
-        with Stack(env.name, config=env):
-            S3Bucket("assets", versioning=env.size > 1)
-
-Declaring the shape as an :class:`EnvSchema` subclass is what makes ``env.size``
-an ordinary annotated attribute — one an editor completes and a checker
-diagnoses. The schema may instead be a mapping of :func:`var` declarations
-(``Config(schema={"size": var(int, default=1)}, envs=...)``); it validates
-identically and is the right choice when the static side does not matter.
-
-This is not ``atlantide.input()``. An input is a per-run parameter supplied from
-outside the repository (a CI build number, a fork's name prefix) and is untyped;
-a ``Config`` is the checked-in environment matrix, validated eagerly and
-identical for every run. What differs between environments belongs here; what
-differs between runs of one environment is an input. The two compose: an
-environment's value may be built from an input.
-
-``region``, ``tags`` and ``name_prefix`` are well-known keys every schema has
-implicitly, so ``Stack(env.name, config=env)`` needs no separate ``region=``. A
-schema may re-declare one to make it required or to narrow it.
-
-Import-graph note: this module imports only ``core.errors`` and ``core.node_id``.
-``core.stack`` imports it (for ``Stack(config=...)``) and ``core.resource``
-imports ``core.stack``, so importing ``resource`` from here would cycle.
+Import graph: this module imports only ``core._config_types``, ``core._describe``
+and ``core.errors`` (``_config_types`` adds ``core.node_id``). ``core.stack``
+imports it and ``core.resource`` imports ``core.stack``, so importing
+``resource`` here would create a cycle.
 """
 
 from __future__ import annotations
@@ -47,38 +22,46 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar, cast, get_args, overload
+from typing import TYPE_CHECKING, Any, ClassVar, cast, overload, override
 
-from typing_extensions import override
-
+# Imported under private names: this module is config-importable, so its public
+# namespace is the config surface.
+from atlantide.core._config_types import MISSING as _MISSING
+from atlantide.core._config_types import RESERVED as _RESERVED
+from atlantide.core._config_types import SUPPORTED_TYPES as _SUPPORTED_TYPES
+from atlantide.core._config_types import annotation_type as _annotation_type
+from atlantide.core._config_types import describe_type_arg as _describe_type_arg
+from atlantide.core._config_types import own_annotations as _own_annotations
+from atlantide.core._config_types import require_default_matches as _require_default_matches
+from atlantide.core._config_types import require_variable_name as _require_variable_name
+from atlantide.core._config_types import resolve_envs as _resolve_envs
+from atlantide.core._describe import describe_type, describe_value
 from atlantide.core.errors import LanguageError
-from atlantide.core.node_id import require_identifier
 
-_MISSING = object()
-
-#: The environment type a `Config` yields: the user's `EnvSchema` subclass when
-#: one was declared, otherwise `EnvView`. `E` binds it from the argument in the
-#: constructor overload; `EnvT` carries it to `envs()`/`env()`.
-E = TypeVar("E", bound="EnvSchema")
-EnvT = TypeVar("EnvT", bound="EnvSchema")
-
-#: What a ``var()`` may be declared as. Parameterised generics (``list[str]``)
-#: are refused: they evaluate to a ``types.GenericAlias`` that ``isinstance``
-#: cannot test against, and element-type checking is out of scope.
-_SUPPORTED_TYPES: tuple[type, ...] = (str, int, float, bool, list, dict)
+#: The types ``var()`` accepts, by name, as an ``EnvSchema`` annotation spells them.
+#: The Atlas-lang validator checks annotations against this set without
+#: evaluating them.
+SUPPORTED_FIELD_TYPE_NAMES: frozenset[str] = frozenset(t.__name__ for t in _SUPPORTED_TYPES)
 
 #: Keys every schema carries implicitly, so an environment can supply what
-#: `Stack` needs without the author restating them. An explicit declaration in
-#: `schema=` wins (it may make one required, which these are not).
+#: `Stack` needs. An explicit declaration in `schema=` takes precedence and may
+#: make the key required.
 _WELL_KNOWN: dict[str, type] = {"region": str, "tags": dict, "name_prefix": str}
 
 
 @dataclass(frozen=True, slots=True)
 class Var:
-    """One declared environment variable: its type and, maybe, its default."""
+    """One declared environment variable: its type and optional default."""
 
     type: type
     default: Any = _MISSING
+    #: Whether an environment may supply ``None``. ``default=None`` implies it;
+    #: an ``X | None`` field with another default sets it explicitly.
+    nullable: bool = False
+
+    def __post_init__(self) -> None:
+        if self.default is None:
+            object.__setattr__(self, "nullable", True)
 
     @property
     def required(self) -> bool:
@@ -87,10 +70,12 @@ class Var:
 
     @override
     def __repr__(self) -> str:
-        # Mirrors how it was written, so a traceback or a `Config` dump reads
-        # back as source instead of `default=<object object at 0x...>`.
+        # Renders as the `var(...)` call, not `default=<object object at 0x...>`.
         if self.required:
             return f"var({self.type.__name__})"
+        if self.nullable and self.default is not None:
+            # Only an `X | None = <value>` field; shown as it was annotated.
+            return f"var({self.type.__name__} | None, default={self.default!r})"
         return f"var({self.type.__name__}, default={self.default!r})"
 
 
@@ -98,142 +83,68 @@ def var(type_: type, default: Any = _MISSING) -> Var:
     """Declare an environment variable, e.g. ``var(int, default=1)``.
 
     Without a ``default`` the variable is required: every environment must
-    supply it, checked when the :class:`Config` is constructed rather than
-    wherever the value is eventually read. ``default=None`` instead makes it
-    optional and nullable.
+    supply it, checked when the :class:`Config` is constructed.
+    ``default=None`` makes it optional and nullable.
     """
     if type_ not in _SUPPORTED_TYPES:
         supported = ", ".join(t.__name__ for t in _SUPPORTED_TYPES)
         raise LanguageError(
-            f"var() type must be one of {supported}, got {_describe_type(type_)} — "
+            f"var() type must be one of {supported}, got {_describe_type_arg(type_)} — "
             f"parameterised generics such as list[str] are not supported"
         )
-    if default is not _MISSING and default is not None and not _type_matches(default, type_):
-        raise LanguageError(
-            f"var({type_.__name__}) default {default!r} is a {type(default).__name__}"
-        )
+    if default is not _MISSING:
+        _require_default_matches(f"var({type_.__name__})", type_, default)
     return Var(type=type_, default=default)
 
 
-def _describe_type(value: Any) -> str:
-    """A readable name for whatever was passed where a type was expected."""
-    name = getattr(value, "__name__", None)
-    return name if isinstance(name, str) else repr(value)
+#: Names an environment variable may not take (the environment's own API), as
+#: a set for the Atlas-lang validator's ``EnvSchema`` check.
+RESERVED_FIELD_NAMES: frozenset[str] = frozenset(_RESERVED)
 
 
-def _type_matches(value: Any, expected: type) -> bool:
-    """``isinstance`` with the bool/int hole closed.
+def _field_var(owner: str, field: str, type_: type, default: Any, *, nullable: bool = False) -> Var:
+    """A declared field with a default, held to exactly what ``var()`` accepts.
 
-    ``isinstance(True, int)`` is ``True``, so a plain check would let
-    ``var(int)`` accept ``size=True``. Same guard as the project-file reader.
+    Without the check, ``field: int = 'x'`` would be stored and read as a str.
     """
-    if expected is bool:
-        return isinstance(value, bool)
-    if isinstance(value, bool):
-        return False
-    if expected is float:
-        return isinstance(value, int | float)
-    return isinstance(value, expected)
+    _require_default_matches(f"{owner}.{field}", type_, default)
+    return Var(type=type_, default=default, nullable=nullable)
 
 
-#: Names an environment variable may not take: they are the environment's own
-#: API, so a variable sharing one would be unreachable — `env.name` would answer
-#: the environment name while `env["name"]` answered the value.
-_RESERVED = ("name", "get", "as_dict")
+def check_field_default(owner: str, field: str, annotation: Any, default: Any) -> None:
+    """Check one ``EnvSchema`` field's default the way class creation will.
 
-
-def _require_variable_name(name: str, what: str) -> None:
-    """Reject a variable name that could not be read back as ``env.<name>``."""
-    if not name.isidentifier() or name.startswith("_"):
-        raise LanguageError(
-            f"{what} {name!r} must be a plain identifier not starting with '_' — "
-            f"it is read back as `env.{name}`"
-        )
-    if name in _RESERVED:
-        raise LanguageError(
-            f"{what} {name!r} collides with an environment's own API "
-            f"({', '.join(_RESERVED)}) — pick another name"
-        )
-
-
-def _annotation_type(owner: str, field: str, annotation: Any) -> tuple[type, bool]:
-    """The declared type of an annotated field, and whether it is nullable.
-
-    Accepts one of the six supported types, or ``X | None``. Annotations arrive
-    either as objects (ordinary Python) or as strings (under
-    ``from __future__ import annotations``), so both spellings are handled here
-    rather than by calling ``get_type_hints``, which would evaluate arbitrary
-    names out of the declaring module.
+    The interpreter calls it per field so a bad default is reported on its own
+    line. ``__init_subclass__`` repeats the check at class creation, which
+    covers ordinary Python.
     """
-    parts = _annotation_parts(annotation)
-    named = [part for part in parts if part != "None"]
-    written = " | ".join(parts)
-    if len(named) != 1:
-        raise LanguageError(
-            f"field {field!r} of {owner!r}: only `X | None` may be combined, got {written!r}"
-        )
-    by_name = {supported.__name__: supported for supported in _SUPPORTED_TYPES}
-    if named[0] not in by_name:
-        raise LanguageError(
-            f"field {field!r} of {owner!r} must be one of {', '.join(by_name)}, "
-            f"got {written!r} — parameterised generics such as list[str] are not supported"
-        )
-    return by_name[named[0]], "None" in parts
-
-
-def _annotation_parts(annotation: Any) -> tuple[str, ...]:
-    """An annotation as the names it is written from: ``str | None`` -> ``("str", "None")``.
-
-    Names, not types: an annotation reaches here as a string under
-    ``from __future__ import annotations`` and as an object otherwise, and
-    resolving the string form would mean evaluating a name out of the declaring
-    module. Comparing spellings needs neither.
-    """
-    if isinstance(annotation, str):
-        return tuple(part.strip() for part in annotation.split("|"))
-    if members := get_args(annotation):  # a union, e.g. `str | None`
-        return tuple(_annotation_name(member) for member in members)
-    return (_annotation_name(annotation),)
-
-
-def _annotation_name(annotation: Any) -> str:
-    """One annotation member's name, with ``NoneType`` spelled the way it is written."""
-    if annotation is None or annotation is type(None):
-        return "None"
-    name = getattr(annotation, "__name__", None)
-    return name if isinstance(name, str) else str(annotation)
+    type_, _ = _annotation_type(owner, field, annotation)
+    _field_var(owner, field, type_, default)
 
 
 class EnvSchema:
     """Base for one environment's resolved variables: ``env.name``, ``env.domain``.
 
-    Subclass it to declare an environment's shape, and the variables become
-    ordinary annotated attributes that an editor completes and a type checker
-    diagnoses::
+    Subclass it to declare an environment's shape; the variables become
+    annotated attributes that an editor completes and a type checker checks::
 
         class AppEnv(EnvSchema):
             region: str
             price_class: str = "PriceClass_100"
 
-    Without a subclass, field names come from the schema at runtime, so no
-    fixed-field type can express them: an editor offers nothing and ``env.typo``
-    type-checks clean.
+    Atlas-lang forbids ``class`` except for a subclass of this type whose body
+    is only annotated fields (see :mod:`atlantide.lang.validate`), so a schema
+    is data.
 
-    Atlas-lang normally forbids ``class``; :mod:`atlantide.lang.validate` makes a
-    narrow exception for a subclass of this type whose body is only annotated
-    fields. There are no methods, decorators or metaclass, so a schema is data.
+    ``__getattr__`` is hidden from type checkers, so only declared fields
+    type-check. At runtime an unknown name raises an error listing the declared
+    variables.
 
-    ``__getattr__`` is hidden from type checkers (see below), so a subclass's
-    declared fields are the only ones that type-check. At runtime every lookup
-    still falls through here, so a typo is answered by name.
-
-    No ``frozen=`` machinery: Atlas-lang cannot assign to an attribute at all
-    (the interpreter binds ``Name``, ``Tuple``/``List`` and ``Subscript``
-    targets and rejects everything else), so immutability is structural.
+    Immutability is structural: Atlas-lang cannot assign to an attribute (the
+    interpreter binds only ``Name``, ``Tuple``/``List`` and ``Subscript`` targets).
     """
 
-    # The storage every environment shares, declared once here so a subclass can
-    # be `__slots__ = ()` and still carry no `__dict__`.
+    # Declared here so a subclass with `__slots__ = ()` carries no `__dict__`.
     __slots__ = ("_declared", "_values", "name")
 
     #: Set by `__init_subclass__` on a declared subclass: the fields it declared.
@@ -248,30 +159,33 @@ class EnvSchema:
 
         Reads the annotations plus either ``__atlas_defaults__`` (what the
         interpreter builds, keeping defaults out of the class namespace) or
-        plain class attributes (what ordinary Python writes). Doing it here
-        rather than in `atlantide.lang` keeps the interpreter to a single
-        ``type()`` call and makes a hand-written ``class X(EnvSchema)`` behave
-        identically.
+        plain class attributes (what ordinary Python writes). Running here
+        rather than in ``atlantide.lang`` keeps the interpreter to a single
+        ``type()`` call and gives a hand-written ``class X(EnvSchema)`` the same
+        behaviour.
         """
         super().__init_subclass__(**kwargs)
-        # `EnvView` declares no annotations, so it falls through with no fields —
-        # no special case needed for the one subclass that is not a user schema.
         defaults: Mapping[str, Any] = cls.__dict__.get("__atlas_defaults__", {})
+        # A parent schema's fields first, in MRO order, so a field redeclared
+        # here overrides the inherited one.
         fields: dict[str, Var] = {}
-        for field, annotation in cls.__dict__.get("__annotations__", {}).items():
+        for base in reversed(cls.__mro__[1:]):
+            fields.update(base.__dict__.get("__atlas_fields__", {}))
+        for field, annotation in _own_annotations(cls).items():
             _require_variable_name(field, f"field of {cls.__name__!r}")
             type_, nullable = _annotation_type(cls.__name__, field, annotation)
             if field in defaults:
-                fields[field] = Var(type=type_, default=defaults[field])
+                fields[field] = _field_var(
+                    cls.__name__, field, type_, defaults[field], nullable=nullable
+                )
             elif field in cls.__dict__:
-                fields[field] = Var(type=type_, default=cls.__dict__[field])
-                # `price_class: str = "..."` in ordinary Python leaves a *class*
-                # attribute, which normal lookup finds before `__getattr__` runs
-                # — so every environment would read the default instead of its
-                # own value. The default is captured above, so drop the
-                # attribute and let reads fall through to the instance. (The
-                # interpreter never creates one: it passes `__atlas_defaults__`
-                # precisely to keep config values out of the class namespace.)
+                fields[field] = _field_var(
+                    cls.__name__, field, type_, cls.__dict__[field], nullable=nullable
+                )
+                # In ordinary Python, `price_class: str = "..."` leaves a class
+                # attribute that normal lookup finds before `__getattr__`, so every
+                # environment would read the default. Delete it so reads fall
+                # through to the instance values.
                 delattr(cls, field)
             else:
                 fields[field] = Var(type=type_, default=None) if nullable else Var(type=type_)
@@ -280,33 +194,30 @@ class EnvSchema:
     def __init__(self, name: str, values: Mapping[str, Any], declared: Sequence[str]) -> None:
         """Built by :class:`Config`, which has already validated ``values``.
 
-        Not meant to be called from a config file — an environment comes out of
-        ``config.envs()``, already checked against the schema.
+        Config files obtain environments from ``config.envs()`` instead.
         """
         self.name = name
         self._values = dict(values)
         self._declared = tuple(declared)
 
     def _variable(self, item: str) -> Any:
-        """Read a declared variable, or say what this environment declares.
+        """Read a declared variable, or raise an error listing the declared ones.
 
-        The body of ``__getattr__``, as an ordinary method so both classes can
-        call it: :class:`EnvSchema` hides its ``__getattr__`` from type checkers
-        and :class:`EnvView` does not, but a typo must read the same either way.
-        Being a real method is also what makes ``self._values`` below safe — an
-        underscore name is answered with ``AttributeError`` rather than looping
-        back through here.
+        Shared by both ``__getattr__`` definitions (:class:`EnvSchema` hides its
+        own from type checkers, :class:`EnvView` does not) so a typo reports the
+        same way. Reading ``self._values`` cannot recurse: an underscore name
+        raises ``AttributeError`` first.
         """
         # An underscore name is never a variable (`_require_variable_name`
-        # rejects them), so it is either a protocol probe -- `copy`, `pickle` and
-        # `rich` ask for dunders that must answer `AttributeError` -- or this
-        # object mid-construction.
+        # rejects them), so it is a protocol probe (`copy`, `pickle` and `rich`
+        # ask for dunders that must raise `AttributeError`) or an unset slot
+        # during construction.
         if item.startswith("_"):
             raise AttributeError(item)
         if item in self._values:
             return self._values[item]
-        # Read `name` the long way round: on a half-built instance `self.name`
-        # would come back here and turn a typo into a RecursionError.
+        # Bypass normal lookup: on a half-built instance `self.name` would
+        # re-enter here and raise RecursionError.
         name = object.__getattribute__(self, "name")
         raise LanguageError(
             f"environment {name!r} has no variable {item!r} — "
@@ -314,12 +225,11 @@ class EnvSchema:
         )
 
     if not TYPE_CHECKING:
-        # The guard is load-bearing: a visible `__getattr__` returning `Any`
-        # makes every attribute valid, which is the gap a declared schema closes.
-        # `EnvView` re-declares a visible one, keeping the `var()` path
-        # permissive for configs that never declared a schema class.
+        # Hidden from type checkers: a visible `__getattr__` returning `Any` would
+        # make every attribute type-check. `EnvView` re-declares it visibly for
+        # the `var()` form.
         def __getattr__(self, item: str) -> Any:
-            """A declared variable. Only called for names outside ``__slots__``."""
+            """A declared variable. Called only when normal attribute lookup fails."""
             return self._variable(item)
 
     def __getitem__(self, key: str) -> Any:
@@ -333,11 +243,10 @@ class EnvSchema:
         return self._values.get(key, default)
 
     def as_dict(self) -> dict[str, Any]:
-        """This environment's variables as plain sorted data.
+        """This environment's variables as a plain dict in sorted key order.
 
-        Passing an environment straight into a resource field fails at IR
-        canonicalization as "not JSON-encodable"; this is the conversion, usable
-        with ``merge()``/``to_json()`` and safe in a resource field.
+        An environment object is not JSON-encodable; this dict can be passed to a
+        resource field, ``merge()`` or ``to_json()``.
         """
         return {key: self._values[key] for key in sorted(self._values)}
 
@@ -349,13 +258,11 @@ class EnvSchema:
 class EnvView(EnvSchema):
     """The environment view for a config that declared its schema with ``var()``.
 
-    A ``var()`` schema's field names exist only at runtime, so no fixed-field
-    type can express them; this class therefore re-declares the ``__getattr__``
-    :class:`EnvSchema` hides. Without it, every ``env.<var>`` in a ``schema=``
-    config would be a type error in the author's editor.
-
-    The cost is that a typo is caught only when the config runs. Declaring an
-    :class:`EnvSchema` subclass instead moves that to edit time.
+    A ``var()`` schema's field names exist only at runtime, so this class
+    re-declares the ``__getattr__`` that :class:`EnvSchema` hides; otherwise
+    every ``env.<var>`` in a ``schema=`` config would be a type error. A typo is
+    therefore caught only at runtime; an :class:`EnvSchema` subclass catches it
+    at edit time.
     """
 
     __slots__ = ()
@@ -368,27 +275,26 @@ class EnvView(EnvSchema):
 class EnvSelection:
     """The ``--env`` selection for one evaluation, and what a ``Config`` did with it.
 
-    Lives in a :class:`~contextvars.ContextVar` for the same reason the resource
-    registry does: a ``Config(...)`` literal is constructed inside the
-    interpreter, so the selection must already be in scope rather than passed as
-    an argument the config author would have to thread through.
+    Held in a :class:`~contextvars.ContextVar`, like the resource registry:
+    ``Config(...)`` is constructed inside the interpreter, so the selection must
+    be in scope rather than passed as an argument.
     """
 
     #: What the run asked for. ``None`` means every environment; ``()`` means none.
     requested: tuple[str, ...] | None = None
     #: Every environment the config declared.
     declared: tuple[str, ...] = ()
-    #: What ``Config.envs()`` actually yielded.
+    #: The declared environments ``requested`` selects, recorded when a
+    #: ``Config`` claims the selection; ``Config.envs()`` yields exactly these.
     selected: tuple[str, ...] = ()
-    #: Whether a ``Config`` saw this selection, so a ``--env`` against a config
-    #: that declares none can be reported instead of silently doing nothing.
+    #: Whether a ``Config`` claimed this selection, so ``--env`` against a config
+    #: that declares none can be reported.
     consumed: bool = False
 
     def claim(self, declared: tuple[str, ...]) -> None:
         """Bind this run's selection to the ``Config`` that just declared ``declared``.
 
-        Only one may: the selection is global to the run, so a second ``Config``
-        would leave ``--env prod`` with no single set of environments to name.
+        Only one ``Config`` may claim it, since the selection is global to the run.
         """
         if self.consumed:
             raise LanguageError(
@@ -417,26 +323,28 @@ def selecting(requested: Sequence[str] | None) -> Iterator[EnvSelection]:
         _selection.reset(token)
 
 
-class Config(Generic[EnvT]):
+#: ``EnvT`` is the environment type a `Config` yields: the user's `EnvSchema` subclass
+#: if declared, otherwise `EnvView`. The constructor overload binds it as ``E``.
+class Config[EnvT: EnvSchema]:
     """Every environment this system has, and what differs between them.
 
-    The schema comes either as an :class:`EnvSchema` subclass — the typed form,
-    where an editor completes ``env.<var>`` and a checker flags a typo — or as a
-    mapping of :func:`var` declarations::
+    The schema is either an :class:`EnvSchema` subclass (the typed form, where an
+    editor completes ``env.<var>`` and a type checker flags typos) or a mapping of
+    :func:`var` declarations::
 
         Config(AppEnv, envs={...})                       # typed
         Config(schema={"size": var(int, default=1)}, envs={...})
 
-    Both take the same ``envs`` mapping and run the same validation; the class
-    only adds static knowledge of the field set. Everything is checked when the
-    ``Config`` is constructed — a prod-only type error fails ``atlantide
-    validate`` in CI rather than at the moment prod is applied.
+    Both forms take the same ``envs`` mapping and run the same validation; the
+    class adds only static knowledge of the field set. Everything is checked at
+    construction, so a prod-only type error fails ``atlantide validate`` rather
+    than the prod apply.
     """
 
     __slots__ = ("_envs", "_view", "schema")
 
     @overload
-    def __init__(
+    def __init__[E: EnvSchema](
         self: Config[E], schema: type[E], *, envs: Mapping[str, Mapping[str, Any]]
     ) -> None: ...
 
@@ -454,7 +362,6 @@ class Config(Generic[EnvT]):
         *,
         envs: Mapping[str, Mapping[str, Any]],
     ) -> None:
-        # Positional-or-keyword, so `Config(schema={...}, envs=...)` keeps working.
         if isinstance(schema, type) and issubclass(schema, EnvSchema):
             self._view: type[EnvSchema] = schema
             declared: Mapping[str, Var] = schema.__atlas_fields__
@@ -465,12 +372,16 @@ class Config(Generic[EnvT]):
         self._envs = _resolve_envs(self.schema, envs, self._view)
         if (selection := current_selection()) is not None:
             selection.claim(tuple(self._envs))
+            # Recorded now, not only by `envs()`: a config that reads its
+            # environments through `env()` alone would otherwise leave every
+            # declared one excluded. Also reports a mistyped `--env` up front.
+            selection.selected = self._chosen(selection.requested)
 
     def envs(self) -> list[EnvT]:
         """The selected environments, sorted by name.
 
-        A list rather than a generator: the interpreter iterates lists in order,
-        and this is the order the stacks are declared in.
+        Returns a list: the interpreter iterates it in order, and that order is
+        the stack declaration order.
         """
         selection = current_selection()
         chosen = self._chosen(selection.requested if selection is not None else None)
@@ -483,8 +394,8 @@ class Config(Generic[EnvT]):
         if requested is None:
             return tuple(self._envs)
         for name in requested:
-            # A typo must not yield an empty selection, which would read as a
-            # successful run that did everything asked of it.
+            # An unknown name raises: an empty selection would run as a successful
+            # no-op.
             if name not in self._envs:
                 raise self._unknown(name)
         wanted = set(requested)
@@ -501,7 +412,9 @@ class Config(Generic[EnvT]):
         return cast("EnvT", self._envs[name])
 
     def _unknown(self, name: str) -> LanguageError:
-        return LanguageError(f"unknown environment {name!r} — declared: {', '.join(self._envs)}")
+        return LanguageError(
+            f"unknown environment {describe_value(name)} — declared: {', '.join(self._envs)}"
+        )
 
     def names(self) -> list[str]:
         """Every declared environment name, sorted."""
@@ -515,82 +428,16 @@ class Config(Generic[EnvT]):
 def _resolve_schema(schema: Mapping[str, Var]) -> dict[str, Var]:
     """The declared schema plus the well-known keys it did not declare itself.
 
-    Returned in sorted key order, which keeps ``EnvView.as_dict`` and the
-    "declared: ..." error text stable without re-sorting at each use.
+    Returned in sorted key order, which keeps each environment's values and the
+    "declared: ..." error text in a stable order.
     """
     for name, declaration in schema.items():
         if not isinstance(declaration, Var):
             raise LanguageError(
-                f"schema entry {name!r} must be a var(...), got {type(declaration).__name__}"
+                f"schema entry {name!r} must be a var(...), got {describe_type(declaration)}"
             )
-        # `env.<name>` has to be able to read it back — see `_require_variable_name`.
         _require_variable_name(name, "schema entry")
     resolved = dict(schema)
     for name, type_ in _WELL_KNOWN.items():
         resolved.setdefault(name, Var(type=type_, default=None))
     return {name: resolved[name] for name in sorted(resolved)}
-
-
-def _resolve_envs(
-    schema: Mapping[str, Var],
-    envs: Mapping[str, Mapping[str, Any]],
-    view: type[EnvSchema],
-) -> dict[str, EnvSchema]:
-    """Validate each environment against ``schema``, keyed in sorted name order.
-
-    ``view`` is the class each environment is built as — the user's
-    :class:`EnvSchema` subclass, or :class:`EnvView` for the ``var()`` form.
-    """
-    if not envs:
-        raise LanguageError("Config() requires at least one environment in envs=")
-    declared = tuple(schema)  # already sorted by `_resolve_schema`
-    resolved: dict[str, EnvSchema] = {}
-    for name in sorted(envs):
-        # Environment names become stack names; checked here so a bad one is
-        # reported where it was written rather than as an invalid stack.
-        require_identifier(name, "environment")
-        resolved[name] = view(name, _resolve_values(schema, name, envs[name]), declared)
-    return resolved
-
-
-def _resolve_values(
-    schema: Mapping[str, Var], env_name: str, values: Mapping[str, Any]
-) -> dict[str, Any]:
-    """One environment's values, defaults filled in and every entry type-checked."""
-    if not isinstance(values, Mapping):
-        raise LanguageError(
-            f"environment {env_name!r} must be a mapping of variable to value, "
-            f"got {type(values).__name__}"
-        )
-    for key in values:
-        if key not in schema:
-            raise LanguageError(
-                f"environment {env_name!r}: unknown variable {key!r} — "
-                f"declared: {', '.join(schema)}"
-            )
-    return {
-        key: _resolve_value(declaration, env_name, key, values)
-        for key, declaration in schema.items()
-    }
-
-
-def _resolve_value(declaration: Var, env_name: str, key: str, values: Mapping[str, Any]) -> Any:
-    """One variable's value: what the environment supplied, or its default."""
-    if key not in values:
-        if declaration.required:
-            raise LanguageError(f"environment {env_name!r} is missing required variable {key!r}")
-        return declaration.default
-
-    value = values[key]
-    # `None` is legal only where the declaration made the variable nullable by
-    # defaulting to it; otherwise it would pass the type check and surface as an
-    # empty field on a resource.
-    nullable = not declaration.required and declaration.default is None
-    if value is None and nullable:
-        return None
-    if not _type_matches(value, declaration.type):
-        raise LanguageError(
-            f"environment {env_name!r}: variable {key!r} expects "
-            f"{declaration.type.__name__}, got {type(value).__name__} {value!r}"
-        )
-    return value

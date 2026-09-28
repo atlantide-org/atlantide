@@ -82,7 +82,7 @@ with Stack("common", region=Region.EuNorth1, name_prefix="atlantide", tags={"env
     # `output()` returns a typed handle to the export. dev/prod below consume this
     # variable directly, so the output name lives in exactly one place (a typo is an
     # undefined-variable error, not a plan-time string mismatch).
-    vpc_id = output("vpc_id", network.vpc_id)  # computed VPC id — consumed by dev + prod
+    vpc_id = output("vpc_id", network.vpc_id)
 
 
 class AppEnv(EnvSchema):
@@ -186,12 +186,12 @@ for env in config.envs():
 
         # Exported per stack — the CLI prints them after apply. Values are computed
         # Refs (resolved at apply) or plain literals; both show up under Outputs.
-        output("assets_arn", assets.arn)  # computed bucket ARN
+        output("assets_arn", assets.arn)
         output("assets_bucket", assets.bucket)  # the resolved bucket name
-        output("jobs_url", jobs.url)  # computed queue URL
-        output("jobs_arn", jobs.arn)  # computed queue ARN
-        output("worker_role_arn", worker.arn)  # computed IAM role ARN
-        output("processor_arn", processor.arn)  # computed Lambda ARN
+        output("jobs_url", jobs.url)
+        output("jobs_arn", jobs.arn)
+        output("worker_role_arn", worker.arn)
+        output("processor_arn", processor.arn)
         output("build_id", build.result)  # the pinned random id
         output("edge_sg_id", edge.group_id)  # computed SG id (on the shared VPC)
         output("region", Region.EuNorth1)  # a literal

@@ -9,24 +9,36 @@ backends' dependencies.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from atlantide.core.errors import StateError
-from atlantide.state.backend import DEFAULT_LOCK_POLICY, LockPolicy, StateBackend
+from atlantide.state.backend import StateBackend
+from atlantide.state.leases import DEFAULT_LOCK_POLICY, DEFAULT_SKEW_MARGIN, LockPolicy
+from atlantide.state.sql.dsn import dsn_host
 
-#: Backend names accepted in ``[state].backend``.
-LOCAL = "local"
-S3 = "s3"
-POSTGRES = "postgres"
-BACKENDS = (LOCAL, S3, POSTGRES)
+
+class BackendKind(StrEnum):
+    """Backend names accepted in ``[state].backend``."""
+
+    LOCAL = "local"
+    S3 = "s3"
+    POSTGRES = "postgres"
+
+
+# Plain `str` values: the CLI prints these (as a --help default and via repr() in
+# diagnostics), where an enum member renders as `<BackendKind.LOCAL: 'local'>`.
+LOCAL: str = BackendKind.LOCAL.value
+S3: str = BackendKind.S3.value
+POSTGRES: str = BackendKind.POSTGRES.value
+BACKENDS: tuple[str, ...] = tuple(kind.value for kind in BackendKind)
 
 #: Keys that must be set for a backend to be usable, checked before any API call.
 REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
-    LOCAL: (),
-    S3: ("bucket", "key", "lock_table"),
-    POSTGRES: (),  # the dsn may also come from the environment; checked separately
+    BackendKind.LOCAL: (),
+    BackendKind.S3: ("bucket", "key", "lock_table"),
+    BackendKind.POSTGRES: (),  # the dsn may also come from the environment; checked separately
 }
 
 #: Read when ``[state].dsn`` is absent, so credentials stay out of the repo.
@@ -50,19 +62,30 @@ class StateConfig:
     profile: str | None = None
     endpoint: str | None = None
     # postgres
-    dsn: str | None = None
+    #: Kept out of the repr: it may carry a password.
+    dsn: str | None = field(default=None, repr=False)
     schema: str | None = None
-    # locking (backend-independent)
+    # locking, for every backend
     lock_ttl: float | None = None
     lock_renew_interval: float | None = None
     node_timeout: float | None = None
+    #: s3, postgres: how far past a lease's expiry another run may take it over.
+    #: Judged by the taker's clock on s3 (tolerated skew between hosts) and by
+    #: the server's on postgres (grace for a late renewal).
+    lock_skew_margin: float | None = None
+    #: s3: DynamoDB table holding the journal heads (commit pointers + fences);
+    #: defaults to ``lock_table``.
+    journal_table: str | None = None
+    #: s3: state writes to different nodes kept in flight at once (capped by the
+    #: run's parallelism).
+    write_concurrency: int | None = None
 
     @property
     def is_remote(self) -> bool:
-        return self.backend != LOCAL
+        return self.backend != BackendKind.LOCAL
 
     def validate(self) -> None:
-        """Fail fast, naming the missing key, rather than at the first API call."""
+        """Raise :class:`StateError` naming any missing key, before the first API call."""
         if self.backend not in BACKENDS:
             raise StateError(
                 f"unknown [state].backend {self.backend!r} — expected one of {', '.join(BACKENDS)}"
@@ -72,7 +95,7 @@ class StateConfig:
                 f'[state].backend = "{self.backend}" requires '
                 f"{', '.join(missing)} in atlantide.toml"
             )
-        if self.backend == POSTGRES and not self.resolved_dsn():
+        if self.backend == BackendKind.POSTGRES and not self.resolved_dsn():
             raise StateError(
                 f'[state].backend = "postgres" requires a dsn in atlantide.toml '
                 f"or the {DSN_ENV} environment variable"
@@ -81,17 +104,17 @@ class StateConfig:
     def lock_policy(self) -> LockPolicy:
         """The lease timings for this project, defaults filled in.
 
-        ``renew_interval`` tracks a custom ``lock_ttl`` unless it is set too: a
-        user who shortens the TTL alone would otherwise get an interval longer
-        than it, which cannot renew anything.
+        ``renew_interval`` tracks a custom ``lock_ttl`` unless it is set too;
+        otherwise shortening only the TTL could leave an interval longer than
+        the TTL, which never renews in time.
         """
         ttl = self.lock_ttl if self.lock_ttl is not None else DEFAULT_LOCK_POLICY.ttl
         interval = self.lock_renew_interval if self.lock_renew_interval is not None else ttl / 3
         policy = LockPolicy(
             ttl=ttl,
             renew_interval=interval,
-            # Never let the grace swallow the whole TTL: with a very short ttl the
-            # default 30s would refuse every write outright.
+            # Capped at ttl / 3: with a short TTL, the default 30s would refuse
+            # every write.
             renew_grace=min(DEFAULT_LOCK_POLICY.renew_grace, ttl / 3),
         )
         policy.validate()
@@ -109,44 +132,34 @@ class StateConfig:
 
 
 def describe(config: StateConfig, local_path: Path | None) -> str:
-    """A short, safe label for where state lives — printed before every mutation.
+    """A short, safe label for where state lives, printed before every mutation.
 
-    Targeting the wrong state is the expensive mistake this feature makes
-    possible (a stale shell, a config read from the wrong directory), and it is
-    silent: a plan against unexpectedly-empty state just looks like a first run.
-    Naming the target on every command is what makes it loud instead.
+    Naming the target on every command exposes a wrong target (a stale shell, a
+    config read from the wrong directory); a plan against unexpectedly empty
+    state otherwise looks like a first run.
 
-    ``local_path`` wins when set, because an explicit ``--state`` overrides the
-    configured backend — and it is always set for a local backend, which is why
-    there is no local branch below. A postgres DSN is reduced to host and schema:
-    it carries a password, and this string is printed into terminals and CI logs.
+    ``local_path`` takes precedence because an explicit ``--state`` overrides the
+    configured backend; it is always set for a local backend. A postgres DSN is
+    reduced to host and schema because it carries a password and this label is
+    printed to terminals and CI logs.
     """
     if local_path is not None:
         return str(local_path)
-    if config.backend == S3:
+    if config.backend == BackendKind.S3:
         return f"s3://{config.bucket}/{config.key}"
-    if config.backend == POSTGRES:
-        return f"postgres://{_dsn_host(config.resolved_dsn())}/{config.schema or DEFAULT_SCHEMA}"
+    if config.backend == BackendKind.POSTGRES:
+        return f"postgres://{dsn_host(config.resolved_dsn())}/{config.schema or DEFAULT_SCHEMA}"
     return LOCAL  # pragma: no cover - a local backend always resolves a path
-
-
-def _dsn_host(dsn: str | None) -> str:
-    """The ``host[:port]`` of a DSN, with any credentials dropped."""
-    if not dsn:
-        return "?"
-    try:
-        parsed = urlsplit(dsn)
-    except ValueError:  # pragma: no cover - defensive
-        return "?"
-    host = parsed.hostname or "?"
-    return f"{host}:{parsed.port}" if parsed.port is not None else host
 
 
 def make_state_backend(config: StateConfig, local_path: Path) -> StateBackend:
     """Build the configured backend; ``local_path`` is the sqlite file for ``local``."""
     config.validate()
-    if config.backend == S3:
-        from atlantide.state.s3_backend import S3StateBackend
+    skew_margin = (
+        config.lock_skew_margin if config.lock_skew_margin is not None else DEFAULT_SKEW_MARGIN
+    )
+    if config.backend == BackendKind.S3:
+        from atlantide.state.s3 import S3StateBackend
 
         return S3StateBackend(
             config.require("bucket"),
@@ -156,12 +169,17 @@ def make_state_backend(config: StateConfig, local_path: Path) -> StateBackend:
             profile=config.profile,
             endpoint_url=config.endpoint,
             kms_key_id=config.kms_key_id,
+            lock_skew_margin=skew_margin,
+            journal_table=config.journal_table,
+            write_concurrency=config.write_concurrency,
         )
-    if config.backend == POSTGRES:
-        from atlantide.state.postgres_backend import PostgresStateBackend
+    if config.backend == BackendKind.POSTGRES:
+        from atlantide.state.sql.postgres import PostgresStateBackend
 
         dsn = config.resolved_dsn() or ""  # validate() proved it is set
-        return PostgresStateBackend(dsn, schema=config.schema or DEFAULT_SCHEMA)
-    from atlantide.state.sqlite_backend import SqliteStateBackend
+        return PostgresStateBackend(
+            dsn, schema=config.schema or DEFAULT_SCHEMA, lock_skew_margin=skew_margin
+        )
+    from atlantide.state.sql.sqlite import SqliteStateBackend
 
     return SqliteStateBackend(str(local_path))

@@ -1,4 +1,4 @@
-"""atlantide.core: dependency-free SDK surface (types, Resource, Provider ABC).
+"""atlantide.core: the SDK surface (types, Resource, Provider ABC).
 
 Fallible lookups/checks return ``returns.result.Result``; the aliases below are
 re-exported so downstream modules import one vocabulary from here.

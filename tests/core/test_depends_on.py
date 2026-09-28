@@ -5,8 +5,8 @@ edge. This is for the cases where nothing is read: an IAM policy that has to
 propagate before the thing using it starts, a bucket policy that must exist
 before an upload.
 
-The property that makes it safe to reach for is that it orders and nothing more:
-adding one must never re-plan the resources it points at.
+It orders and nothing more: adding one must never re-plan the resources it
+points at.
 """
 
 from __future__ import annotations
@@ -62,8 +62,8 @@ def test_adding_an_ordering_edge_plans_no_change() -> None:
 
 
 def test_the_merkle_hashes_are_unmoved_too() -> None:
-    """Belt and braces: `hash_ir` covers the document, `merkle_hashes` the
-    per-node digests the diff actually compares."""
+    """`hash_ir` covers the document; `merkle_hashes` covers the per-node digests
+    the diff compares."""
 
     def hashes(source: str) -> dict[str, str]:
         ir = _ir(source)
@@ -91,8 +91,8 @@ def test_an_explicit_edge_appears_in_the_graph() -> None:
 
 
 def test_a_cycle_through_an_explicit_edge_is_rejected() -> None:
-    """An ordering edge is a real edge, so it can create a real cycle — and one
-    made only of ordering hints is just as unschedulable as one made of values."""
+    """An ordering edge is a real edge: a cycle made only of ordering hints is as
+    unschedulable as one made of values."""
     from returns.result import Failure
 
     ir = _ir(f"Box('a', size=1, depends_on=[{B!r}])\nBox('b', size=2, depends_on=[{A!r}])\n")
@@ -132,8 +132,8 @@ def test_something_that_is_neither_a_resource_nor_an_id_is_refused() -> None:
 
 def test_recreating_an_explicit_dependency_re_applies_its_dependent() -> None:
     """`_stale_dependents` pulls a node out of NOOP when an upstream node is
-    recreated. An explicit edge has to count: the dependent was ordered after it
-    for a reason, and that reason does not evaporate because no value is read.
+    recreated. An explicit edge counts too: the dependent was ordered after it
+    for a reason that holds even though no value is read.
     """
     source = "a = Box('a', size=1)\nBox('b', size=2, depends_on=[a])\n"
     h = Harness(MemoryStateBackend())

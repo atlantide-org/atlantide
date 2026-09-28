@@ -2,8 +2,8 @@
 
 A ``SecretRef("db_password", provider="ssm")`` resolves to the decrypted value of
 the parameter at ``{prefix}db_password``. Like every other
-:class:`~atlantide.secrets.backend.SecretsProvider`, the value is fetched
-in-memory at apply time and never written to config, the IR, or state — state
+:class:`~atlantide.secrets.base.SecretsProvider`, the value is fetched
+in memory at apply time and never written to config, the IR, or state; state
 keeps only the rotation digest.
 
 Values are memoised per instance, so a config referencing one secret from several
@@ -12,30 +12,24 @@ resources costs one API call and yields one consistent value for the whole run.
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import Any, ClassVar, override
 
 import boto3
-from botocore.config import Config as BotoConfig
 from botocore.exceptions import BotoCoreError, ClientError
-from typing_extensions import override
 
 from atlantide.core.check import FAIL, OK, Check
 from atlantide.core.errors import SecretsError
-from atlantide.core.tuning import CONNECT_TIMEOUT, MAX_ATTEMPTS, READ_TIMEOUT, RETRY_MODE
-from atlantide.secrets.backend import SecretsProvider
+from atlantide.secrets.base import SecretsProvider
+from atlantide.util.aws import client_config, error_code
 
-#: Bounded, retried client. Secret resolution happens mid-apply, so a hung SSM
-#: call hangs a run that is already holding its lease.
-_CLIENT_CONFIG = BotoConfig(
-    connect_timeout=CONNECT_TIMEOUT,
-    read_timeout=READ_TIMEOUT,
-    retries={"max_attempts": MAX_ATTEMPTS, "mode": RETRY_MODE},
-)
+#: Bounded, retried client config. Resolution happens mid-apply while the run
+#: holds its lease, so an SSM call must not hang.
+_CLIENT_CONFIG = client_config()
 
-#: Error codes meaning "the store answered, that name just isn't in it".
+#: Error codes meaning "the store answered; the name is not in it".
 _NOT_FOUND = frozenset({"ParameterNotFound"})
 
-#: Error codes meaning "the store answered, and refused you".
+#: Error codes meaning "the store answered and refused access".
 _DENIED = frozenset({"AccessDeniedException", "AccessDenied"})
 
 #: A name no parameter store should hold, used to prove one answers at all.
@@ -73,6 +67,8 @@ class SsmParameterStore(SecretsProvider):
             response = self._client.get_parameter(Name=path, WithDecryption=True)
         except ClientError as exc:
             raise self._error(exc, name, path) from exc
+        except BotoCoreError as exc:  # no credentials, bad profile, no endpoint, timeout
+            raise SecretsError(f"cannot reach SSM for {path!r}: {exc}") from exc
         parameter = response["Parameter"]
         if parameter.get("Type") == "StringList":
             raise SecretsError(
@@ -84,7 +80,7 @@ class SsmParameterStore(SecretsProvider):
         return value
 
     def _error(self, exc: ClientError, name: str, path: str) -> SecretsError:
-        code = _code(exc)
+        code = error_code(exc)
         if code in _NOT_FOUND:
             return SecretsError(
                 f"secret {name!r} not found in SSM at {path!r} — "
@@ -100,16 +96,12 @@ class SsmParameterStore(SecretsProvider):
 
     @override
     def check(self) -> Check:
-        """Ask for a name that cannot exist, and read the refusal.
+        """Request a parameter that should not exist and classify the error.
 
-        A "no such parameter" is the answer that proves the most: the endpoint
-        resolved, the credentials were accepted, and ``ssm:GetParameter`` is
-        granted — everything that would otherwise fail mid-apply. The error
-        *code* distinguishes that from a denial, so this never has to match on
-        the wording of a message.
-
-        ``kms:Decrypt`` cannot be verified without a real SecureString to read,
-        so a pass here does not promise one.
+        ``ParameterNotFound`` proves the endpoint resolved, the credentials were
+        accepted, and ``ssm:GetParameter`` is granted. Errors are classified by
+        code, not message. ``kms:Decrypt`` cannot be verified without a real
+        SecureString, so a pass does not cover it.
         """
         path = f"{self._prefix}{_PROBE}"
         try:
@@ -118,16 +110,15 @@ class SsmParameterStore(SecretsProvider):
             return self._probe_result(exc, path)
         except BotoCoreError as exc:  # no credentials, bad profile, no endpoint
             return self._check(FAIL, f"cannot reach SSM: {exc}")
-        # Someone really did create the probe parameter; the store still answered.
+        # The probe parameter exists; the store still answered.
         return self._check(OK, f"reachable ({self._where()})")
 
     def _probe_result(self, exc: ClientError, path: str) -> Check:
-        code = _code(exc)
+        code = error_code(exc)
         if code in _NOT_FOUND:
             return self._check(OK, f"reachable ({self._where()})")
         if code in _DENIED:
-            return Check(
-                f"secrets: {self.name}",
+            return self._check(
                 FAIL,
                 f"access denied on {path!r} — the caller needs ssm:GetParameter "
                 f"(and kms:Decrypt for a SecureString)",
@@ -136,8 +127,3 @@ class SsmParameterStore(SecretsProvider):
 
     def _where(self) -> str:
         return f"prefix {self._prefix!r}" if self._prefix else "no prefix"
-
-
-def _code(exc: ClientError) -> str:
-    """The AWS error code, e.g. ``ParameterNotFound`` (``""`` if the shape is odd)."""
-    return str(exc.response.get("Error", {}).get("Code", ""))

@@ -10,11 +10,10 @@ from atlantide.engine import Engine
 from atlantide.providers import random as random_provider
 from atlantide.providers.random import RandomProvider
 from atlantide.secrets import KeyMaterial, SecretsRegistry, is_sealed_marker
-from atlantide.state import MemoryStateBackend
-from atlantide.state.sqlite_backend import SqliteStateBackend
+from atlantide.state import MemoryStateBackend, SqliteStateBackend
 from tests.conftest import make_engine
 
-# A fixed-length password whose generated value we can scan for in the raw DB.
+# A fixed-length password whose generated value can be scanned for in the raw DB.
 SRC = (
     "from atlantide.providers.random import Password\n"
     "from atlantide.core import output\n"
@@ -45,7 +44,7 @@ def test_sensitive_output_sealed_in_node_state(tmp_path: Any) -> None:
 
 
 def test_no_sealer_leaves_output_plaintext(tmp_path: Any) -> None:
-    # Without install material (dev/tests), state is byte-identical to before.
+    # Without install material (dev/tests), outputs are stored unsealed.
     backend = MemoryStateBackend()
     engine = make_engine(random_provider.TYPES, RandomProvider(), backend=backend)
     report = asyncio.run(engine.apply(SRC)).unwrap()
@@ -80,14 +79,15 @@ def test_round_trip_replans_as_noop(tmp_path: Any) -> None:
     assert not plan.changeset.actionable
 
 
-def test_digest_matches_falls_back_to_legacy_salt(tmp_path: Any) -> None:
-    # A digest written before per-install salts (legacy salt) still verifies, so
-    # an upgraded install does not see spurious rotations.
+def test_digest_matches_rejects_a_fixed_salt_digest(tmp_path: Any) -> None:
+    # A digest under the fixed (no-install) salt is not accepted once an install
+    # salt exists: it reads as a rotation rather than silently verifying.
     from atlantide.secrets.digest import secret_digest
 
-    legacy_stored = secret_digest("n:f", "hunter2")  # fixed-salt digest, pre-migration
+    unsalted = secret_digest("n:f", "hunter2")
     salted = SecretsRegistry(material=KeyMaterial(os.path.join(str(tmp_path), "k.key")))
-    assert salted.digest("n:f", "hunter2") != legacy_stored  # per-install salt differs
-    assert salted.digest_matches("n:f", "hunter2", legacy_stored)  # legacy still accepted
+    salted.seal("x")  # an install key exists: a bare digest never creates one
+    assert salted.digest("n:f", "hunter2") != unsalted  # per-install salt differs
+    assert not salted.digest_matches("n:f", "hunter2", unsalted)
     assert salted.digest_matches("n:f", "hunter2", salted.digest("n:f", "hunter2"))
-    assert not salted.digest_matches("n:f", "rotated", legacy_stored)  # real change detected
+    assert not salted.digest_matches("n:f", "rotated", salted.digest("n:f", "hunter2"))

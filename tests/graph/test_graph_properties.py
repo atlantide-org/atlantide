@@ -1,27 +1,24 @@
 """Laws of the dependency graph, over generated graphs.
 
-The graph layer is pure algorithm — Tarjan, Kahn, a closure walk — and it decides
-the order every provider call happens in. Its failure modes are exactly the ones
-hand-written examples are worst at:
+The graph layer is pure algorithm (Tarjan, Kahn, a closure walk) and it decides
+the order every provider call happens in. Its failure modes are the ones
+hand-written examples catch least:
 
 * **A silent truncation.** Kahn's algorithm emits nothing for a node it never
   unblocks. An implementation that lost an edge would return a *shorter* order,
-  and a shorter order is not an error — it is a plan that skips resources. The
-  only reliable check is that the output is a permutation of the input, on graphs
-  nobody drew by hand.
+  which is not an error but a plan that skips resources. The reliable check is
+  that the output is a permutation of the input, on generated graphs.
 * **A cycle that is not caught.** A missed cycle is not a crash; it is a
-  truncated order, i.e. the previous bullet. So cycle detection has to be tested
-  against graphs that are cyclic *by construction* rather than by the author's
-  belief that they drew one.
-* **A selection that is not closed.** `--target` on a subnet has to pull in its
+  truncated order, i.e. the previous bullet. So cycle detection must be tested
+  against graphs that are cyclic *by construction*.
+* **A selection that is not closed.** `--target` on a subnet must pull in its
   VPC, or the apply creates a resource whose dependency does not exist yet. That
-  is a property of every seed set against every graph shape, and there are more
-  of both than anyone enumerates.
+  is a property of every seed set against every graph shape, too many
+  combinations to enumerate by hand.
 
-One thing deliberately not asserted here: that the reverse order is the forward
-order reversed. It is false, and reasonably so — ties break by sorted id in each
-direction independently, so two nodes with no edge between them come out in the
-same relative order both ways. Asserting it would be asserting a bug.
+Deliberately not asserted: that the reverse order is the forward order reversed.
+It does not hold: ties break by sorted id in each direction independently, so two
+nodes with no edge between them come out in the same relative order both ways.
 """
 
 from __future__ import annotations
@@ -51,10 +48,10 @@ def graphs() -> st.SearchStrategy[DiGraph]:
 
 @given(graphs(), st.booleans())
 def test_every_dependency_is_ordered_before_its_dependent(graph: DiGraph, reverse: bool) -> None:
-    """The whole point of the ordering, in both directions.
+    """The ordering respects every edge, in both directions.
 
     Forward is create/update order: a node's dependencies act first. Reverse is
-    destroy order and inverts the relation — a VPC cannot be destroyed while a
+    destroy order and inverts the relation: a VPC cannot be destroyed while a
     subnet still references it.
     """
     order = topological_order(graph, reverse=reverse)
@@ -103,9 +100,9 @@ def test_declaring_dependencies_in_another_order_builds_the_same_graph(ir: IRGra
 def test_a_cycle_is_reported_and_names_the_nodes_in_it(planted: PlantedCycle) -> None:
     """Detection plus attribution.
 
-    Reporting *that* a config is cyclic is not enough to act on — the operator
-    has to know which resources to break apart, and a detector that names the
-    wrong component sends them to edit a file that is fine.
+    Reporting *that* a config is cyclic is not enough to act on: the operator
+    must know which resources to break apart, and a detector that names the
+    wrong component sends them to edit the wrong file.
     """
     result = build_graph(planted.ir)
 
@@ -118,16 +115,16 @@ def test_a_cycle_is_reported_and_names_the_nodes_in_it(planted: PlantedCycle) ->
 
 @given(ir_graphs())
 def test_an_acyclic_graph_is_never_reported_as_cyclic(ir: IRGraph) -> None:
-    """No false positives: a spurious cycle is a config that cannot be deployed
-    at all, with no way for the operator to prove the tool wrong."""
+    """No false positives: a spurious cycle makes a config undeployable, with no
+    workaround for the operator."""
     assert isinstance(build_graph(ir), Success)
 
 
 @given(cyclic_ir_graphs())
 def test_every_reported_cycle_is_genuinely_a_cycle(planted: PlantedCycle) -> None:
-    """Each reported component must be strongly connected under the real edges —
+    """Each reported component must be strongly connected under the real edges:
     every member reachable from every other. A detector that reported an
-    arbitrary set of ids would satisfy the test above and still be useless."""
+    arbitrary set of ids would satisfy the test above without being correct."""
     edges = {node.id: set(node.edges()) for node in planted.ir.nodes}
 
     def reachable(start: str) -> set[str]:
@@ -193,9 +190,9 @@ def test_a_selection_contains_what_was_asked_for(
 def test_closing_a_selection_again_adds_nothing(
     seeded: tuple[DiGraph, frozenset[str]], reverse: bool
 ) -> None:
-    """Idempotence. The engine closes a selection more than once — once to pick
-    the apply scope, again to pick the lock scope — and a closure that grew each
-    time would widen the lock on every pass."""
+    """Idempotence: the engine closes a selection more than once (once to pick the
+    apply scope, again to pick the lock scope), and a closure that grew each time
+    would widen the lock on every pass."""
     graph, seeds = seeded
     once = closure(graph, seeds, reverse=reverse)
 
@@ -217,15 +214,15 @@ def test_a_selection_grows_with_its_seeds(
 @given(graphs(), st.booleans())
 def test_closing_over_everything_selects_everything(graph: DiGraph, reverse: bool) -> None:
     """A whole-graph selection is the un-targeted run, which must act on the
-    whole graph — the degenerate case that keeps `--target` and no-`--target`
-    on the same code path."""
+    whole graph; the degenerate case keeps `--target` and no-`--target` on the
+    same code path."""
     assert closure(graph, graph.node_ids, reverse=reverse) == frozenset(graph.node_ids)
 
 
 @given(graphs())
 def test_naming_every_node_selects_exactly_those_nodes(graph: DiGraph) -> None:
     """A full node id is the precise spelling and must resolve to itself, with no
-    glob interpretation — ids contain no wildcard characters, and a pattern that
+    glob interpretation: ids contain no wildcard characters, and a pattern that
     matched more than it named would act on resources nobody asked for."""
     assert match_targets(graph.node_ids, graph.node_ids) == frozenset(graph.node_ids)
 

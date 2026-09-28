@@ -46,8 +46,7 @@ from atlantide.providers.aws.handlers.sqs import SqsQueueHandler
 __all__ = ["HANDLERS", "AwsHandler"]
 
 _HANDLER_CLASSES: list[type[AwsHandler[Any]]] = [
-    # Read-only lookups. Registered here like any other handler — the registry's
-    # rule is "no type without a handler", not "no type without CRUD".
+    # Read-only lookups. Every type needs a handler, even without full CRUD.
     AwsCallerIdentityHandler,
     AwsAvailabilityZonesHandler,
     S3BucketHandler,

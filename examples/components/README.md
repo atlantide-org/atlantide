@@ -8,7 +8,7 @@ another project.
 ## Why not a URL import
 
 Atlas-lang config is a deterministic sandbox: it may import only `atlantide.*` and
-cannot touch the network (see [`atlantide/lang/validate.py`](../../atlantide/lang/validate.py)),
+cannot touch the network (see [`atlantide/lang/validate/imports.py`](../../atlantide/lang/validate/imports.py)),
 which is what keeps the IR byte-stable. So there is no live URL import. Instead you
 fetch once — pinned to an exact commit and a content hash — and import the vendored
 code locally. It's the `terraform init` model, and the vendored package mounts under

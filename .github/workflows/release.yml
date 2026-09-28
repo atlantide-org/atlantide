@@ -7,12 +7,12 @@ on:
 permissions:
   contents: write
 
-# Ordered by how hard each step is to undo. `verify` is cheap and settles every
-# question that can be answered before anything is produced. `build` uploads
+# Ordered by how hard each step is to undo. `verify` is cheap and checks
+# everything that can be checked before anything is produced. `build` uploads
 # binaries to the GitHub release, which can be replaced or deleted. `pypi` runs
 # last because it is the only irreversible step: a published version can be
-# yanked but its filenames are burned forever. A run that fails should fail
-# before that point, not after it.
+# yanked, but its filenames can never be reused. A failing run should fail
+# before that point.
 jobs:
   verify:
     name: Verify the release is publishable
@@ -38,31 +38,30 @@ jobs:
           python-version: "3.13"
           enable-cache: true
 
-      - name: Assert the tag and both version declarations agree
+      - name: Assert the tag matches the package version
         run: |
+          # The version is declared once, in atlantide/__init__.py; hatch reads
+          # it from there (`dynamic = ["version"]`), so `uv version` cannot.
           tag="${GITHUB_REF_NAME#v}"
-          version="$(uv version --short)"
-          if [ "$tag" != "$version" ]; then
-            echo "::error::tag v$tag != pyproject version $version — bump the version before tagging"
+          version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' atlantide/__init__.py)"
+          if [ -z "$version" ]; then
+            echo "::error::no __version__ found in atlantide/__init__.py"
             exit 1
           fi
-          # atlantide/__init__.py carries its own copy, used by `--version` when
-          # running from a source tree. Drift there ships a binary that lies.
-          init="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' atlantide/__init__.py)"
-          if [ "$init" != "$version" ]; then
-            echo "::error::atlantide/__init__.py says $init but pyproject says $version — update both"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag v$tag != package version $version — bump atlantide/__init__.py before tagging"
             exit 1
           fi
 
       - name: Refuse to republish a version PyPI already has
         run: |
-          version="$(uv version --short)"
+          version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' atlantide/__init__.py)"
           code="$(curl -sS -o /dev/null -w '%{http_code}' \
             "https://pypi.org/pypi/atlantide/$version/json")"
           case "$code" in
             404) echo "$version is not on PyPI yet" ;;
             200)
-              echo "::error::atlantide $version is already on PyPI. Filenames can never be reused there, even after deleting a release — re-running this tag cannot succeed. Bump the version in pyproject.toml and atlantide/__init__.py, then tag again."
+              echo "::error::atlantide $version is already on PyPI. Filenames can never be reused there, even after deleting a release — re-running this tag cannot succeed. Bump __version__ in atlantide/__init__.py, then tag again."
               exit 1
               ;;
             *)

@@ -9,14 +9,12 @@ from atlantide.providers.aws.resources import S3Bucket, S3BucketPolicy
 
 
 class SecureBucket(Component):
-    """A private S3 bucket plus a baseline hardening policy (TLS-only access).
+    """A private S3 bucket plus a TLS-only bucket policy.
 
-    A worked example of a library component: two resources wired together — the
-    policy *denies* every ``s3:*`` action on the bucket and its objects unless the
-    request came over TLS (``aws:SecureTransport``), and depends on the bucket via
-    its ``arn`` refs — namespaced under the component name. A ``Deny`` grants no
-    public access, so it applies cleanly under S3 Block Public Access. Exposes the
-    bucket handle and its computed ``arn`` / ``regional_domain_name``.
+    The policy denies every ``s3:*`` action on the bucket and its objects unless the
+    request uses TLS (``aws:SecureTransport``). A ``Deny`` grants no public access, so
+    it applies under S3 Block Public Access. Exposes the bucket handle, ``arn`` and
+    ``domain_name`` (the bucket's ``regional_domain_name``).
     """
 
     def __init__(

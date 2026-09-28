@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Self
 
 from returns.result import Result
 
@@ -19,11 +19,14 @@ from atlantide.core import (
     field_mutability,
 )
 from atlantide.core.errors import AtlantideError, PreventDestroyError
+from atlantide.core.events import EventSink, no_sink
+from atlantide.engine.planner import protected_ids
 from atlantide.graph import build_graph, topological_order
 from atlantide.graph.select import match_targets
-from atlantide.ir import lower, merkle_hashes
+from atlantide.ir import IRGraph, lower, merkle_hashes
 from atlantide.lang import evaluate_source
 from atlantide.reconcile import (
+    AdoptOptions,
     ApplyEnv,
     ApplyReport,
     ChangeSet,
@@ -33,14 +36,15 @@ from atlantide.reconcile import (
     ImportRequest,
     adopt,
     apply,
+    check_prevent_destroy,
     diff,
-    plan,
     refresh,
 )
-from atlantide.reconcile.context import DEFAULT_NODE_TIMEOUT, ProgressCallback
+from atlantide.reconcile.applied import consumed
+from atlantide.reconcile.env import DEFAULT_NODE_TIMEOUT
+from atlantide.reconcile.progress import ProgressCallback
 from atlantide.secrets import SecretsRegistry
-from atlantide.state import MemoryStateBackend
-from atlantide.state.backend import LeaseGuard, StateBackend
+from atlantide.state import LeaseGuard, MemoryStateBackend, StateBackend, StateGraph
 from tests.support.factories import globals_of, types_of
 from tests.support.providers import FakeProvider
 
@@ -62,6 +66,8 @@ class Harness:
     #: state a failed lease renewal would leave it in.
     lease: LeaseGuard = field(default_factory=LeaseGuard)
     node_timeout: float = DEFAULT_NODE_TIMEOUT
+    #: Where the executor's run events go; a test assigns a list's ``append``.
+    events: EventSink = no_sink
 
     @classmethod
     def of(
@@ -70,7 +76,7 @@ class Harness:
         provider: Provider | None = None,
         globals: dict[str, Any] | None = None,
         **kw: Any,
-    ) -> Harness:
+    ) -> Self:
         """Build a Harness from resource classes, deriving ``types`` and base ``globals``."""
         return cls(
             types=types_of(*resource_classes),
@@ -100,6 +106,7 @@ class Harness:
             secrets=self.secrets,
             lease=self.lease,
             node_timeout=self.node_timeout,
+            events=self.events,
             **extra,
         )
 
@@ -115,17 +122,26 @@ class Harness:
     def _mutability(self) -> dict[str, dict[str, Any]]:
         return {name: field_mutability(cls) for name, cls in self.types.items()}
 
-    def _protected(self) -> frozenset[str]:
-        return frozenset(n.id for n in self.backend.load().nodes.values() if n.prevent_destroy)
+    def _diff(self, ir: IRGraph, hashes: dict[str, str], prior: StateGraph) -> ChangeSet:
+        """The planner's diff: symbolic, plus what each ref field consumed since it was applied."""
+        return diff(
+            ir, hashes, prior, self._mutability(), consumed=consumed(ir, prior, self.secrets)
+        )
+
+    def _protected(self, ir: IRGraph) -> frozenset[str]:
+        """What the planner's guard protects: the config's flag, or state's for a dropped node."""
+        return protected_ids(self.backend.load(), ir)
 
     # -- stages -----------------------------------------------------------
 
     def diff_only(self, source: str) -> ChangeSet:
         _, ir, _, hashes = self._compile(source, self._providers())
-        return diff(ir, hashes, self.backend.load(), self._mutability())
+        return self._diff(ir, hashes, self.backend.load())
 
     def plan_only(self, source: str) -> Result[ChangeSet, PreventDestroyError]:
-        return plan(self.diff_only(source), self._protected())
+        _, ir, _, hashes = self._compile(source, self._providers())
+        changeset = self._diff(ir, hashes, self.backend.load())
+        return check_prevent_destroy(changeset, self._protected(ir))
 
     def apply(
         self,
@@ -141,10 +157,10 @@ class Harness:
         on_failure: str = "halt",
         on_progress: ProgressCallback | None = None,
     ) -> ApplyReport:
-        """The same run, awaitable — so a test can cancel it from outside.
+        """The same run, awaitable, so a test can cancel it from outside.
 
         An interrupt cancels the task *awaiting* the apply; it does not raise
-        inside one node's provider call. The difference matters: ``TaskGroup``
+        inside one node's provider call. This matters because ``TaskGroup``
         treats a ``CancelledError`` raised by a child as that child being
         cancelled rather than as a failure, so simulating an interrupt from
         inside a provider does not exercise the path a real Ctrl-C takes.
@@ -152,7 +168,9 @@ class Harness:
         providers = self._providers()
         registry, ir, graph, hashes = self._compile(source, providers)
         prior = self.backend.load()
-        changeset = plan(diff(ir, hashes, prior, self._mutability()), self._protected()).unwrap()
+        changeset = check_prevent_destroy(
+            self._diff(ir, hashes, prior), self._protected(ir)
+        ).unwrap()
         desired = Desired(
             ir=ir,
             graph=graph,
@@ -182,8 +200,7 @@ class Harness:
         A bare string is shorthand for an :class:`ImportRequest` with no external
         id. Node ids are resolved through ``match_targets``, the same matcher
         ``--target`` uses, so a test names ``"b"`` rather than
-        ``"default:test.Box:b"`` — and a typo raises instead of silently adopting
-        nothing.
+        ``"default:test.Box:b"``, and a typo raises instead of adopting nothing.
         """
         providers = self._providers()
         _, ir, _graph, hashes = self._compile(source, providers)
@@ -196,9 +213,7 @@ class Harness:
                 hashes=hashes,
                 prior=self.backend.load(),
                 env=self._env(providers),
-                write=write,
-                allow_drift=allow_drift,
-                force=force,
+                options=AdoptOptions(write=write, allow_drift=allow_drift, force=force),
             )
         )
 
@@ -216,11 +231,9 @@ class Harness:
 def box_harness(backend: StateBackend, provider: Provider | None = None) -> Harness:
     """A :class:`Harness` over the canonical ``Box`` resource.
 
-    Most reconcile-level behaviour — diff, replace, rollback, convergence — is
-    about the engine rather than about any particular resource, so those suites
-    all want the same one-resource setup. It lived in ``tests/reconcile/conftest``
-    under the name ``Harness``, which shadowed the class it returns and left
-    suites elsewhere importing another package's conftest to reach it.
+    Most reconcile-level behaviour (diff, replace, rollback, convergence) is about
+    the engine rather than any particular resource, so those suites share this
+    one-resource setup.
     """
     from atlantide.core import Lifecycle
     from tests.support.resources import Box
@@ -232,7 +245,7 @@ def _resolve(request: ImportRequest | str, known: set[str]) -> ImportRequest:
     """Expand a short node id to the full one, leaving an unmatchable id alone.
 
     An id that matches nothing is passed through unchanged so ``adopt`` can report
-    it as blocked — which is the behaviour the "not in this config" case tests.
+    it as blocked, the behaviour the "not in this config" case tests.
     ``match_targets`` signals "no match" by raising, so the exception *is* the
     answer rather than something to probe for first.
     """

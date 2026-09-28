@@ -12,7 +12,8 @@ import os
 import signal
 import traceback
 from collections.abc import Callable, Coroutine
-from typing import Any, NoReturn, TypeVar
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, NoReturn
 
 import typer
 from returns.result import Failure, Result
@@ -20,32 +21,36 @@ from rich.markup import escape
 
 from atlantide.cli.console import out
 from atlantide.cli.context import current, json_mode
+from atlantide.cli.views.output import emit_error_json
 from atlantide.core import AtlantideError
 from atlantide.core.errors import InterruptedRunError
-
-_T = TypeVar("_T")
+from atlantide.core.tuning import io_workers
+from atlantide.util.errors import also_failed, attach_also_failed
 
 #: Conventional shell exit code for "terminated by SIGINT" (128 + 2).
 _EXIT_INTERRUPTED = 130
 
 
-def run_async(
-    coro: Coroutine[Any, Any, Result[_T, AtlantideError]],
-) -> Result[_T, AtlantideError]:
-    """Run an engine coroutine, funnelling a provider ExceptionGroup into a Failure.
+def run_async[T](
+    coro: Coroutine[Any, Any, Result[T, AtlantideError]],
+    *,
+    parallelism: int | None = None,
+) -> Result[T, AtlantideError]:
+    """Run an engine coroutine, converting a provider ExceptionGroup into a Failure.
 
-    The primary typed error (with its ``node_id``/``op`` context and ``__cause__``
-    chain) is preserved rather than stringified, so the caller can render which
-    resource failed and, under ``--debug``, the full traceback. Any additional
-    failed leaves ride along on ``_also_failed`` for rendering.
+    The primary typed error keeps its ``node_id``/``op`` context and ``__cause__``
+    chain, for rendering and ``--debug`` tracebacks; other failed leaves are
+    attached via :func:`~atlantide.util.errors.attach_also_failed`.
 
-    Ctrl-C is handled rather than left to Python's default: the default raises
-    ``KeyboardInterrupt`` on the main thread, which unwinds past the executor
-    without ever cancelling its tasks — so the saga never runs and the traceback
-    is the last thing an operator sees mid-apply. See :func:`_install_sigint`.
+    Ctrl-C is routed through :func:`_install_sigint`: the default
+    ``KeyboardInterrupt`` on the main thread unwinds past the executor without
+    cancelling its tasks, so the saga would not run.
+
+    The loop's default executor is sized by :func:`~atlantide.core.tuning.io_workers`
+    from ``parallelism``; ``asyncio.run`` shuts it down with the loop.
     """
     try:
-        return asyncio.run(_interruptible(coro))
+        return asyncio.run(_interruptible(coro, workers=io_workers(parallelism)))
     except BaseException as exc:  # includes the cancellation an interrupt causes
         leaves = flatten_group(exc)
         if any(isinstance(e, asyncio.CancelledError | KeyboardInterrupt) for e in leaves):
@@ -55,20 +60,20 @@ def run_async(
             primary: AtlantideError = typed[0]
             rest = [e for e in leaves if e is not primary]
         else:
-            # The synthesized primary already joins every leaf message; listing
-            # the leaves again as "also failed" would render each one twice.
+            # The synthesized primary already joins every leaf message, so none
+            # are attached as also-failed.
             primary = AtlantideError("; ".join(str(e) for e in leaves))
             rest = []
         if rest:
-            primary._also_failed = rest  # type: ignore[attr-defined]
+            attach_also_failed(primary, rest)
         return Failure(primary)
 
 
 def _interrupted(leaves: list[BaseException]) -> InterruptedRunError:
     """The failure for an interrupted run, carrying anything else that broke.
 
-    A rollback that also failed rides along on ``_also_failed`` (the executor puts
-    it there), so the operator sees both the interrupt and what it could not undo.
+    A rollback failure attached by the executor is carried along, so both the
+    interrupt and what could not be undone are reported.
     """
     error = InterruptedRunError(
         "interrupted — completed resources were rolled back where possible; "
@@ -76,40 +81,48 @@ def _interrupted(leaves: list[BaseException]) -> InterruptedRunError:
     )
     extra = [e for e in leaves if not isinstance(e, asyncio.CancelledError | KeyboardInterrupt)]
     for leaf in leaves:
-        extra.extend(getattr(leaf, "_also_failed", []))
+        extra.extend(also_failed(leaf))
     if extra:
-        error._also_failed = extra  # type: ignore[attr-defined]
+        attach_also_failed(error, extra)
     return error
 
 
-async def _interruptible(
-    coro: Coroutine[Any, Any, Result[_T, AtlantideError]],
-) -> Result[_T, AtlantideError]:
-    """Drive ``coro`` as a task an interrupt can cancel cleanly."""
-    task: asyncio.Task[Result[_T, AtlantideError]] = asyncio.ensure_future(coro)
+async def _interruptible[T](
+    coro: Coroutine[Any, Any, Result[T, AtlantideError]],
+    *,
+    workers: int,
+) -> Result[T, AtlantideError]:
+    """Drive ``coro`` as a task an interrupt can cancel cleanly.
+
+    The handler stays installed until the executor has shut down: a cancelled task
+    returns at once, but ``asyncio.run`` then waits on its worker threads (a boto
+    call can take minutes), and a second Ctrl-C there must still abandon the run
+    rather than raise ``KeyboardInterrupt``.
+    """
     loop = asyncio.get_running_loop()
+    loop.set_default_executor(
+        ThreadPoolExecutor(max_workers=workers, thread_name_prefix="atlantide-io")
+    )
+    task: asyncio.Task[Result[T, AtlantideError]] = asyncio.ensure_future(coro)
     restore = _install_sigint(loop, task)
     try:
         return await task
     finally:
-        restore()
+        try:
+            await loop.shutdown_default_executor()
+        finally:
+            restore()
 
 
 def _install_sigint(loop: asyncio.AbstractEventLoop, task: asyncio.Task[Any]) -> Callable[[], None]:
     """Route Ctrl-C into cancelling ``task``; return a callable that undoes it.
 
-    First press cancels, which unwinds the executor through its saga. Second press
-    gives up on that and exits immediately — an operator pressing Ctrl-C twice is
-    saying they want out now, and an unkillable "cleaning up" is worse than an
-    honest abandonment.
-
-    ``os._exit`` is deliberate on the second press: it skips ``finally`` blocks,
-    *including the one that releases the state lock*. That is correct rather than
-    sloppy. An abandoned run may still have boto worker threads mutating live
-    resources — :func:`asyncio.to_thread` cannot kill them — so releasing the lease
-    would invite a second writer alongside a first that is still going. The TTL
-    reclaims it, and ``atlantide state unlock`` is there for an operator who knows
-    the run is gone.
+    The first press cancels, which unwinds the executor through its saga. The
+    second abandons the rollback and exits via ``os._exit``, skipping ``finally``
+    blocks, including the one that releases the state lock: boto worker threads may
+    still be mutating live resources (:func:`asyncio.to_thread` cannot kill them),
+    so releasing the lease would admit a concurrent writer. The lock TTL reclaims
+    it, or ``atlantide state unlock`` clears it once the run is gone.
     """
     pressed = 0
 
@@ -133,8 +146,8 @@ def _install_sigint(loop: asyncio.AbstractEventLoop, task: asyncio.Task[Any]) ->
     try:
         loop.add_signal_handler(signal.SIGINT, interrupt)
     except (NotImplementedError, AttributeError):  # pragma: no cover - Windows only
-        # Windows has no loop-level signal handling; fall back to the classic
-        # handler, hopping onto the loop thread to touch the task safely.
+        # No loop-level signal handling on Windows: use ``signal.signal`` and hop
+        # onto the loop thread before touching the task.
         previous = signal.signal(signal.SIGINT, lambda *_: loop.call_soon_threadsafe(interrupt))
 
         def restore_handler() -> None:
@@ -176,28 +189,31 @@ def maybe_traceback(err: BaseException) -> None:
 def render_error(err: BaseException) -> None:
     """Print the red ``error:`` line(s) with node context; no exit."""
     out().print(f"[bold red]error:[/] {escape(error_prefix(err))}{escape(str(err))}")
-    for extra in getattr(err, "_also_failed", []):
+    _render_extra_failures(err)
+
+
+def _render_extra_failures(err: BaseException) -> None:
+    """One ``and:`` line per failure that rode along on ``err``."""
+    for extra in also_failed(err):
         out().print(f"[bold red]  and:[/] {escape(error_prefix(extra))}{escape(str(extra))}")
 
 
 def fail(message: str) -> NoReturn:
     """Abort with a plain diagnostic.
 
-    Messages here bypass the error taxonomy, so under ``--json`` they are wrapped
-    in a generic envelope rather than left as text a consumer cannot parse.
+    The message carries no typed error, so under ``--json`` it is wrapped in a
+    generic error envelope.
     """
     if json_mode():
         _emit_error(AtlantideError(message))
-    # Escaped: these messages quote config keys such as [state].backend, which
-    # Rich would otherwise read as markup and swallow.
+    # Escaped: messages quote config keys such as [state].backend, which Rich
+    # parses as markup and drops.
     out().print(f"[bold red]error:[/] {escape(message)}")
     raise typer.Exit(1)
 
 
 def _emit_error(err: BaseException) -> NoReturn:
     """Write the JSON failure envelope to stdout and exit."""
-    from atlantide.cli.json_out import emit_error_json
-
     emit_error_json(err)
     raise typer.Exit(_EXIT_INTERRUPTED if isinstance(err, InterruptedRunError) else 1)
 
@@ -205,15 +221,14 @@ def _emit_error(err: BaseException) -> NoReturn:
 def fail_error(err: AtlantideError) -> NoReturn:
     """Render a structured error (node context + optional traceback) and exit.
 
-    An interrupt exits 130 (the shell convention for SIGINT) rather than 1, so a
-    CI job can tell "someone cancelled this" from "this deployment is broken".
+    An interrupt exits 130 (the shell convention for SIGINT) rather than 1, so CI
+    can distinguish a cancelled run from a failed one.
     """
     if json_mode():
         _emit_error(err)
     if isinstance(err, InterruptedRunError):
         out().print(f"[yellow]interrupted:[/] {escape(str(err))}")
-        for extra in getattr(err, "_also_failed", []):
-            out().print(f"[bold red]  and:[/] {escape(error_prefix(extra))}{escape(str(extra))}")
+        _render_extra_failures(err)
         maybe_traceback(err)
         raise typer.Exit(_EXIT_INTERRUPTED)
     render_error(err)
@@ -245,14 +260,14 @@ def fail_diag(err: AtlantideError, source: str) -> NoReturn:
     raise typer.Exit(1)
 
 
-def unwrap_or_exit(result: Result[_T, AtlantideError]) -> _T:
+def unwrap_or_exit[T](result: Result[T, AtlantideError]) -> T:
     """Return the success value, or render the failure and exit non-zero."""
     if isinstance(result, Failure):
         fail_error(result.failure())
     return result.unwrap()
 
 
-def unwrap_or_diag(result: Result[_T, AtlantideError], source: str) -> _T:
+def unwrap_or_diag[T](result: Result[T, AtlantideError], source: str) -> T:
     """Like :func:`unwrap_or_exit`, but renders a source-anchored diagnostic."""
     if isinstance(result, Failure):
         fail_diag(result.failure(), source)

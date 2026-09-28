@@ -2,14 +2,14 @@
 
 A ``StackReference("common").output("vpc_id")`` yields a :class:`StackOutputRef`
 that is not a :class:`~atlantide.core.types.Ref`, so it never becomes a graph
-edge — the referenced stack is applied separately and its output read from
+edge: the referenced stack is applied separately and its output read from
 committed state. When the referenced stack lives in the *same* config, its
 output already holds a live value expression (``network.vpc_id``, a ``Ref``) in
 ``registry.outputs``. Substituting the handle with that expression
 before lowering turns the cross-stack reference into an ordinary ref: the graph
 gains a real edge, so dependent stacks order after their sources and independent
 stacks still run in parallel, and the value threads through ``live_outputs`` at
-apply — exactly like an intra-stack ref.
+apply, like an intra-stack ref.
 
 Only *in-config* references (target ``{stack}:{name}`` present in this config's
 outputs) are inlined. An *external* reference (source stack in a separate config,
@@ -18,6 +18,7 @@ already applied) is left untouched, keeping the committed-outputs path.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from itertools import chain
 from typing import Any
 
@@ -26,7 +27,7 @@ from returns.result import Failure
 from atlantide.core._tree import tree_any, tree_map
 from atlantide.core.errors import StackOutputCycleError
 from atlantide.core.resource import Resource, ResourceRegistry
-from atlantide.core.types import StackOutputRef
+from atlantide.core.types import StackOutputRef, Transform
 
 
 def inline_stack_outputs(registry: ResourceRegistry) -> ResourceRegistry:
@@ -63,10 +64,9 @@ def inline_stack_outputs(registry: ResourceRegistry) -> ResourceRegistry:
         rebuilt.add_output(key, value)
     for binding in registry.policy_bindings:
         rebuilt.add_policy_binding(binding)
-    # Every carried field must survive the rebuild; dropping the consumed
-    # config inputs made `Compiled.inputs` empty for exactly the configs that
-    # use an in-config StackReference. Dropping the environment selection has the
-    # same shape: without it, `apply --env prod` plans every dev node as a delete.
+    # Every carried field must survive the rebuild: without `inputs`,
+    # `Compiled.inputs` is empty, and without the environment selection
+    # `apply --env prod` plans every dev node as a delete.
     rebuilt.inputs = dict(registry.inputs)
     rebuilt.envs_declared = registry.envs_declared
     rebuilt.envs_selected = registry.envs_selected
@@ -85,11 +85,8 @@ def _resolve_output_expr(
         return resolved[key]
     if key in seen:
         raise StackOutputCycleError([*seen, key])
-    chain = (*seen, key)
-    result = tree_map(
-        outputs[key],
-        lambda v: _resolve_leaf(v, outputs, resolved, chain),
-    )
+    resolving = (*seen, key)
+    result = tree_map(outputs[key], lambda v: _resolve_leaf(v, outputs, resolved, resolving))
     resolved[key] = result
     return result
 
@@ -102,13 +99,27 @@ def _resolve_leaf(
         target = _key(value)
         if target in outputs:
             return _resolve_output_expr(target, outputs, resolved, seen)
+    if isinstance(value, Transform):
+        return _map_transform(value, lambda v: _resolve_leaf(v, outputs, resolved, seen))
     return value
 
 
 def _inline_leaf(value: Any, outputs: dict[str, Any], resolved: dict[str, Any]) -> Any:
     if isinstance(value, StackOutputRef) and _key(value) in outputs:
         return resolved[_key(value)]
+    if isinstance(value, Transform):
+        return _map_transform(value, lambda v: _inline_leaf(v, outputs, resolved))
     return value
+
+
+def _map_transform(value: Transform, leaf: Callable[[Any], Any]) -> Transform:
+    """Rebuild a ``Transform`` with ``leaf`` applied through its arguments.
+
+    ``tree_map`` does not rebuild a ``Transform``, but ``_has_inconfig_ref`` sees
+    through one, so a ``StackOutputRef`` operand must be substituted here or it
+    reaches apply unresolved and forms no graph edge.
+    """
+    return Transform(value.op, tuple(tree_map(arg, leaf) for arg in value.args))
 
 
 def _key(ref: StackOutputRef) -> str:

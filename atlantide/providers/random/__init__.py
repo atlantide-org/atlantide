@@ -8,7 +8,8 @@ from atlantide.providers.random.resources import Id, Password, Timestamp, Uuid
 _RESOURCE_TYPES: tuple[type[Resource], ...] = (Uuid, Password, Id, Timestamp)
 TYPES: dict[str, type[Resource]] = {cls.type_name(): cls for cls in _RESOURCE_TYPES}
 
-#: See :mod:`atlantide.core.plugin`.
+#: Plugin descriptor advertised through the entry-point group; see
+#: :mod:`atlantide.core.plugin`.
 PLUGIN = ProviderPlugin(
     name=RandomProvider.name,
     types=TYPES,

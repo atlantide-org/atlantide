@@ -16,14 +16,11 @@ from atlantide.core.context import Context
 from atlantide.core.fields import sensitive_fields
 from atlantide.core.markers import canonicalize
 from atlantide.core.resource import Resource
-from atlantide.reconcile.context import (
-    PHASE_FAIL,
-    PHASE_FINISH,
-    PHASE_START,
-    ApplyEnv,
+from atlantide.reconcile.env import ApplyEnv, node_failure, provider_for
+from atlantide.reconcile.progress import (
+    Phase,
     RefreshProgress,
-    node_failure,
-    provider_for,
+    no_refresh_progress,
 )
 from atlantide.reconcile.resolve import (
     live_outputs,
@@ -31,11 +28,11 @@ from atlantide.reconcile.resolve import (
     seal_outputs,
     unseal_outputs,
 )
+from atlantide.reconcile.writer import writer_for
 from atlantide.secrets import SecretsRegistry
-from atlantide.state.backend import (
+from atlantide.state import (
     NO_INPUT_HASH,
-    STATUS_CREATED,
-    StateBackend,
+    NodeStatus,
     StateGraph,
     StateNode,
 )
@@ -44,9 +41,9 @@ from atlantide.state.backend import (
 class Drift(Enum):
     """How one node's live state compares to what state records."""
 
-    IN_SYNC = "in_sync"  # live outputs match the persisted ones
-    DRIFTED = "drifted"  # live outputs differ (see NodeDrift.changed)
-    MISSING = "missing"  # the resource no longer exists at the provider
+    IN_SYNC = "in_sync"  # every value the read reported matches state
+    DRIFTED = "drifted"  # see NodeDrift.changed
+    MISSING = "missing"  # the provider could not find the resource
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,16 +75,8 @@ class DriftReport:
         return self._of_kind(Drift.MISSING)
 
     @property
-    def in_sync(self) -> list[NodeDrift]:
-        return self._of_kind(Drift.IN_SYNC)
-
-    @property
     def has_drift(self) -> bool:
         return any(n.kind is not Drift.IN_SYNC for n in self.nodes)
-
-
-def _noop_refresh_progress(node_id: str, phase: str) -> None:
-    pass
 
 
 async def refresh(
@@ -100,49 +89,66 @@ async def refresh(
 ) -> DriftReport:
     """Read every recorded resource's live state and report drift vs. persisted state.
 
-    Reads run concurrently (bounded by ``env.parallelism``); they never mutate the
-    provider. With ``write=True`` the detected drift is synced back into state:
-    a DRIFTED node's outputs are overwritten with the live ones.
+    Reads run concurrently (bounded by ``env.parallelism``) and never mutate the
+    provider. With ``write=True`` the live read is folded back into state (see
+    :func:`_folded`).
 
-    A node the provider could not find is *reported* but not removed unless
-    ``prune=True``. "MISSING" is only ever as trustworthy as the read that
-    produced it, and a read can be wrong for reasons that have nothing to do with
-    the resource — an unpaginated listing, a permission the caller lacks, an
-    eventually-consistent view. Deleting the row on that evidence turns a
-    transient misread into a permanent loss of the only record that the resource
-    exists, and the next apply builds a second one. Reporting is recoverable;
-    deleting is not.
+    A MISSING node is reported but removed only with ``prune=True``: the read can
+    be wrong for reasons unrelated to the resource (an unpaginated listing, a
+    missing permission, an eventually-consistent view), and deleting the row
+    drops the only record of the resource, so the next apply creates a duplicate.
 
-    Report order is deterministic (sorted by node id).
+    Only a row the read changes is written, through the installed state writer
+    (off the event loop for a network backend) and after ``env.lease.check()``,
+    as the executor's writes are.
+
+    The report is sorted by node id.
     """
-    on_progress = progress or _noop_refresh_progress
+    on_progress = progress or no_refresh_progress
     ctx = Context()
     outputs = live_outputs(prior, env.secrets)
     semaphore = asyncio.Semaphore(env.parallelism)
+    writer = writer_for(env.backend)
+
+    def checked_put(row: StateNode) -> None:
+        env.lease.check()  # a lost lease must not write state
+        env.backend.put(row)
+
+    def checked_delete(node_id: str) -> None:
+        env.lease.check()
+        env.backend.delete(node_id)
+
+    async def sync(node: StateNode, row: StateNode | None) -> None:
+        """Write ``row`` over ``node``, drop it when ``None``; skip it if unchanged."""
+        if row is None:
+            await writer.run(checked_delete, node.id, key=node.id)
+        elif row is not node:
+            await writer.run(checked_put, row, key=node.id)
 
     async def check(node: StateNode) -> NodeDrift:
         async with semaphore:
-            on_progress(node.id, PHASE_START)
+            on_progress(node.id, Phase.START)
             try:
                 res = reconstruct(node, env, outputs)
                 live = await provider_for(env.providers, node.provider).read(ctx, res)
             except Exception as exc:
-                on_progress(node.id, PHASE_FAIL)
+                on_progress(node.id, Phase.FAIL)
                 raise node_failure(node.id, "read", exc) from exc
-            on_progress(node.id, PHASE_FINISH)
+            on_progress(node.id, Phase.FINISH)
         cls = env.types.get(node.type)
-        # `res` is the object the provider was handed, so its input values are
-        # the baseline comparable with what `read` returned.
+        # `res` is what the provider read, so its inputs are the comparable baseline.
         resolved = resolved_properties(node, res)
         if write:
-            _sync_state(node, resolved, live, env.backend, cls, env.secrets, prune=prune)
+            if live is None:
+                await sync(node, _synced_missing(node, prune=prune))
+            else:
+                await sync(node, _folded(node, resolved, live, cls, env.secrets))
         sensitive = frozenset(sensitive_fields(cls)) if cls is not None else frozenset()
         return classify_drift(node, resolved, live, sensitive, env.secrets)
 
-    # Sorted so the report (and any state writes) are deterministic. A TaskGroup,
-    # not `gather`: when one read fails, the remaining checks must be cancelled
-    # and awaited — a detached check with `write=True` would keep issuing state
-    # writes after the caller has raised and released the state lock.
+    # Sorted so the report and any state writes are deterministic. A TaskGroup
+    # cancels and awaits the remaining checks when one read fails; otherwise a
+    # check with `write=True` could write state after the lock is released.
     ordered = [node for _, node in sorted(prior.nodes.items())]
     async with asyncio.TaskGroup() as tg:
         tasks = [tg.create_task(check(node)) for node in ordered]
@@ -152,10 +158,9 @@ async def refresh(
 def resolved_properties(node: StateNode, res: Resource) -> dict[str, Any]:
     """The node's input properties as values, keyed as they are stored.
 
-    ``properties`` is symbolic: it keeps the ``$ref`` / ``$secret_ref`` /
-    ``$transform`` markers that make the diff a pure symbolic comparison. A
-    provider's ``read`` reports resolved values, since ``reconstruct`` resolved
-    them before the call, so the two are only comparable through this.
+    ``properties`` keeps the ``$ref`` / ``$secret_ref`` / ``$transform`` markers the
+    symbolic diff needs, while a provider's ``read`` reports resolved values; this
+    makes the two comparable.
     """
     inputs = res.input_values()
     return {key: inputs.get(key, node.properties[key]) for key in node.properties}
@@ -166,19 +171,14 @@ def _observed_drift(
 ) -> dict[str, tuple[Any, Any]]:
     """Per-key (stored, live) for every value the provider observed that changed.
 
-    Compares each key the provider's ``read`` reported against stored state —
-    inputs (``resolved``) and computed ``outputs`` (plaintext) alike — so a
-    provider that observes input fields (e.g. an S3 bucket's versioning/tags)
-    detects in-place drift, not just output drift. Keys the provider did not
-    report are unobserved, hence never flagged.
+    Each key the provider's ``read`` reported is compared against stored inputs
+    (``resolved``) and plaintext ``outputs``, so a provider that observes inputs
+    (e.g. an S3 bucket's versioning or tags) detects in-place drift. Unreported
+    keys are never flagged.
 
-    Both sides go through :func:`~atlantide.core.markers.canonicalize` first. An
-    input declared as a nested model — a ``SgRule``, a ``Route`` — is held as that
-    model on the config side and comes back from a provider as a plain mapping,
-    and comparing the two directly is never equal. That reports drift on a
-    security group nobody touched, on every run, forever; and because
-    ``refresh --write`` clears ``input_hash`` whenever it believes an input
-    drifted, the phantom then survives into the next plan.
+    Both sides go through :func:`~atlantide.core.markers.canonicalize` first: an
+    input declared as a nested model (``SgRule``, ``Route``) is a model in config
+    but a plain mapping from the provider, and would otherwise always differ.
     """
     baseline = canonicalize({**resolved, **outputs})
     return {
@@ -194,13 +194,8 @@ def _unobserved_inputs(
     """Split the node's inputs into (observed, unobserved) by what ``read`` reported.
 
     :func:`_observed_drift` can only flag keys the provider returned, so an
-    unreported input is not "in sync" — it is *unchecked*, and saying otherwise
-    makes IN_SYNC a claim the read never supported.
-
-    Derived from the live read rather than from a per-handler declaration on
-    purpose: a declaration is a second source of truth that can drift from what
-    the handler actually does, and the thing being reported here is precisely
-    what the handler actually did.
+    unreported input is unchecked, not in sync. Derived from the live read rather
+    than a per-handler declaration, so it always matches what the handler reports.
     """
     observed = tuple(key for key in sorted(resolved) if key in live)
     unobserved = tuple(key for key in sorted(resolved) if key not in live)
@@ -220,13 +215,10 @@ def classify_drift(
 ) -> NodeDrift:
     """Pure comparison of a node's persisted state to what its provider observed.
 
-    Persisted sensitive outputs are unsealed for the comparison, then values of
-    ``sensitive`` fields are replaced with :data:`REDACTED` in the report — drift
-    on a generated secret is flagged without echoing it.
-
-    The verdict is scoped to what the read reported: ``observed`` / ``unobserved``
-    record which inputs it covered, so IN_SYNC can be rendered as the partial
-    claim it is.
+    Sealed outputs are unsealed for the comparison, and values of ``sensitive``
+    fields are reported as :data:`REDACTED`, so drift on a secret is flagged
+    without echoing it. ``observed`` / ``unobserved`` record which inputs the read
+    covered, so IN_SYNC applies only to the observed ones.
     """
     if live is None:
         return NodeDrift(node.id, Drift.MISSING)
@@ -245,56 +237,52 @@ def classify_drift(
     )
 
 
-def _sync_state(
+def _synced_missing(node: StateNode, *, prune: bool) -> StateNode | None:
+    """The row recording that the provider could not find ``node``; ``None`` drops it.
+
+    A write-ahead row carries no physical id, so ``read`` reports MISSING whether
+    or not the create leaked; the row is kept as it is for the next apply to reclaim.
+
+    A confirmed row is dropped only with ``prune`` (see :func:`refresh`); otherwise
+    its hash is cleared so the next plan re-checks the node.
+    """
+    if node.status != NodeStatus.CREATED:
+        return node
+    if prune:
+        return None
+    if node.input_hash == NO_INPUT_HASH:
+        return node  # already marked
+    return replace(node, input_hash=NO_INPUT_HASH)
+
+
+def _folded(
     node: StateNode,
     resolved: dict[str, Any],
-    live: dict[str, Any] | None,
-    backend: StateBackend,
+    live: dict[str, Any],
     cls: type[Resource] | None,
     secrets: SecretsRegistry,
-    *,
-    prune: bool = False,
-) -> None:
-    """Reconcile state to the live read: drop a gone node, else fold observed values
-    back into the right column — inputs into ``properties``, the rest into ``outputs``.
+) -> StateNode:
+    """``node`` with the live read folded in: inputs into ``properties``, the rest
+    into ``outputs``.
 
-    Outputs are unsealed, merged with the live read, then re-sealed so a synced
-    sensitive value is never written back in the clear.
+    Outputs are unsealed, merged, then re-sealed so a sensitive value is never
+    written in the clear. In addition:
 
-    Two rules keep the write from corrupting state:
-
-    * A property whose stored form is symbolic keeps its marker. Replacing a
-      ``$ref`` with the value it resolved to erases the dependency from state, and
-      the next config change diffs the config's marker against that literal —
-      a spurious REPLACE when the field is ``immutable()``.
+    * A property stored as a marker keeps it. Replacing a ``$ref`` with its value
+      erases the dependency, and the next plan would diff the config's marker
+      against a literal (a REPLACE on an ``immutable()`` field).
     * Input drift clears ``input_hash``. The diff is symbolic, so config and state
-      hash identically after a drift; :data:`NO_INPUT_HASH` is the only channel
-      through which the next plan can see it.
+      hash identically after drift; :data:`NO_INPUT_HASH` makes the next plan
+      re-check the node.
+    * A read that changes nothing returns ``node`` itself, so the caller can skip
+      the write. Compared in plaintext: sealing need not be deterministic.
     """
-    if live is None:
-        # A write-ahead row carries no physical id, so `read` reports MISSING
-        # whether or not the create leaked. The row is the only record of the
-        # attempt, so it is kept for the next apply to reclaim.
-        #
-        # A confirmed row is dropped only when explicitly asked for: see the
-        # `refresh` docstring on why one failed read is not enough evidence to
-        # discard the sole record of a resource. The hash is cleared either way,
-        # so the next plan re-checks the node instead of skipping it.
-        if node.status == STATUS_CREATED:
-            if prune:
-                backend.delete(node.id)
-            else:
-                backend.put(replace(node, input_hash=NO_INPUT_HASH))
-        return
-
     properties = dict(node.properties)
-    outputs = unseal_outputs(node.outputs, secrets)
+    stored = unseal_outputs(node.outputs, secrets)
+    outputs = dict(stored)
     drifted_inputs = False
-    # Canonicalized on both sides for the same reason :func:`_observed_drift` is,
-    # and it has to be done here too: this decides whether to poison `input_hash`,
-    # so a comparison that reports a phantom difference does not merely mis-report
-    # it — it writes the phantom into state, where the next plan reads it as a
-    # reason to act.
+    # Canonicalized on both sides, as in `_observed_drift`: a spurious difference
+    # here would clear `input_hash` in state.
     comparable = canonicalize(resolved)
     for key, value in canonicalize(live).items():
         if key not in properties:
@@ -304,11 +292,14 @@ def _sync_state(
             if properties[key] == comparable.get(key):  # a literal, safe to record
                 properties[key] = value
 
-    backend.put(
-        replace(
-            node,
-            properties=properties,
-            outputs=outputs if cls is None else seal_outputs(outputs, cls, secrets),
-            input_hash=NO_INPUT_HASH if drifted_inputs else node.input_hash,
-        )
+    if outputs == stored:
+        sealed = node.outputs
+    else:
+        sealed = outputs if cls is None else seal_outputs(outputs, cls, secrets)
+    row = replace(
+        node,
+        properties=properties,
+        outputs=sealed,
+        input_hash=NO_INPUT_HASH if drifted_inputs else node.input_hash,
     )
+    return node if row == node else row

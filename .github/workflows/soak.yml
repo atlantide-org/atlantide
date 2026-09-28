@@ -1,10 +1,9 @@
 # The property suite at a thousand examples per law, nightly.
 #
-# `ci.yml` runs the same properties at a hundred examples and derandomized. That
-# is a regression gate: it answers "did this pull request break a law we already
-# know about", quickly and identically every time. It is deliberately not a
-# search, and it cannot be one — a gate that explored new inputs would fail on
-# pull requests that did not cause the failure.
+# `ci.yml` runs the same properties at a hundred examples, derandomized. That is
+# a regression gate: it checks whether a pull request broke a known law, quickly
+# and identically every time. It does not search for new inputs, because a gate
+# that did would fail pull requests that did not cause the failure.
 
 name: Soak
 
@@ -30,10 +29,6 @@ jobs:
           python-version: "3.13"
           enable-cache: true
       - name: Install
-        # `postgres` too, matching ci.yml: the state suite is parametrized over
-        # postgres and starts a container for it when no server is named, so a
-        # run without psycopg reaches the backend and dies on the import rather
-        # than skipping.
         run: uv sync --extra dev --extra postgres
       - name: Restore the example database
         uses: actions/cache@v4

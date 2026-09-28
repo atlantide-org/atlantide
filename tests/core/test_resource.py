@@ -81,9 +81,10 @@ def test_collecting_registry_auto_registers() -> None:
 
 
 def test_duplicate_registration_rejected() -> None:
-    with collecting(), pytest.raises(RegistryError, match="duplicate resource"):
+    with collecting():
         Bucket("logs", bucket_name="a")
-        Bucket("logs", bucket_name="b")
+        with pytest.raises(RegistryError, match="duplicate resource"):
+            Bucket("logs", bucket_name="b")
 
 
 def test_no_registration_outside_collecting() -> None:
@@ -112,9 +113,10 @@ def test_output_outside_collecting_raises() -> None:
 
 
 def test_duplicate_output_rejected() -> None:
-    with collecting(), pytest.raises(RegistryError, match="duplicate output"):
+    with collecting():
         output("dup", 1)
-        output("dup", 2)
+        with pytest.raises(RegistryError, match="duplicate output"):
+            output("dup", 2)
 
 
 def test_handles_are_accepted_in_nested_positions() -> None:
@@ -133,3 +135,42 @@ def test_handles_are_accepted_in_nested_positions() -> None:
         },
     )
     assert "token" in res.tags
+
+
+def test_default_lifecycle_is_shared_and_immutable() -> None:
+    """Resources without a lifecycle share one default instance (no per-instance
+    factory call); sharing is only safe because ``Lifecycle`` is frozen."""
+    import dataclasses
+
+    from atlantide.core import Lifecycle
+
+    a = Bucket("a", bucket_name="x")
+    b = Bucket("b", bucket_name="y")
+    assert a.lifecycle is b.lifecycle
+    assert a.lifecycle == Lifecycle()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        a.lifecycle.prevent_destroy = True  # type: ignore[misc]
+    assert b.lifecycle.prevent_destroy is False
+
+
+def test_private_accessors_match_ordinary_attribute_lookup() -> None:
+    b = Bucket("logs", bucket_name="x")
+    assert b.logical_name == b._logical_name == "logs"
+    assert b.stack == b._stack
+    assert b.depends_on == b._depends_on == ()
+    assert b.node_id == "default:test.Bucket:logs"
+    # A private attribute that was never set still raises AttributeError, as
+    # pydantic's own lookup does, rather than a KeyError from the fast path.
+    bare = Bucket.model_construct(bucket_name="x")
+    with pytest.raises(AttributeError):
+        _ = bare.logical_name
+    with pytest.raises(AttributeError):
+        _ = bare.node_id
+
+
+def test_unset_computed_field_still_reads_as_ref() -> None:
+    """The underscore fast path in ``__getattribute__`` must not bypass the
+    UNSET→Ref rewrite for public fields."""
+    b = Bucket("logs", bucket_name="x")
+    arn: object = b.arn
+    assert arn == Ref(node_id="default:test.Bucket:logs", attr="arn")

@@ -1,14 +1,15 @@
 """Random resources: a value generated once at apply and pinned in state.
 
-Unlike a non-deterministic function evaluated in config, these are resources: the
-value is produced at apply, persisted, and stable thereafter (re-plan is a Merkle
-NOOP). All inputs are immutable, so changing one — e.g. ``keepers`` — is a REPLACE
-that regenerates the value, visible in the plan.
+The value is produced at apply, persisted, and stable thereafter (re-plan is a
+Merkle NOOP). All inputs are immutable, so changing one (such as ``keepers``) is a
+REPLACE that regenerates the value.
 """
 
 from __future__ import annotations
 
 from typing import ClassVar
+
+from pydantic import model_validator
 
 from atlantide.core import Resource, computed, immutable
 
@@ -35,12 +36,26 @@ class Password(RandomResource):
     length: int = immutable(default=32)
     result: str = computed(sensitive=True)
 
+    @model_validator(mode="after")
+    def _validate(self) -> Password:
+        # An empty password would be generated and pinned without complaint.
+        if isinstance(self.length, int) and self.length < 1:
+            raise ValueError(f"Password.length must be at least 1, got {self.length}")
+        return self
+
 
 class Id(RandomResource):
     """A random id: ``byte_length`` random bytes, hex-encoded into ``result``."""
 
     byte_length: int = immutable(default=16)
     result: str = computed()
+
+    @model_validator(mode="after")
+    def _validate(self) -> Id:
+        # token_hex(0) is "", and a negative length raises only at apply.
+        if isinstance(self.byte_length, int) and self.byte_length < 1:
+            raise ValueError(f"Id.byte_length must be at least 1, got {self.byte_length}")
+        return self
 
 
 class Timestamp(RandomResource):

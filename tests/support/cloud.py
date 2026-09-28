@@ -1,7 +1,7 @@
 """Cloud-provider test kit: reusable env + mock + default Stack setup.
 
-Adding a new cloud provider's suite is three lines — supply the provider's env
-vars and a ``mock_factory`` (e.g. ``moto.mock_aws``); everything else is shared.
+A new cloud provider's suite supplies the provider's env vars and a
+``mock_factory`` (e.g. ``moto.mock_aws``); everything else is shared.
 
 :func:`fake_aws_credentials` and :func:`create_state_store` are the pieces the
 remote-state suites compose with ``moto.mock_aws`` directly, since they need no
@@ -50,14 +50,12 @@ def cloud_env_fixture(
 def aws_fixture(
     *, region: str = TEST_REGION, stack: str = "default"
 ) -> Callable[..., Iterator[None]]:
-    """The AWS flavour of :func:`cloud_env_fixture`, which is what every suite wants.
+    """The AWS flavour of :func:`cloud_env_fixture`.
 
-    ``cloud_env_fixture`` stays generic because it is the seam a second cloud
-    provider plugs into. But nine AWS suites were each re-spelling the same
-    credential dict and the same ``mock_factory=mock_aws`` to reach it, which is
-    nine chances to typo an env var into a suite that then quietly talks to a real
-    account. Say what varies — the region, occasionally the stack name — and
-    nothing else::
+    ``cloud_env_fixture`` stays generic as the seam a second cloud provider plugs
+    into. This fixes the fake credentials and ``mock_factory=mock_aws`` in one
+    place, so a mistyped env var cannot leave a suite talking to a real account.
+    Callers pass only what varies (the region, occasionally the stack name)::
 
         aws_env = aws_fixture()
     """

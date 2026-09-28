@@ -1,14 +1,9 @@
 """What a run did, as a stream of events.
 
-The executor already reported per-node progress, but only in the shape a terminal
-needed: ``(node_id, action, phase)``, with no timing, no error, and no way to tell
-one run from another. That is enough to draw a table and not enough to answer
-"who changed this, when, and what happened" — which is the question asked after
-something has gone wrong, by someone who was not there.
-
-:class:`ApplyEvent` widens it just far enough to answer that, and the progress
-callback becomes an adapter over the same stream rather than a second, parallel
-notification path that can drift from it.
+Each :class:`ApplyEvent` carries the run id, a timestamp, the node and action
+and any error detail: enough to answer "who changed this, when, and what
+happened" after the fact. The terminal progress display is an adapter over this
+same stream rather than a second notification path, so the two cannot drift apart.
 """
 
 from __future__ import annotations
@@ -17,16 +12,16 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-#: A run starts and ends. The header carries the identity of the run itself.
+#: Run boundaries: the first and last event of every run.
 RUN_START = "run_start"
 RUN_FINISH = "run_finish"
 
-#: Per-node, mirroring the progress phases the TUI already consumed.
+#: Per-node, mirroring the progress phases the TUI consumes.
 NODE_START = "node_start"
 NODE_FINISH = "node_finish"
 NODE_FAIL = "node_fail"
 
-#: Lock lifecycle: who held state when, which anchors an incident timeline.
+#: Lock lifecycle: who held state, and when.
 LEASE_ACQUIRE = "lease_acquire"
 LEASE_RENEW = "lease_renew"
 LEASE_LOST = "lease_lost"
@@ -42,7 +37,7 @@ class ApplyEvent:
     """One thing that happened during a run.
 
     ``at`` is supplied by the emitter rather than read here, so a replayed or
-    reconstructed stream carries the times it actually had.
+    reconstructed stream carries its original times.
     """
 
     run_id: str
@@ -53,21 +48,20 @@ class ApplyEvent:
     detail: dict[str, Any] = field(default_factory=dict)
 
 
-#: Where events go. A single function, so an S3 or webhook sink is a drop-in
-#: rather than a new interface.
-EventSink = Callable[[ApplyEvent], None]
+#: Where events go. A plain callable, so a new sink (S3, webhook) needs no new
+#: interface.
+type EventSink = Callable[[ApplyEvent], None]
 
 
 def no_sink(event: ApplyEvent) -> None:
-    """Discard. The default, so nothing pays for the stream unless it is wanted."""
+    """Discard the event. The default, so the stream costs nothing unless used."""
 
 
 def fanout(*sinks: EventSink) -> EventSink:
-    """One sink feeding several — the terminal display and the audit file at once.
+    """One sink feeding several, e.g. the terminal display and the audit file.
 
-    A sink that raises must not take the run down with it: an audit file on a
-    full disk is a problem, but it is a smaller problem than an apply aborting
-    half-way because of one.
+    A sink that raises is skipped: a failing sink (e.g. an audit file on a full
+    disk) must not abort an apply half-way.
     """
 
     def emit(event: ApplyEvent) -> None:

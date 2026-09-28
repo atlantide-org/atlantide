@@ -1,36 +1,46 @@
 """What an apply says when things went wrong on the way out.
 
-These are the lines that tell an operator state no longer describes reality, and
-they had no test at all — which is how a "simplification" of the block that emits
-them could have changed the wording, the styling, or dropped one entirely without
-anything noticing.
+These are the lines that tell an operator state no longer describes reality.
+Without a test, a change to the block that emits them could alter the wording or
+styling, or drop a line, unnoticed.
 
 Asserted as exact strings rather than fragments. The wording *is* the feature: it
 is the only place a half-completed rollback, a state row that could not be marked
-stale, or a resource left running with no state row is ever explained. Editing one
-should be a deliberate act that updates this file too.
+stale, or a resource left running with no state row is explained. Changing the
+wording means updating this file too.
 """
 
 from __future__ import annotations
 
 import io
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
 from rich.console import Console
 
-from atlantide.cli import render
+from atlantide.cli.views import common, report
 from atlantide.reconcile import ApplyReport
 
 
-def _rendered(report: ApplyReport, **kwargs: object) -> str:
-    """The report as plain text, wide enough that nothing wraps."""
+@contextmanager
+def _captured() -> Iterator[io.StringIO]:
+    """Route both modules the report prints through — its own lines and the
+    shared per-stack sections — into one buffer, wide enough that nothing wraps."""
     buffer = io.StringIO()
-    original = render.console
-    render.console = Console(file=buffer, width=200, force_terminal=False)
+    capture = Console(file=buffer, width=200, force_terminal=False)
+    originals = report.console, common.console
+    report.console = common.console = capture
     try:
-        render.render_report(report, show_nodes=False, **kwargs)  # type: ignore[arg-type]
+        yield buffer
     finally:
-        render.console = original
+        report.console, common.console = originals
+
+
+def _rendered(applied: ApplyReport, **kwargs: object) -> str:
+    """The report as plain text, summary and trouble only."""
+    with _captured() as buffer:
+        report.render_report(applied, show_nodes=False, **kwargs)  # type: ignore[arg-type]
     return buffer.getvalue()
 
 
@@ -77,8 +87,8 @@ def test_a_failed_rollback_names_every_node_and_its_reason() -> None:
 
 
 def test_nodes_that_could_not_be_marked_stale_say_the_next_plan_will_lie() -> None:
-    """The worst of the three: the next plan reports no change for a resource
-    whose state is known to be wrong, and nothing else will say so."""
+    """The next plan reports no change for a resource whose state is known to be
+    wrong, and nothing else will say so."""
     output = _rendered(ApplyReport(poison_failed={"s:t:a": "write refused"}))
 
     assert (
@@ -130,8 +140,66 @@ def test_a_sensitive_output_is_not_printed() -> None:
 
     assert "url = https://x" in output
     assert "hunter2" not in output
-    assert render.SECRET_REDACTED in output
+    assert common.SECRET_REDACTED in output
 
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_node_rows_are_grouped_under_their_stack() -> None:
+    output = _rendered_nodes(ApplyReport(created=["s1:t.A:a", "s2:t.B:b"], deleted=["s1:t.C:c"]))
+    lines = [line.rstrip() for line in output.splitlines()]
+    assert lines[0].startswith("s1 ")
+    assert lines[1:3] == ["  + done t.A:a", "  - done t.C:c"]
+    assert lines[3].startswith("s2 ")
+    assert lines[4] == "  + done t.B:b"
+
+
+def _rendered_nodes(applied: ApplyReport) -> str:
+    with _captured() as buffer:
+        report.render_report(applied)
+    return buffer.getvalue()
+
+
+def test_a_state_only_write_is_counted_apart_from_the_unchanged() -> None:
+    output = _rendered(ApplyReport(noop=["s:t:a", "s:t:b"], state_only=["s:t:a"]))
+
+    assert output.strip() == "Applied: 1 state-only, 1 unchanged"
+
+
+def test_a_replace_the_apply_did_not_need_is_named() -> None:
+    output = _rendered(
+        ApplyReport(
+            updated=["s:t:up", "s:t:cdn"],
+            noop=["s:t:pol"],
+            downgraded={"s:t:cdn": "update", "s:t:pol": "noop"},
+        )
+    )
+
+    assert output.splitlines() == [
+        "",
+        "Applied: 2 to change, 1 unchanged",
+        "2 known-after-apply replace(s) not needed — no immutable value changed:",
+        "  t:cdn: update instead of replace",
+        "  t:pol: noop instead of replace",
+    ]
+
+
+def test_the_node_rows_show_a_state_only_write() -> None:
+    with _captured() as buffer:
+        report.render_report(ApplyReport(noop=["s:t:a"], state_only=["s:t:a"]))
+    assert "~ done t:a  (state only)" in buffer.getvalue()
+
+
+def test_the_live_table_shows_the_action_a_node_finished_with() -> None:
+    """A known-after-apply replace that was not needed finishes as what it ran as."""
+    from atlantide.cli.progress import ProgressTable
+    from atlantide.core.actions import Action
+    from atlantide.reconcile.progress import Phase
+
+    table = ProgressTable([("s:t:cdn", Action.REPLACE)])
+    table.record("s:t:cdn", Action.REPLACE, Phase.START)
+    assert table._action_of["s:t:cdn"] is Action.REPLACE
+    table.record("s:t:cdn", Action.NOOP, Phase.FINISH)
+    assert table._action_of["s:t:cdn"] is Action.NOOP

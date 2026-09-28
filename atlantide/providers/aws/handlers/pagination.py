@@ -1,15 +1,15 @@
-"""The two AWS listing protocols, so no handler hand-rolls a paging loop.
+"""Iterators over the two AWS listing pagination protocols.
 
-Reading only the first page is a silent correctness bug, not a performance one:
-an item past page one reads as absent, refresh classifies the node MISSING, and
-``refresh --write`` drops the state row of a healthy resource. Both protocols
-live here so that cannot be got wrong per handler.
+An item past the first page must not read as absent: refresh would classify the
+node MISSING and ``refresh --write`` would drop its state row.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from typing import Any
+
+from atlantide.core.errors import ProviderError
 
 
 def token_pages(call: Any, key: str, **kwargs: Any) -> Iterator[dict[str, Any]]:
@@ -26,7 +26,7 @@ def token_pages(call: Any, key: str, **kwargs: Any) -> Iterator[dict[str, Any]]:
 def marker_pages(call: Any, envelope: str, **kwargs: Any) -> Iterator[dict[str, Any]]:
     """Every item across a ``Marker``/``NextMarker``-paged listing (CloudFront).
 
-    CloudFront wraps its items in a named envelope (``DistributionList``,
+    CloudFront wraps items in a named envelope (``DistributionList``,
     ``OriginAccessControlList``) that also carries the truncation flags.
     """
     marker: str | None = None
@@ -36,4 +36,8 @@ def marker_pages(call: Any, envelope: str, **kwargs: Any) -> Iterator[dict[str, 
         yield from listing.get("Items", [])
         if not listing.get("IsTruncated"):
             return
+        # Without a marker the next call would re-fetch the first page forever;
+        # stopping instead would hide later items as absent (see module docstring).
         marker = listing.get("NextMarker")
+        if not marker:
+            raise ProviderError(f"{envelope} is truncated but carries no NextMarker")

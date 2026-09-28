@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from atlantide.core._describe import describe_value
 from atlantide.core.errors import RegistryError
 from atlantide.policy.base import PolicyContext, PolicyProvider, PolicyResult
 
 
 class PolicyRegistry:
-    """Holds one or more `PolicyProvider`s; evaluates by finding the owner of a name."""
+    """Holds :class:`PolicyProvider` instances; evaluates via the first one defining a name."""
 
     def __init__(self) -> None:
         self._providers: list[PolicyProvider] = []
@@ -22,4 +23,4 @@ class PolicyRegistry:
         for provider in self._providers:
             if provider.has(name):
                 return provider.evaluate(name, ctx)
-        raise RegistryError(f"unknown policy {name!r}")
+        raise RegistryError(f"unknown policy {describe_value(name)}")

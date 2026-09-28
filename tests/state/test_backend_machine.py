@@ -1,33 +1,27 @@
 """The backend contract under arbitrary run interleavings.
 
-`tests/state/test_backend.py` states the contract as 23 examples whose median
-length is **two** backend operations and whose longest is six. Every bug this
-project has actually had in the locking layer needed more than that:
+`tests/state/test_backend.py` states the contract as short examples of two to six
+backend operations. Locking bugs can need longer sequences plus a second writer:
 
-    acquire -> write -> renew -> write        (S3 dropped its cached ETag on
-                                               renewal, so the next write
-                                               compare-and-swapped against a
-                                               re-read ETag and silently adopted
-                                               a concurrent writer's document)
+    acquire -> write -> renew -> write        (a backend that drops its cached
+                                               ETag on renewal compare-and-swaps
+                                               the next write against a re-read
+                                               ETag and silently adopts a
+                                               concurrent writer's document)
 
-Four operations plus a second writer. It was found by reading the code, and the
-first test written for it *passed against the broken implementation*.
+**The model is a run, not a call.** With `acquire`, `bind`, `unbind`, `release`
+and `put` as independent equally-likely rules, a write under a stale binding is
+almost never generated, and the machine passes with fencing switched off.
 
-**The model is a run, not a call.** An earlier version of this machine offered
-`acquire`, `bind`, `unbind`, `release` and `put` as equally-likely independent
-rules, and it passed with fencing switched off entirely — because in twelve steps
-of eight flat rules a write essentially never happened while a stale lease was
-bound. Measured: zero of 576 generated writes occurred under a binding at all.
+So the rules mirror what `with_lock` does. A run starts (acquire and bind),
+writes, may renew, and finishes; a second run takes over once the first has
+lapsed. The dangerous interleaving (start A, let it lapse, B takes over, A
+writes) is then four likely steps.
 
-So the rules mirror what `with_lock` does. A run starts (acquire *and* bind),
-writes, maybe renews, and finishes; a second run takes over once the first has
-lapsed. The dangerous interleaving — start A, let it lapse, B takes over, A
-writes — is then four likely steps rather than a five-rule coincidence.
-
-**What is not modelled.** The machine never re-derives who *should* be allowed to
+**What is not modelled.** The machine never re-derives who should be allowed to
 write: that is `fence_violation`'s job, and a second implementation here would
-turn a model bug into a false accusation against the product. Where a rule needs
-to know who holds a node it asks the backend's own `locks()`.
+turn a model bug into a false failure. Where a rule needs to know who holds a
+node it asks the backend's own `locks()`.
 """
 
 from __future__ import annotations
@@ -47,13 +41,12 @@ from hypothesis.stateful import (
 )
 
 from atlantide.core.errors import StateError
-from atlantide.state.backend import Lease, StateBackend, StateNode
+from atlantide.state import Lease, StateBackend, StateNode
 from tests.state.conftest import BackendFactory
 from tests.support import FakeClock
 
-#: A small fixed universe, so operations actually collide. Generated ids would
-#: rarely touch the same node twice, and everything interesting here is two
-#: operations meeting on one node.
+#: A small fixed universe, so operations collide. Generated ids would rarely touch
+#: the same node twice, and the interesting cases are two operations on one node.
 NODES = ["n0", "n1"]
 OWNERS = ["runner-a", "runner-b"]
 TTL = 100.0
@@ -80,9 +73,9 @@ class BackendMachine(RuleBasedStateMachine):
         self.backend = backend
         self.clock = clock
         self.accepted: dict[str, StateNode] = {}
-        #: The lease this backend is fenced against, exactly as `with_lock` keeps
-        #: it: taken once at the start of a run and held — going stale if the
-        #: world moves on — until a renewal replaces it or the run ends.
+        #: The lease this backend is fenced against, as `with_lock` keeps it: taken
+        #: at the start of a run and held (going stale if another run takes over)
+        #: until a renewal replaces it or the run ends.
         self.bound: Lease | None = None
         self.max_serial = 0
         self.max_fence = 0
@@ -93,8 +86,8 @@ class BackendMachine(RuleBasedStateMachine):
 
         One backend per test rather than one per example: the postgres fixture
         owns a fixed pool of four schemas, so a fresh backend per example would
-        exhaust it. Serial keeps climbing across examples, which is fine — the
-        invariant is that it never *decreases*.
+        exhaust it. Serial keeps climbing across examples; the invariant is only
+        that it never decreases.
         """
         self.backend.bind_lease(None)
         for owner in OWNERS:
@@ -122,35 +115,33 @@ class BackendMachine(RuleBasedStateMachine):
             f"or lowered fence lets a superseded run's writes land."
         )
         self.max_fence = lease.fence
+        self._assert_recorded(lease)
         self.backend.bind_lease(lease)
         self.bound = lease
 
     @rule(owner=st.sampled_from(OWNERS), scope=_scopes)
     def another_run_takes_over(self, owner: str, scope: list[str]) -> None:
-        """A second run acquires — succeeding only once the first has lapsed.
+        """A second run acquires, succeeding only once the first has lapsed.
 
-        Deliberately does *not* rebind: this models the other process, while the
-        backend under test keeps whatever lease it already had. That is the state
-        fencing exists for, and the one the previous version of this machine
-        could never reach.
+        Does not rebind: this models the other process, while the backend under
+        test keeps the lease it already had. That is the state fencing exists for.
         """
         lease = self.backend.acquire_lock(owner, TTL, set(scope)).value_or(None)
         if lease is not None:
             self.max_fence = max(self.max_fence, lease.fence)
+            self._assert_recorded(lease)
 
     @precondition(lambda self: self.bound is not None)
     @rule()
     def the_bound_run_is_superseded(self) -> None:
         """The scenario fencing exists for, as one step: this run's lease lapses
-        and the *other* run takes the very nodes it was holding.
+        and the other run takes the nodes it was holding.
 
-        A compound rule on purpose. Left to chance the machine has to draw
-        `start_run`, then `pass_time` long enough, then `another_run_takes_over`
-        with the matching owner *and* overlapping scope, then a write to a node in
-        it — four ordered draws out of eight rules. Measured over a full run, the
-        foreign-holder state was reached zero times, and the machine passed with
-        fencing disabled entirely. Making the interesting transition reachable is
-        the difference between a state machine and a slow random walk.
+        Compound on purpose. Left to chance, the machine would have to draw
+        `start_run`, then a long enough `pass_time`, then `another_run_takes_over`
+        with the matching owner and an overlapping scope, then a write to a node in
+        it: four ordered draws out of eight rules, which in practice never reaches
+        the foreign-holder state.
         """
         assert self.bound is not None
         self.clock.advance(TTL + 1.0)
@@ -158,6 +149,7 @@ class BackendMachine(RuleBasedStateMachine):
         stolen = self.backend.acquire_lock(other, TTL, self.bound.scope).value_or(None)
         if stolen is not None:
             self.max_fence = max(self.max_fence, stolen.fence)
+            self._assert_recorded(stolen)
 
     @precondition(lambda self: self.bound is not None)
     @rule()
@@ -170,6 +162,7 @@ class BackendMachine(RuleBasedStateMachine):
             return
         assert renewed.fence >= self.bound.fence
         self.max_fence = max(self.max_fence, renewed.fence)
+        self._assert_recorded(renewed)
         self.backend.bind_lease(renewed)
         self.bound = renewed
 
@@ -188,8 +181,8 @@ class BackendMachine(RuleBasedStateMachine):
 
     @rule(nodes=st.lists(st.sampled_from(NODES), min_size=1, unique=True))
     def operator_breaks_the_lock(self, nodes: list[str]) -> None:
-        """`atlantide state unlock` — someone clearing a dead run's hold by hand,
-        possibly while that run is not dead at all."""
+        """`atlantide state unlock`: an operator clearing a dead run's hold by hand,
+        possibly while that run is still alive."""
         self.backend.force_unlock(set(nodes))
 
     # -- writing ----------------------------------------------------------
@@ -218,10 +211,9 @@ class BackendMachine(RuleBasedStateMachine):
             assert self.backend.load().nodes.get(node_id) == self.accepted.get(node_id)
             return
         if present:
-            # Only judged when there was something to delete. Deleting a node
-            # that does not exist changes nothing, and the backends disagree
-            # about whether to refuse it — see
-            # `test_deleting_an_absent_node_is_not_uniformly_fenced`.
+            # Only judged when there was something to delete. Deleting an absent
+            # node changes nothing, and the backends disagree about refusing it;
+            # see `test_deleting_an_absent_node_is_not_uniformly_fenced`.
             self._assert_permitted(node_id, holder)
         self.accepted.pop(node_id, None)
 
@@ -247,7 +239,28 @@ class BackendMachine(RuleBasedStateMachine):
             f"store holds it at {holder.fence}: a stale lease wrote"
         )
 
+    def _assert_recorded(self, lease: Lease) -> None:
+        """The store reports every node of a just-granted lease as held by it, at
+        its fence. `_assert_permitted` judges writes by these reported fences, so a
+        backend reporting a wrong one (e.g. `0` for all) would make that check
+        vacuous rather than failing it."""
+        held = self.backend.locks()
+        for node_id in lease.scope:
+            assert (held[node_id].owner, held[node_id].fence) == (lease.owner, lease.fence), (
+                f"{node_id!r} was granted to {lease.owner!r} at fence {lease.fence}, but "
+                f"the store reports {held[node_id].owner!r} at {held[node_id].fence}"
+            )
+
     # -- invariants -------------------------------------------------------
+
+    @invariant()
+    def every_hold_carries_a_minted_fence(self) -> None:
+        """A recorded hold is never unfenced (`0`) and never ahead of the newest
+        fence handed out."""
+        for node_id, held in self.backend.locks().items():
+            assert 0 < held.fence <= self.max_fence, (
+                f"{node_id!r} is held at fence {held.fence}; minted so far: {self.max_fence}"
+            )
 
     @invariant()
     def serial_never_goes_backwards(self) -> None:
@@ -261,9 +274,9 @@ class BackendMachine(RuleBasedStateMachine):
     def the_store_agrees_with_what_it_accepted(self) -> None:
         """Read-your-writes: every accepted write is visible, and nothing else is.
 
-        A backend that caches — S3 holds a document and an ETag between calls —
-        can drift from the store after an operation it did not expect to
-        invalidate. That is exactly the renewal bug this file exists for.
+        A backend that caches (S3 holds a document and an ETag between calls) can
+        drift from the store after an operation it did not expect to invalidate,
+        such as a lock renewal.
         """
         live = self.backend.load().nodes
         assert set(live) == set(self.accepted), (
@@ -274,16 +287,15 @@ class BackendMachine(RuleBasedStateMachine):
 
 
 def test_an_empty_scope_acquire_is_a_no_op(make_backend: BackendFactory) -> None:
-    """Pins a divergence the state machine surfaced, rather than leaving it folklore.
+    """Pins a divergence the state machine surfaced.
 
     `acquire_lock(owner, ttl, set())` is documented as "a no-op success". The
-    backends do not agree on the fence it carries: memory and sqlite mint the
-    next one, s3 and postgres return `0`, which `Lease` defines as *unfenced*.
+    backends disagree on the fence it carries: memory and sqlite mint the next
+    one, s3 and postgres return `0`, which `Lease` defines as unfenced.
 
-    Harmless as things stand — an empty scope means `fence_violation` refuses
-    every write as out-of-scope whatever the fence says — so this records the
-    behaviour rather than changing it. It stops being harmless the moment an
-    empty-scope lease is allowed to write, and then this test says so.
+    Harmless while an empty scope makes `fence_violation` refuse every write as
+    out-of-scope regardless of fence, so this records the behaviour rather than
+    changing it. It stops being harmless if an empty-scope lease may ever write.
     """
     backend = make_backend()
     backend.acquire_lock("a", TTL, {"n0"}).unwrap()
@@ -295,18 +307,17 @@ def test_an_empty_scope_acquire_is_a_no_op(make_backend: BackendFactory) -> None
 
 
 def test_deleting_an_absent_node_is_not_uniformly_fenced(make_backend: BackendFactory) -> None:
-    """A second divergence the machine surfaced, recorded rather than papered over.
+    """A second divergence the machine surfaced.
 
-    Deleting a node that *exists* under a lease someone else has taken is refused
-    by all four backends — that is the guarantee, and it holds. Deleting one that
-    was never there is refused by memory, sqlite and postgres, and accepted by
-    S3, whose `delete` short-circuits on a node absent from its cached document
-    before it reaches the fence check.
+    Deleting an existing node under a lease someone else has taken is refused by
+    all four backends; that is the guarantee. Deleting one that was never there is
+    refused by memory, sqlite and postgres, and accepted by S3, whose `delete`
+    short-circuits on a node absent from its cached document before the fence
+    check.
 
-    Harmless today: the accepted call writes nothing (`serial` does not move), so
-    no stale-lease write lands. It is a divergence in the error contract, not in
-    data integrity. Recorded here so it is a known difference rather than a
-    surprise to the next person who relies on `delete` raising.
+    The accepted call writes nothing (`serial` does not move), so no stale-lease
+    write lands. The divergence is in the error contract, not in data integrity:
+    `delete` of an absent node does not reliably raise.
     """
     backend = make_backend()
     ours = backend.acquire_lock("a", TTL, {"n1"}).unwrap()
@@ -322,8 +333,8 @@ def test_deleting_an_absent_node_is_not_uniformly_fenced(make_backend: BackendFa
 
 
 def test_the_contract_holds_under_arbitrary_sequences(make_backend: BackendFactory) -> None:
-    """Runs on memory, sqlite, s3 and postgres — the same four the example-based
-    contract covers, because a guarantee that only holds in memory is not one."""
+    """Runs on memory, sqlite, s3 and postgres, the same four backends the
+    example-based contract covers."""
     clock = FakeClock()
     backend = make_backend(clock=clock)
 

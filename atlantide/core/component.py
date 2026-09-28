@@ -1,45 +1,42 @@
 """Components: library-authored reusable groups of resources (L2 constructs).
 
-A :class:`Component` packages several resources behind one parameterized object —
-Pulumi's ``ComponentResource`` / CDK's Construct. Config authors *use* components
-(import and instantiate them) but cannot *define* them in Atlas-lang, which bans
-``class``; components are ordinary Python written by library/provider authors.
+A :class:`Component` packages several resources behind one parameterized object,
+like Pulumi's ``ComponentResource`` or a CDK Construct. Config authors *use*
+components (import and instantiate them) but cannot *define* them in Atlas-lang,
+which bans ``class``; components are ordinary Python written by library/provider
+authors.
 
 A component owns no IR node of its own: its children self-register as normal flat
-resources, so lowering/diff/state need no changes. Child logical names are
-namespaced with the component's name (``{component}-{child}``, accumulating when
-components nest), so instantiating a component twice never collides. The
-namespacing is deterministic given the component ``name``, preserving byte-stable
-IR.
+resources, so lowering, diff and state handle them like any other resource. Child
+logical names are namespaced with the component's name (``{component}-{child}``,
+accumulating when components nest), so instantiating a component twice never
+collides. The namespacing depends only on the component ``name``, keeping the IR
+byte-stable.
 
     class SecureBucket(Component):
         def __init__(self, name, *, bucket):
             self.bucket = child(S3Bucket, "assets", bucket=bucket)  # id: <stack>:...:name-assets
 
-The subclass ``__init__`` needs no ``super().__init__`` call and no boilerplate —
-its body runs inside the naming scope automatically.
+The subclass ``__init__`` needs no ``super().__init__`` call: its body runs inside
+the naming scope automatically.
 """
 
 from __future__ import annotations
 
 import functools
 from collections.abc import Callable
-from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, override
 
-from typing_extensions import override
-
+from atlantide.core._component_prefix import active_prefix as _active_prefix
+from atlantide.core._component_prefix import push as _push
+from atlantide.core._component_prefix import reset as _reset
 from atlantide.core.node_id import require_identifier
 
 if TYPE_CHECKING:
     from atlantide.core.resource import Resource
 
-_R = TypeVar("_R", bound="Resource")
 
-_active_prefix: ContextVar[str | None] = ContextVar("atlantide_component_prefix", default=None)
-
-
-def child(cls: type[_R], name: str, /, **kwargs: Any) -> _R:
+def child[R: Resource](cls: type[R], name: str, /, **kwargs: Any) -> R:
     """Construct a component child, preserving its concrete type.
 
     Prefer this to calling ``cls(name, ...)`` directly inside a component: pydantic
@@ -52,13 +49,7 @@ def child(cls: type[_R], name: str, /, **kwargs: Any) -> _R:
 
 def current_component_prefix() -> str | None:
     """The active child-name prefix, or ``None`` outside any component."""
-    return _active_prefix.get()
-
-
-def _push(name: str) -> Any:
-    """Accumulate ``name`` onto the active prefix; returns a reset token."""
-    current = _active_prefix.get()
-    return _active_prefix.set(f"{current}-{name}" if current else name)
+    return _active_prefix()
 
 
 class Component:
@@ -85,8 +76,7 @@ def _scoped_init(init: Callable[..., None]) -> Callable[..., None]:
     def scoped(self: Component, name: str, /, *args: Any, **kwargs: Any) -> None:
         # Re-entrancy guard: a subclass calling `super().__init__(name, ...)`
         # runs the parent's wrapped init on the same instance, and pushing the
-        # prefix again would double it (`name-name-child`). Only the outermost
-        # init owns the scope.
+        # prefix again would double it (`name-name-child`).
         if getattr(self, "_atlas_in_init", False):
             init(self, name, *args, **kwargs)
             return
@@ -97,7 +87,7 @@ def _scoped_init(init: Callable[..., None]) -> Callable[..., None]:
         try:
             init(self, name, *args, **kwargs)
         finally:
-            _active_prefix.reset(token)
+            _reset(token)
             self._atlas_in_init = False
 
     scoped._atlas_scoped = True  # type: ignore[attr-defined]

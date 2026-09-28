@@ -101,9 +101,9 @@ def test_rollback_delete_carries_created_output(tmp_path: object) -> None:
         h.fake().fail_create.add("b")  # dependent fails after 'a' created
         with pytest.raises(ExceptionGroup):
             h.apply("a = Box('a', size=1)\nBox('b', size=2, ref=a.out)\n", on_failure="rollback")
-        # the compensating delete of 'a' gets 'a's real created output, not an
-        # unresolved Ref -> a provider that locates by id can act on the resource
-        # actually created (rather than re-discovering it by shared attributes).
+        # The compensating delete of 'a' gets its created output, not an unresolved
+        # Ref, so a provider that locates by id acts on the resource actually
+        # created rather than re-discovering it by shared attributes.
         assert h.fake().deleted_output("a") == "a:1"
 
 
@@ -126,9 +126,9 @@ def test_rollback_restores_prior_on_failed_update(tmp_path: object) -> None:
 
 
 def test_rollback_update_pushes_prior_upstream_values(tmp_path: object) -> None:
-    """The compensating update of a dependent must carry the upstream values it
-    was originally applied with, not the ones this run's forward pass produced —
-    the upstream's own rollback restores exactly the prior values."""
+    """A dependent's compensating update carries the upstream values it was
+    originally applied with, not this run's forward-pass values, matching the
+    prior values the upstream's own rollback restores."""
     baseline = (
         "a = Box('a', size=1, label='x')\n"
         "c = Box('c', size=2, ref=a.out, label='x')\n"

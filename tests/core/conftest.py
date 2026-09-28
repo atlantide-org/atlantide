@@ -1,4 +1,4 @@
-"""Shared resources for core tests — the canonical Bucket/Notifier from support."""
+"""Shared resources for core tests: the canonical Bucket/Notifier from tests.support."""
 
 from __future__ import annotations
 

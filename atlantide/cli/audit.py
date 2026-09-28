@@ -1,10 +1,8 @@
-"""Writing a run's event stream to a file, and to the log.
+"""Sinks for a run's event stream: the audit file and the logger.
 
-The record that answers "who changed this, when, and what happened" after the
-fact — asked by someone who was not there, about a run nobody thought to watch.
-
-Append-only JSONL, one event per line, so a partial write costs one line rather
-than the file, and `tail -f` works while a run is in flight.
+The audit file records who changed what, when, and with what result. It is
+append-only JSONL, one event per line, so a partial write loses one line rather
+than the file, and ``tail -f`` works during a run.
 """
 
 from __future__ import annotations
@@ -13,20 +11,51 @@ import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from atlantide.cli.errors import fail
+from atlantide.cli.target import StateTarget
+from atlantide.cli.wiring import version
 from atlantide.core.events import ApplyEvent, EventSink, no_sink
 from atlantide.core.logging import get_logger, redact
+from atlantide.engine import Plan
+
+__all__ = ["AuditHeader", "audit_file", "audit_header", "logging_sink"]
 
 _log = get_logger("run")
 
 
-def logging_sink(event: ApplyEvent) -> None:
-    """Mirror the stream into the ordinary logger.
+class AuditHeader(TypedDict):
+    """The first line of an audit file, in the order it is written."""
 
-    Costs nothing when the level filters it out, and means ``--log-level info``
-    shows the run's shape without a separate flag or file.
+    command: str
+    config: str
+    state: str
+    version: str
+    inputs: dict[str, Any]
+    envs: list[str]
+    planned: int
+
+
+def audit_header(
+    command: str, cfg: Path, state_target: StateTarget, plan_obj: Plan, planned: int
+) -> AuditHeader:
+    """The header identifying this run in its audit record."""
+    return {
+        "command": command,
+        "config": str(cfg),
+        "state": state_target.label,
+        "version": version(),
+        "inputs": plan_obj.compiled.inputs,
+        "envs": list(plan_obj.compiled.envs_selected),
+        "planned": planned,
+    }
+
+
+def logging_sink(event: ApplyEvent) -> None:
+    """Mirror the event stream into the logger at ``info`` level.
+
+    ``--log-level info`` then shows each run event without an audit file.
     """
     _log.info(
         event.phase,
@@ -40,13 +69,11 @@ def logging_sink(event: ApplyEvent) -> None:
 
 
 @contextmanager
-def audit_file(path: Path | None, *, header: dict[str, Any]) -> Iterator[EventSink]:
+def audit_file(path: Path | None, *, header: AuditHeader) -> Iterator[EventSink]:
     """A sink appending to ``path``, opened for the life of one run.
 
-    ``header`` is written first: who ran this, against which state, with which
-    version and config. Without it the events are a list of things that happened
-    to nothing in particular — the identity is the part that makes the file an
-    audit trail rather than a log.
+    ``header`` (see :func:`audit_header`) is written first: who ran this, against
+    which state, with which version and config.
     """
     if path is None:
         yield no_sink
@@ -77,11 +104,6 @@ def audit_file(path: Path | None, *, header: dict[str, Any]) -> Iterator[EventSi
 
 
 def _write(handle: Any, payload: dict[str, Any]) -> None:
-    """One line, flushed.
-
-    Flushed per event on purpose: the run this file most needs to describe is
-    the one that is about to be killed, and a buffered tail is the part that
-    would be missing.
-    """
+    """Write one JSON line and flush it, so a killed run loses no buffered events."""
     handle.write(json.dumps(payload, default=str) + "\n")
     handle.flush()

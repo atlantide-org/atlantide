@@ -45,9 +45,9 @@ class CycleError(AtlantideError):
 class StackOutputCycleError(AtlantideError):
     """An in-config cross-stack output reference forms a cycle.
 
-    Raised before lowering (where an infinite substitution recursion would
-    otherwise precede the graph's Tarjan cycle check); the chain names the output
-    keys involved, e.g. ``common:vpc_id -> dev:x -> common:vpc_id``.
+    Raised before lowering, since substitution would otherwise recurse without
+    bound before the graph's cycle check runs. ``chain`` names the output keys
+    involved, e.g. ``common:vpc_id -> dev:x -> common:vpc_id``.
     """
 
     def __init__(self, chain: list[str]) -> None:
@@ -70,9 +70,8 @@ class ComponentError(AtlantideError):
 class ProviderError(AtlantideError):
     """A provider CRUD operation failed.
 
-    Optional structured context makes a failure traceable to its origin:
-    ``node_id`` (which resource), ``op`` (which CRUD phase), and
-    ``resource_type`` (which kind), each defaulting to ``None``.
+    Optional context: ``node_id`` (resource), ``op`` (CRUD phase), and
+    ``resource_type``.
     """
 
     def __init__(
@@ -93,9 +92,9 @@ class RollbackError(AtlantideError):
     """A compensation could not complete after a failed apply.
 
     A compensation is a provider call followed by a state write, so a partial one
-    leaves state describing a resource that is no longer there; the stored hash
-    still matches config, so the next plan reports NOOP. Raised alongside the
-    original failure, not instead of it.
+    can leave state describing a resource that no longer exists while its stored
+    hash still matches config (the next plan reports NOOP). Raised alongside the
+    original failure.
     """
 
     def __init__(self, node_id: str, reason: str) -> None:
@@ -119,46 +118,40 @@ class LockError(AtlantideError):
 class LeaseLostError(LockError):
     """The state lock stopped being held part-way through a run.
 
-    Distinct from :class:`LockError`, which means a run never started. This one
-    means a run *did* start, wrote to the provider, and then found its lease
-    taken by someone else — so another run may now be acting on the same
-    resources. Nothing is rolled back: a compensation is itself a write, and a
-    run that no longer holds the lock must not make one.
+    Unlike a plain :class:`LockError`, the run started and wrote to the provider
+    before its lease was taken, so another run may be acting on the same
+    resources. Nothing is rolled back: a compensation is a write, and a run
+    without the lock must not write.
 
-    The state store is therefore behind what exists at the provider. Recovery is
-    ``atlantide refresh`` before the next apply.
+    State can therefore lag the provider; run ``atlantide refresh`` before the
+    next apply.
     """
 
 
 class InterruptedRunError(AtlantideError):
     """The operator interrupted a run (Ctrl-C).
 
-    Not a failure of the infrastructure, so it renders and exits differently: the
-    conventional 130 rather than 1, and without the "error:" framing that implies
-    something went wrong. Completed nodes are compensated on the way out where the
-    run still held its lock.
+    Exits with 130 rather than 1 and renders without the "error:" prefix.
+    Completed nodes are compensated on exit if the run still holds its lock.
     """
 
 
 class FencedWriteError(StateError):
     """A state write was refused because the writer no longer holds the lock.
 
-    The store, not the writer, decides this — which is what makes it different
-    from :class:`LeaseLostError`. A run whose local clock still believes its lease
-    is good can be wrong; a conditional write against the recorded holder cannot.
-    It is the last line between two concurrent runs and a silently merged state.
+    Unlike :class:`LeaseLostError`, the store decides this through a conditional
+    write against the recorded holder, so it does not depend on the writer's local
+    clock. Prevents two concurrent runs from merging state.
     """
 
 
 class PlanDriftError(AtlantideError):
     """The changeset about to run is not the one that was approved.
 
-    An apply re-diffs once it holds the state lock — it must, or a resource
-    another run created in the meantime would still be planned as a CREATE and
-    get built twice. So the plan a human read and the plan that executes can
-    differ, and the gap between them is exactly where an unreviewed destroy fits.
-    Raised rather than reconciled: which of the two is wanted is the operator's
-    call, not the engine's.
+    An apply re-diffs once it holds the state lock, so a resource another run
+    created meanwhile is not created twice. The re-diffed plan can differ from the
+    approved one, including by an unreviewed destroy, so the apply stops instead
+    of reconciling.
     """
 
 

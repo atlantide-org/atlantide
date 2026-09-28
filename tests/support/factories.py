@@ -12,9 +12,19 @@ from typing import Any
 from atlantide.core import Provider, ProviderRegistry, Resource
 from atlantide.engine import Engine
 from atlantide.policy import PolicyRegistry
+from atlantide.providers import local
+from atlantide.providers import random as random_provider
+from atlantide.providers.local import LocalProvider
+from atlantide.providers.random import RandomProvider
 from atlantide.secrets import SecretsRegistry
-from atlantide.state import MemoryStateBackend
-from atlantide.state.backend import DEFAULT_LOCK_POLICY, LockPolicy, StateBackend, StateNode
+from atlantide.state import (
+    DEFAULT_LOCK_POLICY,
+    LockPolicy,
+    MemoryStateBackend,
+    StateBackend,
+    StateNode,
+)
+from tests.support.cloud import TEST_REGION
 from tests.support.providers import FakeProvider
 
 
@@ -87,3 +97,29 @@ def make_engine(
         parallelism=parallelism,
         lock_policy=lock_policy,
     )
+
+
+def local_engine(**kw: Any) -> Engine:
+    """An :class:`Engine` over the local provider (``local.TYPES``, :class:`LocalProvider`).
+
+    ``kw`` is passed to :func:`make_engine` (``backend=``, ``policies=``, ...).
+    """
+    return make_engine(local.TYPES, LocalProvider(), **kw)
+
+
+def random_engine(**kw: Any) -> Engine:
+    """An :class:`Engine` over the random provider; ``kw`` as for :func:`local_engine`."""
+    return make_engine(random_provider.TYPES, RandomProvider(), **kw)
+
+
+def aws_engine(backend: StateBackend | None = None) -> Engine:
+    """An :class:`Engine` over ``AwsProvider(region=TEST_REGION)``, in-memory state by default.
+
+    Needs the moto mock the suite sets up (:func:`tests.support.aws_fixture`) before
+    it applies anything; building the engine itself makes no AWS call. The AWS
+    provider is imported here, not at module level, so suites that never touch
+    AWS do not pay for importing it.
+    """
+    from atlantide.providers.aws import TYPES, AwsProvider
+
+    return make_engine(TYPES, AwsProvider(region=TEST_REGION), backend=backend)

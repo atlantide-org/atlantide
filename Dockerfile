@@ -17,9 +17,9 @@ FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 # ---------------------------------------------------------------------------
 # Builder — resolve and install dependencies into a self-contained virtualenv.
 #
-# Shares a base image with the runtime stage deliberately. A virtualenv records
-# the absolute path of the interpreter that created it, so one built on a
-# different image is subtly broken once copied across.
+# Shares a base image with the runtime stage: a virtualenv records the absolute
+# path of the interpreter that created it, so one built on a different image
+# breaks once copied across.
 # ---------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-alpine AS builder
 
@@ -34,14 +34,12 @@ WORKDIR /app
 ARG EXTRAS=""
 
 # Dependencies first, from the lockfile alone. This layer is keyed on
-# pyproject.toml and uv.lock only, so editing the source neither re-resolves nor
-# re-downloads anything — which is most of the build time.
+# pyproject.toml and uv.lock only, so a source edit neither re-resolves nor
+# re-downloads anything, which is most of the build time.
 #
-# Runtime dependencies only. What keeps pytest, hypothesis, moto, mypy and ruff
-# out is that they live in the `dev` extra and no `--extra dev` is passed: uv
-# installs the default dependencies and nothing else. `--no-dev` is belt and
-# braces for the day those move to a [dependency-groups] table, where it would
-# be the flag that excludes them.
+# Runtime dependencies only. pytest, hypothesis, moto, mypy and ruff live in the
+# `dev` extra, which is excluded because no `--extra dev` is passed. `--no-dev`
+# excludes them if they move to a [dependency-groups] table.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     --mount=type=bind,source=uv.lock,target=uv.lock \

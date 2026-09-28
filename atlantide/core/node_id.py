@@ -1,4 +1,4 @@
-"""The node-id format ``{stack}:{type}:{name}`` — one place to build and parse it.
+"""Building and parsing node ids, formatted ``{stack}:{type}:{name}``.
 
 Every resource is identified by this triple; state rows, IR nodes, locks, and
 CLI output all key on it.
@@ -10,13 +10,14 @@ import re
 
 from atlantide.core.errors import AtlantideError, RegistryError
 
-#: Resource and stack names: a letter, then letters/digits/``_``/``-``.
+#: Resource and stack names: an ASCII letter, then ASCII letters/digits/``_``/``-``.
+#: Use ``fullmatch``: ``$`` also matches before a trailing newline.
 IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
 
 def require_identifier(name: str, kind: str) -> None:
     """Validate a resource/stack name, raising :class:`RegistryError` if invalid."""
-    if not IDENTIFIER_RE.match(name):
+    if not IDENTIFIER_RE.fullmatch(name):
         raise RegistryError(f"invalid {kind} name {name!r}: must match {IDENTIFIER_RE.pattern}")
 
 
@@ -25,11 +26,11 @@ def require_sequence(
 ) -> None:
     """Reject a bare string where a sequence of strings is expected.
 
-    ``tuple("abc")`` is ``('a', 'b', 'c')`` — indistinguishable downstream from
-    three deliberate entries, so the mistake must be caught at the boundary.
-    ``what`` is the full "X must be a sequence…" clause and ``hint`` the remedy;
-    they are joined as ``"{what} — {hint}"`` so each call site keeps its exact
-    message text. ``exc`` picks the site's error family (registry vs IR).
+    ``tuple("abc")`` is ``('a', 'b', 'c')``, indistinguishable downstream from
+    three separate entries, so the mistake is caught at the boundary. ``what`` is
+    the full "X must be a sequence…" clause and ``hint`` the remedy, joined as
+    ``"{what} — {hint}"``. ``exc`` picks the call site's error family (registry
+    vs IR).
     """
     if isinstance(value, str):
         raise exc(f"{what} — {hint}")

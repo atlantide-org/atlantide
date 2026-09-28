@@ -12,17 +12,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from typing import TypeVar
 
 from atlantide.core.tuning import DEFAULT_PARALLELISM
 from atlantide.graph.model import DiGraph
 
-T = TypeVar("T")
-
 __all__ = ["DEFAULT_PARALLELISM", "run_graph"]
 
 
-async def run_graph(
+async def run_graph[T](
     graph: DiGraph,
     work: Callable[[str], Awaitable[T]],
     *,

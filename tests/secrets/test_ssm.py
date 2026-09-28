@@ -75,7 +75,7 @@ def test_ssm_is_the_default_but_others_stay_reachable(
 ) -> None:
     monkeypatch.setenv("FROM_ENV", "env-value")
     registry = make_secrets_registry(
-        SecretsConfig(provider="ssm", prefix=PREFIX, region=REGION),
+        SecretsConfig(provider="ssm", prefix=PREFIX, region=REGION, env_allow=("FROM_ENV",)),
         store_path=tmp_path / "atlantide.secrets",
         key_path=tmp_path / "atlantide.key",
     )
@@ -139,6 +139,17 @@ def test_check_reports_an_unexpected_client_error(
     store = _store()
     monkeypatch.setattr(store._client, "get_parameter", _raise(throttled))
     assert store.check().status == "fail"
+
+
+def test_an_error_without_a_code_is_neither_missing_nor_denied(
+    ssm: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    odd = ClientError({"Error": {"Message": "no code"}}, "GetParameter")
+    store = _store()
+    monkeypatch.setattr(store._client, "get_parameter", _raise(odd))
+    with pytest.raises(SecretsError, match="cannot read SSM parameter"):
+        store.resolve("db_password")
+    assert store.check().detail.startswith("cannot read SSM:")
 
 
 def test_check_reports_missing_credentials(ssm: Any, monkeypatch: pytest.MonkeyPatch) -> None:

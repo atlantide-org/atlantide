@@ -2,8 +2,8 @@
 
 The property under test is not "renewal happens" but its two consequences: a run
 longer than the TTL still finishes, and a run whose hold is taken writes nothing
-more. The second is the one that matters — a lost lease means a second writer
-already exists, so every further write is a write into someone else's state.
+more. The second is critical: a lost lease means a second writer already
+exists, so every further write lands in someone else's state.
 """
 
 from __future__ import annotations
@@ -16,8 +16,7 @@ from returns.result import Failure, Success
 
 from atlantide.core.errors import LeaseLostError, LockError
 from atlantide.engine.locking import with_lock
-from atlantide.state import MemoryStateBackend
-from atlantide.state.backend import DEFAULT_LOCK_POLICY, Lease, LeaseGuard, LockPolicy
+from atlantide.state import DEFAULT_LOCK_POLICY, Lease, LeaseGuard, LockPolicy, MemoryStateBackend
 from tests.support import (
     Box,
     FakeClock,
@@ -40,8 +39,8 @@ async def _sleep_through(renewals: int, policy: LockPolicy = FAST) -> None:
 
 
 async def test_a_run_longer_than_the_ttl_keeps_its_lease() -> None:
-    """The whole point: the TTL bounds a dead run's blast radius, not a live
-    run's deadline. Without renewal this run's lease lapses mid-flight."""
+    """The TTL bounds a dead run's blast radius, not a live run's deadline.
+    Without renewal this run's lease lapses mid-flight."""
     backend = SpyBackend()
 
     async def slow() -> str:
@@ -85,12 +84,12 @@ async def test_losing_the_lease_stops_the_run_and_reports_it() -> None:
 
 
 async def test_no_state_is_written_after_the_lease_is_lost() -> None:
-    """The assertion the whole design exists for.
+    """Writes stop once the lease is lost.
 
-    A run that keeps writing after losing its lock is writing into state another
-    run now owns — the silent-divergence case. `writes_after` is deliberately
-    about ordering rather than totals: writes made *before* the loss are correct
-    and expected.
+    A run that keeps writing after losing its lock writes into state another run
+    now owns: the silent-divergence case. `writes_after` is deliberately about
+    ordering rather than totals: writes made *before* the loss are correct and
+    expected.
     """
     backend = SpyBackend(fail_lock_after=1)
 
@@ -157,12 +156,12 @@ def test_guard_with_no_lease_permits_everything() -> None:
 
 def test_guard_refuses_a_write_inside_the_grace_window() -> None:
     """Local clock check, so it can catch an expiry the renewal task has not yet
-    noticed — the window between renewal failing and cancellation arriving."""
+    noticed: the window between renewal failing and cancellation arriving."""
     clock = FakeClock()
     guard = LeaseGuard(grace=30.0, clock=clock)
     guard.renewed(Lease(owner="me", expires_at=clock() + 100.0))
 
-    guard.check()  # 100s left, comfortably outside the grace window
+    guard.check()  # 100s left, outside the grace window
     clock.advance(75.0)  # 25s left, inside it
     with pytest.raises(LeaseLostError, match="refresh"):
         guard.check()
@@ -178,7 +177,7 @@ def test_a_guard_that_has_failed_stays_failed() -> None:
 
     with pytest.raises(LeaseLostError):
         guard.check()
-    clock.t = 0.0  # even if time somehow ran backwards
+    clock.t = 0.0  # even if the clock goes backwards
     with pytest.raises(LeaseLostError):
         guard.check()
 
@@ -247,9 +246,9 @@ async def test_writes_keep_working_across_a_renewal() -> None:
 
     A backend that mints a fresh epoch per acquisition hands the renewal a
     *newer* fence than the one the run is bound to. Without rebinding, every
-    write after the first renewal is refused as "superseded" — by a lease that is
-    in fact this same run's. Nothing in the lock protocol catches that; only
-    writing after a renewal does.
+    write after the first renewal is refused as "superseded" by this same run's
+    lease. Nothing in the lock protocol catches that; only writing after a
+    renewal does.
     """
     backend = MemoryStateBackend()
     written: list[int] = []

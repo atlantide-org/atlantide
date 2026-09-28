@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from atlantide.cli.json_out import report_json
-from atlantide.cli.render import SECRET_REDACTED, field_diffs, fmt_value
+from atlantide.cli.views.common import SECRET_REDACTED, fmt_value
+from atlantide.cli.views.plan import field_diffs
+from atlantide.cli.views.report import report_json
 from atlantide.core import SecretRef
 from atlantide.ir.model import IRNode
 from atlantide.providers import random as random_provider
 from atlantide.providers.random import RandomProvider
 from atlantide.reconcile import Action, ApplyReport, Change
-from atlantide.state.backend import StateNode
+from atlantide.state import StateNode
 from tests.conftest import make_engine
 
 _MARKER = SecretRef("app/signing-key").canonical()
@@ -47,7 +48,7 @@ def test_field_diffs_redact_rotated_secret() -> None:
     )
     lines = field_diffs(change)
     assert lines == [f"token: {SECRET_REDACTED} → {SECRET_REDACTED}"]
-    assert "app/signing-key" not in lines[0]  # not even the handle name leaks here
+    assert "app/signing-key" not in lines[0]  # the handle name does not leak either
 
 
 def test_report_json_redacts_secret_output() -> None:

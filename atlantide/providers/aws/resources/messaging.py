@@ -22,7 +22,7 @@ class SnsTopic(RegionalResource, TaggedResource):
 class SnsSubscription(RegionalResource):
     """An SNS subscription wiring a topic to an endpoint (e.g. an SQS queue).
 
-    All fields are immutable — any change replaces the subscription. Pass
+    All fields are immutable: any change replaces the subscription. Pass
     ``topic.arn`` and ``queue.arn`` so the subscription depends on both.
     ``subscription_arn`` is computed.
     """

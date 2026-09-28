@@ -1,19 +1,20 @@
 """Route53 handlers: hosted zones and record sets.
 
-A zone is id-located (``zone_id``, restored from state). A record has no id — its
-identity is ``(zone_id, record_name, record_type)`` — so create/update both UPSERT
-the desired set, and delete removes the exact live set. Route53 returns names with
-a trailing dot, so every name comparison is normalised with ``rstrip(".")``.
+A zone is located by ``zone_id``, restored from state. A record has no id: its
+identity is ``(zone_id, record_name, record_type)``, so create and update both
+UPSERT the desired set and delete removes the exact live set. Route53 returns names
+lowercased, with a trailing dot and with special characters as ``\\ooo`` octal escapes
+(``*`` as ``\\052``), so record names are compared through :func:`_normalise_name`.
 """
 
 from __future__ import annotations
 
-from typing import Any
-
-from typing_extensions import override
+import re
+from typing import Any, override
 
 from atlantide.providers.aws.handlers.base import (
     AwsHandler,
+    Client,
     create_or_adopt,
     ignore_missing,
     known_id,
@@ -28,11 +29,12 @@ class Route53HostedZoneHandler(AwsHandler[Route53HostedZone]):
     identity_field = "zone_id"
 
     @override
-    def create(self, client: Any, res: Route53HostedZone) -> dict[str, Any]:
+    def create(self, client: Client, res: Route53HostedZone) -> dict[str, Any]:
         def make() -> dict[str, Any]:
             # Route53 raises HostedZoneAlreadyExists for a repeated
             # CallerReference rather than returning the existing zone, so a retry
-            # adopts the zone `read` finds by domain.
+            # adopts the zone created under that reference. Several zones may
+            # share a domain, so the first one by name is not necessarily ours.
             resp = client.create_hosted_zone(
                 Name=res.domain,
                 CallerReference=res.node_id,
@@ -40,10 +42,10 @@ class Route53HostedZoneHandler(AwsHandler[Route53HostedZone]):
             )
             return _zone_outputs(resp["HostedZone"]["Id"], resp["DelegationSet"]["NameServers"])
 
-        return create_or_adopt(make, lambda: self.read(client, res))
+        return create_or_adopt(make, lambda: self._find_by_reference(client, res))
 
     @override
-    def read(self, client: Any, res: Route53HostedZone) -> dict[str, Any] | None:
+    def read(self, client: Client, res: Route53HostedZone) -> dict[str, Any] | None:
         zid = known_id(res, self.identity_field) or self._find(client, res.domain)
         if zid is None:
             return None
@@ -53,16 +55,18 @@ class Route53HostedZoneHandler(AwsHandler[Route53HostedZone]):
         return _zone_outputs(zid, got["DelegationSet"]["NameServers"])
 
     @override
-    def update(self, client: Any, prior: dict[str, Any], res: Route53HostedZone) -> dict[str, Any]:
+    def update(
+        self, client: Client, prior: dict[str, Any], res: Route53HostedZone
+    ) -> dict[str, Any]:
         zid = prior.get(self.identity_field) or known_id(res, self.identity_field)
-        if zid is None:  # update only runs on an existing (already-created) zone
+        if zid is None:
             raise not_found(res, "update")
         client.update_hosted_zone_comment(Id=zid, Comment=res.comment)
         got = client.get_hosted_zone(Id=zid)
         return _zone_outputs(zid, got["DelegationSet"]["NameServers"])
 
     @override
-    def delete(self, client: Any, res: Route53HostedZone) -> None:
+    def delete(self, client: Client, res: Route53HostedZone) -> None:
         zid = known_id(res, self.identity_field)
         if zid is None:
             return
@@ -70,7 +74,24 @@ class Route53HostedZoneHandler(AwsHandler[Route53HostedZone]):
             client.delete_hosted_zone(Id=zid)
 
     @staticmethod
-    def _find(client: Any, domain: str) -> str | None:
+    def _find_by_reference(client: Client, res: Route53HostedZone) -> dict[str, Any] | None:
+        """The zone for ``res.domain`` created under ``CallerReference == node_id``.
+
+        Runs only on a create conflict, like ``CloudFrontDistributionHandler``'s
+        lookup of the same name.
+        """
+        resp = client.list_hosted_zones_by_name(DNSName=res.domain)
+        target = res.domain.rstrip(".")
+        for zone in resp.get("HostedZones", []):
+            if zone["Name"].rstrip(".") != target:
+                continue
+            got = client.get_hosted_zone(Id=zone["Id"])
+            if got["HostedZone"].get("CallerReference") == res.node_id:
+                return _zone_outputs(zone["Id"], got["DelegationSet"]["NameServers"])
+        return None
+
+    @staticmethod
+    def _find(client: Client, domain: str) -> str | None:
         resp = client.list_hosted_zones_by_name(DNSName=domain)
         target = domain.rstrip(".")
         for zone in resp.get("HostedZones", []):
@@ -84,20 +105,18 @@ class Route53RecordHandler(AwsHandler[Route53Record]):
     resource_type = Route53Record
 
     @override
-    def create(self, client: Any, res: Route53Record) -> dict[str, Any]:
+    def create(self, client: Client, res: Route53Record) -> dict[str, Any]:
         client.change_resource_record_sets(
             HostedZoneId=res.zone_id, ChangeBatch=_batch("UPSERT", _record_set(res))
         )
         return {}
 
     @override
-    def read(self, client: Any, res: Route53Record) -> dict[str, Any] | None:
+    def read(self, client: Client, res: Route53Record) -> dict[str, Any] | None:
         live = self._live_set(client, res)
         if live is None:
             return None
-        # The handler already fetched the record set to answer "does it exist";
-        # reporting what is in it costs nothing and is the difference between
-        # noticing a repointed record and not.
+        # Report the record contents so refresh detects a repointed record.
         observed: dict[str, Any] = {
             "records": [r["Value"] for r in live.get("ResourceRecords", [])],
         }
@@ -112,20 +131,20 @@ class Route53RecordHandler(AwsHandler[Route53Record]):
         return observed
 
     @override
-    def update(self, client: Any, prior: dict[str, Any], res: Route53Record) -> dict[str, Any]:
+    def update(self, client: Client, prior: dict[str, Any], res: Route53Record) -> dict[str, Any]:
         return self.create(client, res)  # UPSERT overwrites the set in place
 
     @override
-    def delete(self, client: Any, res: Route53Record) -> None:
+    def delete(self, client: Client, res: Route53Record) -> None:
         with ignore_missing():
             live = self._live_set(client, res)
-            if live is not None:  # DELETE needs the exact live TTL + values
+            if live is not None:  # DELETE needs the exact live TTL and values
                 client.change_resource_record_sets(
                     HostedZoneId=res.zone_id, ChangeBatch=_batch("DELETE", live)
                 )
 
     @staticmethod
-    def _live_set(client: Any, res: Route53Record) -> dict[str, Any] | None:
+    def _live_set(client: Client, res: Route53Record) -> dict[str, Any] | None:
         resp = absent_ok(
             lambda: client.list_resource_record_sets(
                 HostedZoneId=res.zone_id,
@@ -136,19 +155,30 @@ class Route53RecordHandler(AwsHandler[Route53Record]):
         )
         if resp is None:
             return None
-        target = res.record_name.rstrip(".")
+        target = _normalise_name(res.record_name)
         rrsets: list[dict[str, Any]] = resp.get("ResourceRecordSets", [])
         for rrset in rrsets:
-            if rrset["Name"].rstrip(".") == target and rrset["Type"] == res.record_type:
+            if _normalise_name(rrset["Name"]) == target and rrset["Type"] == res.record_type:
                 return rrset
         return None
+
+
+#: A Route53 octal escape, e.g. ``\052`` for ``*``.
+_OCTAL_ESCAPE = re.compile(r"\\([0-7]{3})")
+
+
+def _normalise_name(name: str) -> str:
+    """A record name in the form Route53 compares it: escapes decoded, lowercase,
+    no trailing dot. ``*.Example.com`` and ``\\052.example.com.`` are the same."""
+    decoded = _OCTAL_ESCAPE.sub(lambda m: chr(int(m.group(1), 8)), name)
+    return decoded.lower().rstrip(".")
 
 
 def _record_set(res: Route53Record) -> dict[str, Any]:
     """The ``ResourceRecordSet`` for this record.
 
-    An alias carries no ``TTL`` or ``ResourceRecords`` — Route 53 rejects a set
-    with both, since an alias inherits the target's TTL.
+    An alias set omits ``TTL`` and ``ResourceRecords``: Route 53 rejects an alias
+    set that carries them, since an alias inherits the target's TTL.
     """
     if res.alias is not None:
         return {

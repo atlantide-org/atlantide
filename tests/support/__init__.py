@@ -9,7 +9,8 @@ Import helpers from here instead of re-authoring per suite::
 :class:`FakeProvider`), derive TYPES with :func:`types_of`, and — for a cloud
 provider needing credentials/mocks — wire setup with
 :func:`cloud_env_fixture` (supply the provider's env vars and a ``mock_factory``).
-Drive scenarios through :class:`Harness` or :func:`engine_for`.
+Drive scenarios through :class:`Harness` or :func:`engine_for`; the stock
+providers have :func:`local_engine`, :func:`random_engine` and :func:`aws_engine`.
 """
 
 from __future__ import annotations
@@ -25,12 +26,16 @@ from tests.support.cloud import (
     fake_aws_credentials,
 )
 from tests.support.factories import (
+    aws_engine,
     engine_for,
     globals_of,
+    local_engine,
+    random_engine,
     state_node,
     types_of,
 )
 from tests.support.harness import Harness, box_harness
+from tests.support.helpers import actions_of, debug_records, leaves, write_config
 from tests.support.providers import FakeProvider, OutputSpec, default_outputs
 from tests.support.resources import (
     Box,
@@ -65,14 +70,21 @@ __all__ = [
     "Thing",
     "Vault",
     "Widget",
+    "actions_of",
+    "aws_engine",
     "aws_fixture",
     "box_harness",
     "cloud_env_fixture",
     "create_state_store",
+    "debug_records",
     "default_outputs",
     "engine_for",
     "fake_aws_credentials",
     "globals_of",
+    "leaves",
+    "local_engine",
+    "random_engine",
     "state_node",
     "types_of",
+    "write_config",
 ]

@@ -1,14 +1,14 @@
-"""Deployable ``.atlas`` artifacts: IR + provider pins + policy set, content-hashed.
+"""Deployable ``.atlas`` artifacts: IR, provider pins and policy set, content-hashed.
 
 ``atlantide build`` bundles the canonical IR, the provider version each node was
-compiled against, the policy set (names + levels + type filters — **not** code),
-and declared outputs into a portable JSON artifact carrying ``hash(IR)``.
-``atlantide deploy`` verifies the hash and the pins, then plans/applies straight
-from the IR — no user source, no re-execution of config.
+compiled against, the policy set (names, levels and type filters, not code), and
+declared outputs into a portable JSON artifact carrying ``hash(IR)``.
+``atlantide deploy`` verifies the hash and the pins, then plans and applies from
+the IR without user source or re-executing the config.
 
-The artifact is a promotion unit: build once, deploy the same bytes across
-environments. The stored ``ir_hash`` is the integrity anchor — a tampered or
-corrupted IR no longer hashes to it. Pins/policies live outside that hash.
+An artifact is built once and deployed unchanged across environments. The stored
+``ir_hash`` is the integrity anchor: a tampered or corrupted IR does not hash to
+it. Pins and policies are outside that hash.
 """
 
 from __future__ import annotations
@@ -38,14 +38,17 @@ class Artifact:
     provider_pins: dict[str, str]
     policies: tuple[PolicyBinding, ...] = ()
     outputs: dict[str, Any] = field(default_factory=dict)
-    #: alias -> resolved git commit of each published component the config used,
-    #: recording which component code produced this IR. Integrity of the vendored
-    #: code itself is checked by ``atlantide component verify``.
+    #: alias -> resolved git commit of each published component the config used.
+    #: ``atlantide component verify`` checks the vendored code itself.
     component_pins: dict[str, str] = field(default_factory=dict)
-    #: The environments ``--env`` selected when this artifact was built, empty
-    #: when the config declares none or nothing was narrowed. Build provenance,
-    #: so outside the hash for the same reason the pins are.
+    #: Environments ``--env`` selected at build time; empty when the config
+    #: declares none. Build provenance, outside the hash like the pins.
     envs: tuple[str, ...] = ()
+    #: Every environment the config declared. With ``envs`` it tells a deploy
+    #: which environments the build left out, whose state is then kept out of
+    #: its diff. Empty in artifacts written before it was recorded, which then
+    #: narrow nothing.
+    envs_declared: tuple[str, ...] = ()
     format_version: int = ARTIFACT_FORMAT
 
     def dumps(self) -> str:
@@ -59,11 +62,13 @@ def build_artifact(
     outputs: dict[str, Any],
     component_pins: dict[str, str] | None = None,
     envs: Sequence[str] = (),
+    envs_declared: Sequence[str] = (),
 ) -> Artifact:
     """Bundle a compiled IR into an :class:`Artifact`.
 
     Provider pins are derived from the IR; ``component_pins`` come from the
-    project's lock; ``envs`` records which environments the build selected.
+    project's lock; ``envs`` records which environments the build selected, out
+    of the ``envs_declared`` the config declared.
     """
     return Artifact(
         ir=ir,
@@ -73,6 +78,7 @@ def build_artifact(
         outputs={key: refs_to_markers(value) for key, value in outputs.items()},
         component_pins=dict(component_pins) if component_pins else {},
         envs=tuple(envs),
+        envs_declared=tuple(envs_declared),
     )
 
 
@@ -109,12 +115,11 @@ def loads(text: str) -> Result[Artifact, ArtifactError]:
             ir=IRGraph.from_stored(data["ir"]),
             ir_hash=data["ir_hash"],
             provider_pins=dict(data["provider_pins"]),
-            policies=tuple(_binding_from_json(p) for p in data.get("policies", [])),
-            outputs=dict(data.get("outputs", {})),
-            component_pins=dict(data.get("component_pins", {})),
-            # Defaulted, so an artifact built before this key existed still
-            # reads and `ARTIFACT_FORMAT` need not move.
-            envs=tuple(data.get("envs", ())),
+            policies=tuple(_binding_from_json(p) for p in data["policies"]),
+            outputs=dict(data["outputs"]),
+            component_pins=dict(data["component_pins"]),
+            envs=tuple(data["envs"]),
+            envs_declared=tuple(data.get("envs_declared", ())),
         )
     except (KeyError, TypeError, ValueError) as exc:
         return Failure(ArtifactError(f"malformed artifact: {exc}"))
@@ -143,12 +148,13 @@ def _to_json(artifact: Artifact) -> dict[str, Any]:
     return {
         "format_version": artifact.format_version,
         "ir_hash": artifact.ir_hash,
-        "ir": artifact.ir.to_stored(),  # the canonical form omits `aliases`
+        "ir": artifact.ir.to_stored(),  # to_canonical() omits aliases and depends_on
         "provider_pins": artifact.provider_pins,
         "component_pins": artifact.component_pins,
         "policies": [_binding_json(b) for b in artifact.policies],
         "outputs": artifact.outputs,
         "envs": list(artifact.envs),
+        "envs_declared": list(artifact.envs_declared),
     }
 
 
@@ -162,10 +168,10 @@ def _binding_json(binding: PolicyBinding) -> dict[str, Any]:
 
 
 def _binding_from_json(data: dict[str, Any]) -> PolicyBinding:
-    types = data.get("types")
+    types = data["types"]
     return PolicyBinding(
         name=data["name"],
         level=PolicyLevel(data["level"]),
         types=frozenset(types) if types is not None else None,
-        params=dict(data.get("params", {})),
+        params=dict(data["params"]),
     )

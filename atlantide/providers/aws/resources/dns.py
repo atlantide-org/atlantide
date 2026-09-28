@@ -1,9 +1,7 @@
 """Route53 resources: a hosted zone and a record set.
 
 Both are global (no ``region`` field). A zone is located by its provider-assigned
-``zone_id``; a record has no id at all — its identity is ``(zone_id, record_name,
-record_type)``, so every field that identifies it is immutable and any change to
-one is a replace.
+``zone_id``; a record has no id and is identified by its zone, name and type.
 """
 
 from __future__ import annotations
@@ -39,9 +37,8 @@ class Route53HostedZone(AwsResource):
 class AliasTarget(Nested):
     """Where an alias record points: another AWS resource, not an address.
 
-    An alias is how a zone apex reaches CloudFront or an ALB at all — those have
-    no fixed IP, and DNS forbids a CNAME at the apex, so a plain record cannot
-    express it.
+    A zone apex needs an alias to reach CloudFront or an ALB: those have no fixed
+    IP, and DNS forbids a CNAME at the apex.
     """
 
     #: The target's DNS name, e.g. a distribution's ``domain_name``.
@@ -52,26 +49,29 @@ class AliasTarget(Nested):
     evaluate_target_health: bool = False
 
 
-#: CloudFront's hosted zone, the same in every account and region. Named because
-#: a magic string in a config is a thing nobody can check.
+#: CloudFront's hosted zone, the same in every account and region.
 CLOUDFRONT_ZONE_ID = "Z2FDTNDATAQYW2"
+
+#: ``Route53Record.ttl`` when unset; the only value an alias record accepts.
+_DEFAULT_TTL = 300
 
 
 class Route53Record(AwsResource):
     """A record set in a hosted zone.
 
-    Identity is ``(zone_id, record_name, record_type)`` — all immutable, so
-    changing any of them replaces the record. ``ttl``, ``records`` and ``alias``
+    Identity is ``(zone_id, record_name, record_type)``, all immutable: changing
+    any of them replaces the record. ``ttl``, ``records`` and ``alias``
     update in place.
 
-    Either ``records`` (with a ``ttl``) or ``alias``, never both: an alias has no
-    TTL of its own, since it inherits the target's.
+    Exactly one of ``records`` (with a ``ttl``) or ``alias``: an alias has no TTL
+    of its own (it inherits the target's), so a non-default ``ttl`` with an alias
+    is rejected rather than silently ignored.
     """
 
     zone_id: str = immutable()  # a Ref to Route53HostedZone.zone_id, or a literal id
     record_name: str = immutable()
     record_type: str = immutable(default="A")
-    ttl: int = mutable(default=300)
+    ttl: int = mutable(default=_DEFAULT_TTL)
     records: list[str] = mutable(default_factory=list)
     alias: AliasTarget | None = mutable(default=None)
 
@@ -82,5 +82,12 @@ class Route53Record(AwsResource):
             raise ValueError(
                 "Route53Record takes either records or alias, not both — an alias "
                 "record has no rdata of its own"
+            )
+        if self.alias is None and not self.records:
+            raise ValueError("Route53Record needs either records or alias")
+        if self.alias is not None and self.ttl != _DEFAULT_TTL:
+            raise ValueError(
+                "Route53Record with an alias takes no ttl — an alias record inherits "
+                "its target's TTL"
             )
         return self

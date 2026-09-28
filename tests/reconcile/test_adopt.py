@@ -1,10 +1,9 @@
 """Adopting an existing resource: the row written has to be the row apply writes.
 
-The headline is :func:`test_an_imported_node_plans_as_a_noop`. Everything else in
-this file exists because there are several ways to write a row that *looks* right
-and is not — a resolved ``$ref`` where a marker belonged, a reported input filed
-as an output, a hash recomputed rather than reused — and each of them is silent
-until a later plan does something surprising.
+The core property is :func:`test_an_imported_node_plans_as_a_noop`. The other
+tests cover rows that *look* right but are not (a resolved ``$ref`` where a marker
+belonged, a reported input filed as an output, a hash recomputed rather than
+reused), each of which stays silent until a later plan misbehaves.
 """
 
 from __future__ import annotations
@@ -16,7 +15,10 @@ import pytest
 from atlantide.core.errors import LeaseLostError
 from atlantide.reconcile import Action, ImportRequest
 from atlantide.reconcile.adopt import ImportStatus
-from atlantide.state.backend import NO_INPUT_HASH, STATUS_CREATED
+from atlantide.state import (
+    NO_INPUT_HASH,
+    NodeStatus,
+)
 from tests.support import Bucket, FakeProvider, Harness, Notifier
 from tests.support.resources import Box
 
@@ -40,9 +42,8 @@ def _harness(live: dict[str, dict[str, Any] | None], **kw: Any) -> Harness:
 def test_an_imported_node_plans_as_a_noop() -> None:
     """Import, then plan: nothing to do.
 
-    This is the whole feature in one assertion. A row whose ``input_hash`` is not
-    the compile's Merkle hash still *works* — it just plans as an UPDATE forever,
-    which is the failure this guards.
+    A row whose ``input_hash`` is not the compile's Merkle hash still works, but
+    plans as an UPDATE on every run.
     """
     harness = _harness({"b": {"out": "b:1"}})
     [outcome] = harness.adopt(BOX, BOX_ID)
@@ -65,7 +66,7 @@ def test_the_row_matches_what_an_apply_would_have_written() -> None:
     assert row.properties == expected.properties
     assert row.dependencies == expected.dependencies
     assert row.type == expected.type
-    assert row.status == STATUS_CREATED == expected.status
+    assert row.status == NodeStatus.CREATED == expected.status
 
 
 # -- how the row is built -----------------------------------------------------
@@ -73,8 +74,8 @@ def test_the_row_matches_what_an_apply_would_have_written() -> None:
 
 def test_a_ref_stays_symbolic_in_the_adopted_row() -> None:
     """Recording the value a ``$ref`` resolved to would erase the dependency from
-    state, and the next config change would diff a marker against a literal — a
-    REPLACE on a field nobody touched."""
+    state, and the next config change would diff a marker against a literal,
+    producing a REPLACE on an unchanged field."""
     harness = _harness({"b": {"arn": "arn:b"}, "n": {}})
     outcomes = harness.adopt(LINKED, BUCKET_ID, NOTIFIER_ID)
     assert [o.status for o in outcomes] == [ImportStatus.IMPORTED, ImportStatus.IMPORTED]
@@ -100,11 +101,11 @@ def test_a_reported_input_is_not_filed_as_an_output() -> None:
 
 
 def test_a_sensitive_value_is_never_echoed_in_a_drift_report() -> None:
-    """Import prints what differs, and a differing secret is still a secret.
+    """Import prints what differs, but never a secret's value.
 
     ``token`` is a sensitive *input*, so a live value that disagrees with config
-    is drift rather than something to record — and the report has to name the
-    field without printing either side of it.
+    is drift rather than something to record; the report names the field without
+    printing either value.
     """
     source = "Bucket('b', bucket_name='n', token='declared')\n"
     harness = _harness({"b": {"arn": "arn:b", "token": "actual"}})
@@ -118,8 +119,8 @@ def test_a_sensitive_value_is_never_echoed_in_a_drift_report() -> None:
 
 
 def test_a_batch_adopts_in_dependency_order() -> None:
-    """The downstream read has to see a resolved value, not an unresolved ref —
-    which is only true if its dependency was adopted first."""
+    """The downstream read must see a resolved value, not an unresolved ref, which
+    requires its dependency to be adopted first."""
     harness = _harness({"b": {"arn": "arn:b"}, "n": {}})
     harness.adopt(LINKED, BUCKET_ID, NOTIFIER_ID)
     assert harness.fake().input("read", "n").target_arn == "arn:b"
@@ -160,8 +161,8 @@ def test_a_node_not_in_this_config_is_blocked() -> None:
 
 
 def test_a_node_whose_dependency_is_absent_is_refused_by_name() -> None:
-    """Adopting the notifier first would read a resource whose inputs are half
-    unresolved — matching nothing, or something unrelated."""
+    """Adopting the notifier first would read a resource with partly unresolved
+    inputs, matching nothing or something unrelated."""
     harness = _harness({"b": {"arn": "arn:b"}, "n": {}})
     [outcome] = harness.adopt(LINKED, NOTIFIER_ID)
     assert outcome.status is ImportStatus.BLOCKED
@@ -170,8 +171,8 @@ def test_a_node_whose_dependency_is_absent_is_refused_by_name() -> None:
 
 
 def test_a_failed_request_does_not_stop_the_ones_after_it() -> None:
-    """A partial batch is resumable; aborting on the first problem means finding
-    the problems one run at a time."""
+    """A partial batch is resumable; aborting on the first problem would surface
+    problems one run at a time."""
     source = BOX + "Bucket('gone', bucket_name='n')\n"
     harness = _harness({"b": {"out": "b:1"}, "gone": None})
     outcomes = harness.adopt(source, "default:test.Bucket:gone", BOX_ID)
@@ -185,8 +186,8 @@ _DRIFTED = "Bucket('b', bucket_name='n', versioning=True)\n"
 
 
 def test_drift_is_refused_and_writes_nothing() -> None:
-    """An import that silently means "your next apply will change your
-    infrastructure" is not a success worth reporting as one."""
+    """An import implying that the next apply will change infrastructure is not
+    reported as a success."""
     harness = _harness({"b": {"arn": "arn:b", "versioning": False}})
     [outcome] = harness.adopt(_DRIFTED, BUCKET_ID)
     assert outcome.status is ImportStatus.DRIFTED
@@ -196,8 +197,8 @@ def test_drift_is_refused_and_writes_nothing() -> None:
 
 
 def test_allow_drift_poisons_the_hash_so_the_next_plan_sees_it() -> None:
-    """Config and state hash identically after a drifted adopt — the diff is
-    symbolic — so clearing the hash is the only channel the next plan has."""
+    """Config and state hash identically after a drifted adopt (the diff is
+    symbolic), so clearing the hash is the only channel to the next plan."""
     harness = _harness({"b": {"arn": "arn:b", "versioning": False}})
     [outcome] = harness.adopt(_DRIFTED, BUCKET_ID, allow_drift=True)
     assert outcome.status is ImportStatus.IMPORTED
@@ -207,7 +208,7 @@ def test_allow_drift_poisons_the_hash_so_the_next_plan_sees_it() -> None:
 def test_a_drifted_adopt_plans_as_an_update_not_a_replace() -> None:
     """The poisoned hash reaches the diff with matching symbolic properties, which
     is the branch yielding an UPDATE. A REPLACE here would destroy the resource
-    the user had just adopted."""
+    just adopted."""
     harness = _harness({"b": {"arn": "arn:b", "versioning": False}})
     harness.adopt(_DRIFTED, BUCKET_ID, allow_drift=True)
     assert [c.action for c in harness.diff_only(_DRIFTED).changes] == [Action.UPDATE]
@@ -226,8 +227,8 @@ def test_a_dry_run_writes_nothing_but_still_reports() -> None:
 
 def test_a_dry_run_resolves_dependencies_like_the_real_run() -> None:
     """A dry run must answer as the real run would: a request depending on an
-    earlier one in the same batch is importable, not BLOCKED — the earlier
-    would-be import counts as tracked, and its outputs resolve the ``$ref``."""
+    earlier one in the same batch is importable, not BLOCKED, because the earlier
+    would-be import counts as tracked and its outputs resolve the ``$ref``."""
     harness = _harness({"b": {"arn": "arn:b"}, "n": {}})
     outcomes = harness.adopt(LINKED, BUCKET_ID, NOTIFIER_ID, write=False)
     assert [o.status for o in outcomes] == [
@@ -253,8 +254,8 @@ def test_a_lost_lease_refuses_the_write() -> None:
 
 
 def test_a_name_addressed_type_refuses_an_external_id() -> None:
-    """The test provider declares no identity field, so an id passed here is a
-    misunderstanding worth naming rather than silently dropping."""
+    """The test provider declares no identity field, so a passed id is refused by
+    name rather than silently dropped."""
     harness = _harness({"b": {"out": "b:1"}})
     [outcome] = harness.adopt(BOX, ImportRequest(BOX_ID, external_id="vpc-123"))
     assert outcome.status is ImportStatus.BLOCKED
@@ -262,9 +263,9 @@ def test_a_name_addressed_type_refuses_an_external_id() -> None:
 
 
 def test_an_id_field_override_seeds_the_computed_field_before_the_read() -> None:
-    """``--id-field`` is the escape hatch for a type whose read keys on something
-    the provider does not declare. The seeded value has to reach the resource the
-    provider is handed, or the override does nothing at all."""
+    """``--id-field`` covers a type whose read keys on a field the provider does
+    not declare. The seeded value must reach the resource passed to the provider,
+    or the override has no effect."""
     source = "Bucket('b', bucket_name='n')\n"
     harness = _harness({"b": {"arn": "arn:seeded"}})
     [outcome] = harness.adopt(

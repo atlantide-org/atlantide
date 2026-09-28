@@ -1,9 +1,9 @@
 """Random provider: generates a value at apply, echoes the pinned value on read.
 
-There is no external store — the value lives in state. ``create`` generates it;
-``read`` echoes the value restored onto the resource (so refresh reports IN_SYNC);
-``update`` is unreachable (all inputs are immutable, so a change is a REPLACE) and
-keeps the prior value.
+The value has no external store; it lives in state. ``create`` generates it;
+``read`` echoes the value restored onto the resource from state, so refresh
+reports IN_SYNC; ``update`` is unreachable (all inputs are immutable, so a change
+is a REPLACE) and keeps the prior value.
 """
 
 from __future__ import annotations
@@ -12,9 +12,7 @@ import string
 import uuid
 from datetime import UTC, datetime
 from secrets import choice, token_hex
-from typing import Any, ClassVar
-
-from typing_extensions import override
+from typing import Any, ClassVar, override
 
 from atlantide.core import Context, Provider, Resource
 from atlantide.core.errors import ProviderError
@@ -33,14 +31,11 @@ class RandomProvider(Provider):
 
     @override
     async def read(self, ctx: Context, res: Resource) -> dict[str, Any] | None:
-        # No external system; echo the pinned value (restored onto res from state).
         result = getattr(res, "result", None)
         return {"result": result} if isinstance(result, str) else None
 
     @override
     async def update(self, ctx: Context, prior: dict[str, Any], res: Resource) -> dict[str, Any]:
-        # All inputs are immutable, so a change is a REPLACE; update returns the
-        # pinned value unchanged.
         return dict(prior)
 
     @override

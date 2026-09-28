@@ -1,45 +1,41 @@
 """The invocation's resolved context: which profile, which project, which state.
 
-Two layers, in the order a command needs them. :func:`load_project` reads
-``atlantide.toml`` under the ``--profile`` the root callback recorded, so every
-command sees the same overlay without threading it through each signature.
-:class:`StateTarget` then answers "where does this command's state live" — an
-explicit ``--state`` beats the ``[state]`` table, which beats the local default,
-and the keyfile paths follow whichever won.
+:func:`current_project` reads ``atlantide.toml`` under the ``--profile`` the root
+callback recorded, so every command sees the same overlay. :class:`StateTarget`
+then resolves where the command's state lives: an explicit ``--state`` beats the
+``[state]`` table, which beats the local default, and the keyfile paths follow
+whichever wins.
 
-Both exist to be resolved once. A command needs that answer for several purposes
-at once — to open the backend, to build the secrets registry, and to say out loud
-what it is about to touch — and those must not be able to disagree; resolving
-once is also what keeps the "your ``--state`` overrides the remote backend"
-warning to one line per command rather than one per lookup.
+Both are resolved once per command, so opening the backend, building the secrets
+registry and announcing the target all use the same answer, and the ``--state``
+override warning prints once.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Self
 
 from rich.markup import escape
 
 from atlantide.cli.console import out
 from atlantide.cli.context import current
 from atlantide.cli.errors import fail
-from atlantide.cli.project import ProjectConfig
-from atlantide.cli.project import load_project as _read_project
+from atlantide.cli.project import ProjectConfig, load_project
 from atlantide.core import AtlantideError
 from atlantide.secrets import KeyfileValueStore, SecretsRegistry, make_secrets_registry
-from atlantide.state import SqliteStateBackend, make_state_backend
-from atlantide.state.backend import StateBackend
+from atlantide.state import LockPolicy, SqliteStateBackend, StateBackend, make_state_backend
 from atlantide.state.factory import describe
 
 #: State database used when neither ``--state`` nor ``atlantide.toml`` names one.
 DEFAULT_STATE = Path("atlantide.db")
 
 
-def load_project() -> ProjectConfig:
+def current_project() -> ProjectConfig:
     """The project config for this invocation, under the active ``--profile``."""
     try:
-        return _read_project(profile=current().profile)
+        return load_project(profile=current().profile)
     except AtlantideError as exc:
         fail(str(exc))
 
@@ -53,11 +49,11 @@ class StateTarget:
     local: Path | None
 
     @classmethod
-    def resolve(cls, state: Path | None, project: ProjectConfig) -> StateTarget:
-        """Resolve ``--state`` against the project config, warning on an override.
+    def resolve(cls, state: Path | None, project: ProjectConfig) -> Self:
+        """Resolve ``--state`` against the project config.
 
-        An explicit ``--state`` file is an explicit choice of local state and
-        wins over a remote ``[state]`` table — loudly, so it is never silent.
+        An explicit ``--state`` file selects local state and overrides a remote
+        ``[state]`` table, with a warning.
         """
         if state is None:
             local = None if project.state_backend.is_remote else default_state(project)
@@ -75,18 +71,22 @@ class StateTarget:
 
     @property
     def label(self) -> str:
-        """``s3://bucket/key (profile prod)`` — this target in one line."""
+        """This target in one line, e.g. ``s3://bucket/key (profile prod)``."""
         where = describe(self.project.state_backend, self.local)
         return f"{where} (profile {self.project.profile})" if self.project.profile else where
 
     def announce(self) -> None:
         """Say which state is about to be read or written.
 
-        Shared state makes "I am pointed at the wrong environment" both easy (a
-        stale shell, a profile not passed) and silent — unexpectedly empty state
-        reads exactly like a first run. One line removes the ambiguity.
+        Makes a wrong target (stale shell, missing profile) visible; empty state
+        otherwise looks like a first run.
         """
         out().print(f"[dim]state:[/] {escape(self.label)}")
+
+    @property
+    def lock_policy(self) -> LockPolicy:
+        """The lease timings every lock this command takes on its state obeys."""
+        return self.project.state_backend.lock_policy()
 
     # -- what hangs off it ------------------------------------------------
 
@@ -97,10 +97,10 @@ class StateTarget:
         return SqliteStateBackend(str(self.local))
 
     def secrets(self) -> SecretsRegistry:
-        """The configured secrets registry, plus install key material (per-install
-        digest salt + at-rest sealing of sensitive outputs).
+        """The configured secrets registry, plus install key material.
 
-        The keyfile is loaded lazily by the material, so a project with no secrets
+        The key material provides the per-install digest salt and at-rest sealing of
+        sensitive outputs. It loads the keyfile lazily, so a project with no secrets
         and no sensitive outputs never creates a key.
         """
         store, key = self._store_and_key()
@@ -114,7 +114,7 @@ class StateTarget:
         """The value-store and encryption-key paths: toml first, else beside the db.
 
         With a remote backend there is no local state file, so they fall back to
-        the project root — the directory ``atlantide.toml`` was read from.
+        the project root (the directory ``atlantide.toml`` was read from).
         """
         project = self.project
         base = self.local.parent if self.local is not None else project.directory
@@ -127,6 +127,19 @@ class StateTarget:
             project.resolve(project.secrets_key) if project.secrets_key else base / "atlantide.key"
         )
         return store, key
+
+
+def resolve_target(
+    state: Path | None, project: ProjectConfig, *, announce: bool = True
+) -> StateTarget:
+    """This command's state target, announced unless ``announce`` is false.
+
+    Machine-readable output carries the same value as a ``state`` field instead.
+    """
+    resolved = StateTarget.resolve(state, project)
+    if announce:
+        resolved.announce()
+    return resolved
 
 
 def default_state(project: ProjectConfig) -> Path:

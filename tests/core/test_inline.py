@@ -1,4 +1,4 @@
-"""Inlining in-config cross-stack output refs into real Refs (or leaving external)."""
+"""Inlining in-config cross-stack output refs into real Refs; external refs stay as-is."""
 
 from __future__ import annotations
 

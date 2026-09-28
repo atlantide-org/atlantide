@@ -32,13 +32,13 @@ def test_leaf_change_is_isolated() -> None:
     changed = _hashes(CFG.replace("Box('b', size=2", "Box('b', size=99"))
     a = "default:test.Box:a"
     b = "default:test.Box:b"
-    assert changed[a] == base[a]  # unrelated node unchanged
-    assert changed[b] != base[b]  # changed node differs
+    assert changed[a] == base[a]
+    assert changed[b] != base[b]
 
 
 def test_dependency_change_propagates_to_dependent() -> None:
     base = _hashes(CFG)
-    # change the upstream 'a' input -> its hash changes AND 'b' (depends on a) changes
+    # 'b' depends on 'a', so changing 'a' changes both hashes.
     changed = _hashes(CFG.replace("Box('a', size=1)", "Box('a', size=7)"))
     a = "default:test.Box:a"
     b = "default:test.Box:b"

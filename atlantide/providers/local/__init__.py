@@ -1,7 +1,11 @@
 """atlantide.providers.local: File/Null resources and LocalProvider."""
 
+from collections.abc import Mapping
+from typing import Any
+
 from atlantide.core.plugin import ProviderPlugin
 from atlantide.core.resource import Resource
+from atlantide.providers.local.paths import PathScope
 from atlantide.providers.local.provider import LocalProvider
 from atlantide.providers.local.resources import File, Null, SourceFile
 
@@ -12,12 +16,26 @@ TYPES: dict[str, type[Resource]] = {
     SourceFile.type_name(): SourceFile,
 }
 
-#: How atlantide discovers this provider. Declared the same way a third-party
-#: package declares one — see :mod:`atlantide.core.plugin`.
+
+def _build(settings: Mapping[str, Any]) -> LocalProvider:
+    """Construct the local provider from its settings table.
+
+    ``root`` is the project root, set by the CLI and absent without a project
+    file, in which case the working directory is the root.
+    ``allow_outside_project`` comes from ``[provider.local]`` in
+    ``atlantide.toml``. See :mod:`atlantide.providers.local.paths`.
+    """
+    scope = PathScope.from_settings(settings)
+    root = None if scope.implicit_root else scope.root
+    return LocalProvider(root, allow_outside_project=scope.allow_outside_project)
+
+
+#: Plugin descriptor advertised through the entry-point group; see
+#: :mod:`atlantide.core.plugin`.
 PLUGIN = ProviderPlugin(
     name=LocalProvider.name,
     types=TYPES,
-    factory=lambda _settings: LocalProvider(),
+    factory=_build,
     module="atlantide.providers.local",
     summary="Files and no-ops on the local machine; needs no credentials.",
 )

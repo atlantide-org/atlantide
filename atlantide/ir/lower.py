@@ -1,10 +1,10 @@
 """Lower an evaluated :class:`ResourceRegistry` to Atlas IR.
 
-This is the single place ``Ref``s become dependency edges: each resource's
-canonical inputs already carry ``{"$ref": "node#attr"}`` markers, and its
-``refs()`` give the upstream node ids the diff/scheduler need. Secret fields
-already carry a ``{"$secret_ref": ...}`` handle (a name, never a value), so no
-special handling is needed here — the plaintext is resolved only at apply.
+``Ref``s become dependency edges here: each resource's canonical inputs already
+carry ``{"$ref": "node#attr"}`` markers, and its ``refs()`` give the upstream
+node ids the diff and scheduler need. Secret fields already carry a
+``{"$secret_ref": ...}`` handle (a name, never a value); the plaintext is
+resolved only at apply.
 """
 
 from __future__ import annotations

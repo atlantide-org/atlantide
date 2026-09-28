@@ -5,7 +5,7 @@ the one class Atlas-lang admits, and the form an editor can complete — or a
 mapping of ``var()`` declarations. Both are imported from ``atlantide.core`` and
 validated at construction. This file drives the whole path a real config takes
 for both: the import allow-list, attribute access under the interpreter, and the
-failure text an author actually sees.
+failure text an author sees.
 """
 
 from __future__ import annotations
@@ -273,7 +273,7 @@ def test_a_prod_only_type_error_fails_the_whole_evaluation() -> None:
 
 
 def test_a_typo_on_a_declared_schema_still_names_the_environment() -> None:
-    """The runtime message is what a generated dataclass would have lost."""
+    """A generated dataclass would lose this runtime message."""
     source = CLASS_CONFIG.replace("env.domain", "env.doman")
     error = _error(source)
     assert "environment 'dev' has no variable 'doman'" in str(error)

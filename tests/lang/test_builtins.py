@@ -17,7 +17,7 @@ from atlantide.lang.builtins import (
 
 
 class Widget(Resource):
-    """Test resource injected via extra_globals (no provider package yet)."""
+    """Test resource injected via extra_globals; it has no provider package."""
 
     class Meta:
         provider: ClassVar[str] = "test"

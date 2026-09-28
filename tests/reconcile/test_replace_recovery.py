@@ -12,21 +12,19 @@ import itertools
 
 import pytest
 
-from atlantide.cli.errors import flatten_group
 from atlantide.core.errors import RollbackError, StateError
 from atlantide.reconcile import Action
-from atlantide.state import MemoryStateBackend
-from atlantide.state.backend import NO_INPUT_HASH, STATUS_CREATED, STATUS_CREATING
-from tests.support import FakeProvider
+from atlantide.state import (
+    NO_INPUT_HASH,
+    MemoryStateBackend,
+    NodeStatus,
+)
+from tests.support import FakeProvider, leaves
 
 from .conftest import Harness
 
 A = "default:test.Box:a"
 B = "default:test.Box:b"
-
-
-def _leaves(group: BaseException) -> list[BaseException]:
-    return flatten_group(group)
 
 
 def test_failed_replace_does_not_leave_state_asserting_the_destroyed_resource() -> None:
@@ -45,7 +43,7 @@ def test_failed_replace_does_not_leave_state_asserting_the_destroyed_resource() 
         h.apply("Box('a', size=2)\n")  # size is immutable -> REPLACE
 
     assert h.fake().calls == [("delete", "a"), ("create", "a")]
-    assert h.backend.load().nodes[A].status == STATUS_CREATING
+    assert h.backend.load().nodes[A].status == NodeStatus.CREATING
 
 
 def test_rollback_of_a_replace_records_the_recreated_identity() -> None:
@@ -75,7 +73,7 @@ def test_rollback_of_a_replace_records_the_recreated_identity() -> None:
     assert h.fake().calls.count(("create", "a")) == 2
     node = h.backend.load().nodes[A]
     assert node.outputs == {"out": "a#4"}, "the id of the resource that now exists"
-    assert node.status == STATUS_CREATED
+    assert node.status == NodeStatus.CREATED
 
 
 def test_a_compensation_that_fails_is_raised_not_swallowed() -> None:
@@ -91,9 +89,9 @@ def test_a_compensation_that_fails_is_raised_not_swallowed() -> None:
     with pytest.raises(ExceptionGroup) as caught:
         h.apply("a = Box('a', size=1)\nBox('b', size=2, ref=a.out)\n", on_failure="rollback")
 
-    leaves = _leaves(caught.value)
-    assert any(isinstance(e, RollbackError) and A in str(e) for e in leaves)
-    assert any("create failed for b" in str(e) for e in leaves), "original failure kept"
+    found = leaves(caught.value)
+    assert any(isinstance(e, RollbackError) and A in str(e) for e in found)
+    assert any("create failed for b" in str(e) for e in found), "original failure kept"
 
 
 def test_refresh_keeps_a_write_ahead_row_the_provider_cannot_see() -> None:
@@ -103,7 +101,7 @@ def test_refresh_keeps_a_write_ahead_row_the_provider_cannot_see() -> None:
     h.fake().fail_create.add("a")
     with pytest.raises(ExceptionGroup):
         h.apply("Box('a', size=1)\n")
-    assert h.backend.load().nodes[A].status == STATUS_CREATING
+    assert h.backend.load().nodes[A].status == NodeStatus.CREATING
 
     h.fake().fail_create.clear()
     h.fake()._live = {"a": None}  # provider cannot find it
@@ -135,16 +133,12 @@ def test_refresh_prune_drops_a_confirmed_row_that_is_gone() -> None:
 
 
 def test_a_node_whose_compensation_failed_is_not_reported_as_unchanged() -> None:
-    """The consequence that matters, asserted where the operator would see it.
+    """`a` is created, `b` fails, and `a`'s compensating delete also fails, so the
+    provider and state disagree.
 
-    `a` is created, `b` fails, and `a`'s compensating delete then fails too — so
-    the provider no longer agrees with state. Because the diff is symbolic, `a`'s
-    stored hash still matches config, and without an explicit stale mark the next
-    plan would Merkle-skip it and report NOOP: state would be permanently wrong
-    about `a` with nothing ever saying so.
-
-    This asserts the *plan*, not the state column, because the column is only a
-    means to this end.
+    The diff is symbolic, so `a`'s stored hash still matches config; without an
+    explicit stale mark the next plan would Merkle-skip it and report NOOP.
+    Asserts the *plan*, which is what the operator sees, not the state column.
     """
     source = "a = Box('a', size=1)\nBox('b', size=2, ref=a.out)\n"
     h = Harness(MemoryStateBackend())
@@ -163,8 +157,8 @@ def test_a_node_whose_compensation_failed_is_not_reported_as_unchanged() -> None
 def test_a_successful_compensation_leaves_no_stale_mark_behind() -> None:
     """Poisoning happens before the undo, so the undo's own write must clear it.
 
-    Otherwise every rollback — including the ones that work perfectly — would
-    leave rows that re-plan forever.
+    Otherwise every rollback, including successful ones, would leave rows that
+    re-plan indefinitely.
     """
     source = "a = Box('a', size=1)\nBox('b', size=2, ref=a.out)\n"
     h = Harness(MemoryStateBackend())

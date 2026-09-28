@@ -12,11 +12,13 @@ seam between the hash, the diff, and refresh.
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
 
 from atlantide.reconcile import Action, Drift
-from atlantide.state import MemoryStateBackend
-from atlantide.state.backend import STATUS_CREATING
+from atlantide.state import (
+    MemoryStateBackend,
+    NodeStatus,
+)
+from tests.support import actions_of
 
 from .conftest import Harness
 
@@ -28,10 +30,6 @@ C = "default:test.Box:c"
 CHAIN = "a = Box('a', size=1)\nb = Box('b', size=2, ref=a.out)\nBox('c', size=3, ref=b.out)\n"
 
 
-def _actions(changeset: Any) -> dict[str, Action]:
-    return {c.node_id: c.action for c in changeset}
-
-
 def test_dependents_re_apply_when_a_dependency_is_recreated() -> None:
     """`a` is absent from state, so it is recreated with a new output; `b` and `c`
     hold the old one with their hashes untouched."""
@@ -39,7 +37,7 @@ def test_dependents_re_apply_when_a_dependency_is_recreated() -> None:
     h.apply(CHAIN)
     h.backend.delete(A)
 
-    actions = _actions(h.diff_only(CHAIN))
+    actions = actions_of(h.diff_only(CHAIN))
     assert actions[A] is Action.CREATE
     assert actions[B] is not Action.NOOP, "b still points at the destroyed a"
     assert actions[C] is not Action.NOOP, "staleness is transitive through b"
@@ -51,21 +49,21 @@ def test_dependents_re_apply_after_an_unconfirmed_create() -> None:
     h = Harness(MemoryStateBackend())
     h.apply(CHAIN)
     node = h.backend.load().nodes[A]
-    h.backend.put(replace(node, status=STATUS_CREATING))
+    h.backend.put(replace(node, status=NodeStatus.CREATING))
 
-    actions = _actions(h.diff_only(CHAIN))
+    actions = actions_of(h.diff_only(CHAIN))
     assert actions[A] is Action.CREATE
     assert actions[B] is not Action.NOOP
 
 
 def test_unrelated_nodes_still_noop() -> None:
-    """Only actual dependents come out of NOOP; the Merkle skip is the point."""
+    """Only actual dependents leave NOOP; unrelated nodes keep the Merkle skip."""
     h = Harness(MemoryStateBackend())
     source = "Box('a', size=1)\nBox('b', size=2)\n"
     h.apply(source)
     h.backend.delete(A)
 
-    actions = _actions(h.diff_only(source))
+    actions = actions_of(h.diff_only(source))
     assert actions[A] is Action.CREATE
     assert actions[B] is Action.NOOP
 
@@ -73,7 +71,7 @@ def test_unrelated_nodes_still_noop() -> None:
 def test_re_apply_is_still_a_full_noop() -> None:
     h = Harness(MemoryStateBackend())
     h.apply(CHAIN)
-    assert set(_actions(h.diff_only(CHAIN)).values()) == {Action.NOOP}
+    assert set(actions_of(h.diff_only(CHAIN)).values()) == {Action.NOOP}
 
 
 # -- refresh -> plan --------------------------------------------------------
@@ -135,5 +133,5 @@ def test_sync_does_not_overwrite_a_ref_marker_with_its_value() -> None:
 
     node = h.backend.load().nodes[B]
     assert node.properties["ref"] == {"$ref": f"{A}#out"}
-    # ...and the drift is still not lost: the hash is what carries it forward.
-    assert _actions(h.diff_only(source))[B] is not Action.NOOP
+    # The drift is still carried forward, via the hash.
+    assert actions_of(h.diff_only(source))[B] is not Action.NOOP

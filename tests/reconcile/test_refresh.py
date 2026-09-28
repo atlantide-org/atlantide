@@ -7,8 +7,7 @@ from typing import Any
 import pytest
 
 from atlantide.reconcile import Drift, DriftReport
-from atlantide.state import MemoryStateBackend, StateNode
-from atlantide.state.backend import NO_INPUT_HASH, StateGraph
+from atlantide.state import NO_INPUT_HASH, MemoryStateBackend, StateGraph, StateNode
 from tests.support import FakeProvider, Harness, Widget, state_node
 
 
@@ -33,8 +32,7 @@ def _refresh(backend: MemoryStateBackend, provider: FakeProvider, *, write: bool
 
 
 def test_refresh_detects_input_field_drift() -> None:
-    # node 'a' has stored input property label='a'; the provider observes label='edited'
-    # -> the mutable *input* drifted, not just outputs.
+    # Stored label='a', observed label='edited': an *input* drifted, not an output.
     backend, _ = _seed()
     provider = FakeProvider(
         live={
@@ -109,13 +107,12 @@ def test_refresh_write_syncs_state() -> None:
 
 
 def test_refresh_write_keeps_a_row_it_could_not_find() -> None:
-    """One failed read is not evidence enough to discard the only record that a
-    resource exists.
+    """One failed read does not justify discarding the only record of a resource.
 
-    A read can be wrong for reasons that have nothing to do with the resource —
-    an unpaginated listing, a missing permission, an eventually-consistent view.
-    Deleting on that evidence turns a transient misread into a permanent loss,
-    and the next apply builds a second resource alongside the first.
+    A read can be wrong for reasons unrelated to the resource: an unpaginated
+    listing, a missing permission, an eventually-consistent view. Deleting on that
+    evidence turns a transient misread into a permanent loss, and the next apply
+    builds a duplicate resource.
     """
     backend, _ = _seed()
     provider = FakeProvider(live={"a": None, "b": None, "c": None})
@@ -126,8 +123,8 @@ def test_refresh_write_keeps_a_row_it_could_not_find() -> None:
 
 
 def test_refresh_write_prune_is_how_you_actually_forget_them() -> None:
-    """The opt-in. Once an operator has confirmed the resources are gone, this is
-    what drops the rows."""
+    """`prune` is the opt-in that drops the rows once an operator has confirmed
+    the resources are gone."""
     backend, _ = _seed()
     provider = FakeProvider(live={"a": None, "b": None, "c": None})
     Harness.of(Widget, provider=provider, backend=backend).refresh(write=True, prune=True)
@@ -142,17 +139,16 @@ def test_refresh_no_drift() -> None:
     )
     report = _refresh(backend, provider, write=False)
     assert not report.has_drift
-    assert len(report.in_sync) == 3
+    assert [n.kind for n in report.nodes] == [Drift.IN_SYNC] * 3
 
 
 def test_in_sync_records_the_inputs_the_read_never_checked() -> None:
     """IN_SYNC is a claim scoped to what the provider reported.
 
-    Every node here stores a `label` input, and this provider's read returns only
-    outputs — so nothing about `label` was verified. The verdict is still IN_SYNC
-    (no observed value disagrees) but it must carry the fact that the one input
-    this resource has went unchecked, or it reads as "atlantide verified your
-    infrastructure" when no API call established that.
+    Every node stores a `label` input, and this provider's read returns only
+    outputs, so `label` was never verified. The verdict is still IN_SYNC (no
+    observed value disagrees), but it must record `label` as unchecked rather than
+    imply the input was verified.
     """
     backend, _ = _seed()
     provider = FakeProvider(
@@ -193,8 +189,8 @@ def test_missing_nodes_carry_no_coverage_claim() -> None:
 
 
 def test_drifted_node_still_reports_what_went_unchecked() -> None:
-    """Coverage is orthogonal to the verdict: a drifted node can also have
-    unchecked fields, and finding one problem does not imply there is only one."""
+    """Coverage is independent of the verdict: a drifted node can also have
+    unchecked fields."""
     backend, _ = _seed()
     provider = FakeProvider(
         live={

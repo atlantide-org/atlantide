@@ -1,8 +1,8 @@
 """CloudFront resources: an origin access control and a distribution.
 
-Both are global (no ``region`` field) — CloudFront has a single global endpoint.
-They are located by their provider-assigned id (``oac_id`` / ``distribution_id``),
-restored from state for read/update/delete.
+Both are global (no ``region`` field): CloudFront has a single global endpoint. Each
+is located by its provider-assigned id (``oac_id`` / ``distribution_id``), restored
+from state.
 """
 
 from __future__ import annotations
@@ -36,13 +36,10 @@ class CloudFrontDistribution(TaggedResource):
     else updates in place. ``domain_name`` is the ``*.cloudfront.net`` URL the
     site is served from.
 
-    **Custom domains.** ``aliases`` are the names to serve, and
-    ``certificate_arn`` is the ACM certificate proving them — pass
-    ``cert.certificate_arn``. Both or neither: CloudFront rejects an alias with no
-    certificate covering it, and a certificate with no alias serves nothing. The
-    certificate must live in ``us-east-1``, which
-    :class:`~atlantide.providers.aws.resources.certificate.AcmCertificate` already
-    pins for you.
+    **Custom domains.** Set ``aliases`` and ``certificate_arn`` (pass ``cert.arn``)
+    together: CloudFront rejects an alias no certificate covers, and a certificate
+    without an alias serves nothing. The certificate must be in ``us-east-1``, which
+    :class:`~atlantide.providers.aws.resources.certificate.AcmCertificate` pins.
     """
 
     origin_domain: str = immutable()  # {bucket}.s3.{region}.amazonaws.com (a Ref)
@@ -52,14 +49,13 @@ class CloudFrontDistribution(TaggedResource):
     comment: str = mutable(default="")
     #: Domain names this distribution answers to (CNAMEs).
     aliases: list[str] = mutable(default_factory=list)
-    #: ACM certificate ARN covering ``aliases``; must be in us-east-1.
     certificate_arn: str | None = mutable(default=None)
     #: Lowest TLS version accepted from viewers. The default excludes TLS 1.0/1.1.
     minimum_protocol_version: str = mutable(default="TLSv1.2_2021")
     #: ``PriceClass_All`` | ``PriceClass_200`` | ``PriceClass_100``.
     price_class: str = mutable(default="PriceClass_All")
     distribution_id: str = computed()
-    domain_name: str = computed()  # <id>.cloudfront.net — the site URL
+    domain_name: str = computed()  # <id>.cloudfront.net
     arn: str = computed()
 
     @model_validator(mode="after")

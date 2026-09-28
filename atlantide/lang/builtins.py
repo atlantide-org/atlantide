@@ -15,10 +15,11 @@ import json
 import re
 import unicodedata
 import uuid
-from typing import Any
+from typing import Any, override
 
 from atlantide.core.errors import LanguageError
 from atlantide.core.types import SecretRef, concat, interpolate, join
+from atlantide.util.jsonfmt import compact_json
 
 # Fixed namespace so uuid5() is stable across machines and runs.
 _ATLAS_NS = uuid.uuid5(uuid.NAMESPACE_URL, "atlantide")
@@ -45,14 +46,17 @@ def b64decode(value: str) -> str:
 
 
 def hmac_sha256_hex(key: str, message: str) -> str:
-    """Deterministic HMAC-SHA256, hex digest — sign webhook secrets/tokens."""
+    """HMAC-SHA256 hex digest of ``message`` under ``key``, e.g. to sign webhook tokens."""
     return hmac.new(key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def to_json(value: Any) -> str:
-    """Canonical JSON: keys sorted, no insignificant whitespace, so the output
-    is byte-stable across runs (safe to hash or embed in policy documents)."""
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    """Canonical JSON: sorted keys, no insignificant whitespace.
+
+    The output is byte-stable across runs, so it can be hashed or embedded in
+    policy documents.
+    """
+    return compact_json(value, ascii=False)
 
 
 def from_json(text: str) -> Any:
@@ -61,8 +65,11 @@ def from_json(text: str) -> Any:
 
 
 def merge(*mappings: dict[str, Any]) -> dict[str, Any]:
-    """Deep-merge dicts left-to-right; later values win. Nested dicts merge
-    recursively, every other type is replaced. Inputs are not mutated."""
+    """Deep-merge dicts left to right; later values win.
+
+    Nested dicts merge recursively; any other value is replaced. Inputs are not
+    mutated.
+    """
     result: dict[str, Any] = {}
     for mapping in mappings:
         for key, value in mapping.items():
@@ -78,61 +85,70 @@ _SLUG_STRIP = re.compile(r"[^a-z0-9]+")
 
 
 def slugify(value: str) -> str:
-    """DNS/resource-safe slug: ASCII-fold, lowercase, non-alphanumerics to a
-    single ``-``, trimmed. ``"Café Menu!" -> "cafe-menu"``."""
+    """DNS- and resource-name-safe slug: ``"Café Menu!" -> "cafe-menu"``.
+
+    ASCII-folds, lowercases, collapses each run of non-alphanumerics to a single
+    ``-`` and trims leading and trailing ``-``.
+    """
     ascii_value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
     return _SLUG_STRIP.sub("-", ascii_value.lower()).strip("-")
 
 
 class ConfigAPI:
-    """The ``atlantide`` handle available to config: sanctioned inputs only."""
+    """The ``atlantide`` handle available to config: sanctioned inputs only.
+
+    State is underscore-prefixed so Atlas-lang cannot read it: ``_inputs`` would
+    expose every input without recording it as consumed, and ``_consumed`` would
+    let config rewrite the recorded inputs. The engine reads ``_consumed`` through
+    :func:`consumed_inputs`.
+    """
 
     def __init__(self, inputs: dict[str, Any]) -> None:
         self._inputs = inputs
-        #: What this evaluation actually read, defaults included. Only these shaped
-        #: the config, so an input passed but never read must not move the plan's
-        #: identity.
-        self.consumed: dict[str, Any] = {}
+        #: Inputs this evaluation read, defaults included. Only these are part of
+        #: the plan's identity.
+        self._consumed: dict[str, Any] = {}
+
+    @override
+    def __repr__(self) -> str:
+        # The default repr embeds a memory address; `f"{atlantide!r}"` in a resource
+        # field would make the IR hash differ on every run.
+        return "<atlantide config API>"
 
     def input(self, name: str, default: Any = _MISSING) -> Any:
         """A declared config input: a per-run value the config may branch on.
 
-        The determinism guarantee is over *(config, inputs)*, not config alone:
-        two runs with the same inputs produce byte-identical IR, and two runs
-        with different ones are supposed to differ. A value that reaches a
-        resource field lands in the hashed IR by the ordinary route, so nothing
-        special is needed to make that work.
+        Determinism holds over *(config, inputs)*: two runs with the same inputs
+        produce byte-identical IR. A value that reaches a resource field is part of
+        the hashed IR.
 
-        Not for secrets — see :meth:`secret`.
+        Not for secrets; see :meth:`secret`.
         """
         if name in self._inputs:
-            self.consumed[name] = self._inputs[name]
+            self._consumed[name] = self._inputs[name]
             return self._inputs[name]
         if default is _MISSING:
             raise LanguageError(
                 f"required input {name!r} not provided — pass -var {name}=<value>, "
                 f"put it in [inputs] in atlantide.toml, or give it a default"
             )
-        self.consumed[name] = default
+        self._consumed[name] = default
         return default
 
     def secret(self, name: str, provider: str | None = None) -> SecretRef:
-        """A handle to a secret in the configured store — never the value.
+        """A handle to a secret in the configured store, not its value.
 
-        Returns a :class:`~atlantide.core.SecretRef`, so the *name* is what
-        reaches the IR, the artifact and state; the plaintext is resolved
-        in-memory at apply and never written down.
+        Returns a :class:`~atlantide.core.SecretRef`: only the *name* reaches the
+        IR, the artifact and state. The plaintext is resolved in memory at apply
+        time and is not persisted.
 
-        This deliberately does not read from ``inputs``. It used to, which meant
-        the value a caller passed was substituted straight into a resource field
-        and from there into the hashed IR, the ``.atlas`` artifact, and the state
-        store — a secret committed to three places at once, by the function whose
-        entire purpose is to keep it out of them. Pass secrets to the store
-        (``atlantide secret set``), not to the config.
+        It does not read ``inputs``: a value there would reach the hashed IR, the
+        ``.atlas`` artifact and the state store. Secrets belong in the store
+        (``atlantide secret set``).
         """
         return SecretRef(name, provider=provider)
 
-    # dunder access is blocked in-language.
+    # The pure helpers, also reachable as `atlantide.<name>`.
     uuid5 = staticmethod(uuid5)
     sha256_hex = staticmethod(sha256_hex)
     hmac_sha256_hex = staticmethod(hmac_sha256_hex)
@@ -144,8 +160,13 @@ class ConfigAPI:
     slugify = staticmethod(slugify)
 
 
-# Deterministic subset of Python builtins. Ordering-sensitive ones (sorted,
-# min, max) are deterministic; iteration over sets is normalised in the interpreter.
+def consumed_inputs(api: ConfigAPI) -> dict[str, Any]:
+    """A copy of the inputs ``api`` handed to config, defaults included."""
+    return dict(api._consumed)
+
+
+# Deterministic subset of Python builtins. The interpreter normalises set
+# iteration order.
 SAFE_BUILTINS: dict[str, Any] = {
     "abs": abs,
     "all": all,

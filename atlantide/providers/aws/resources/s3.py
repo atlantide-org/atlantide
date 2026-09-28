@@ -23,7 +23,7 @@ _BUCKET_NAME = v.all_of(
     v.length_between(3, 63, "S3 bucket name"),
     v.forbids("..", "S3 bucket name"),
     v.matches(
-        re.compile(r"^[a-z0-9][a-z0-9.-]*[a-z0-9]$"),
+        re.compile(r"[a-z0-9][a-z0-9.-]*[a-z0-9]"),  # whole value: matches() uses fullmatch
         "S3 bucket name",
         "lowercase letters, digits, '.' and '-'; must start and end alphanumeric",
     ),
@@ -33,14 +33,13 @@ _BUCKET_NAME = v.all_of(
 class S3Bucket(RegionalResource, TaggedResource):
     """An S3 bucket.
 
-    ``bucket`` (the globally-unique name) and ``region`` are immutable — changing
+    ``bucket`` (the globally-unique name) and ``region`` are immutable: changing
     either replaces the bucket. ``versioning``, ``tags``, ``block_public_access``,
     ``encryption`` and ``force_destroy`` update in place.
 
-    **Defaults are the safe ones.** ``block_public_access`` and ``encryption`` are
-    on unless turned off: a bucket that is public or unencrypted should be a thing
-    someone wrote down, not a thing they forgot. ``force_destroy`` is off for the
-    mirror-image reason — deleting objects is not something to do by default.
+    **Secure defaults.** ``block_public_access`` and ``encryption`` are on unless
+    turned off, so a public or unencrypted bucket is always explicit.
+    ``force_destroy`` is off so objects are never deleted by default.
     """
 
     class Action:
@@ -54,19 +53,18 @@ class S3Bucket(RegionalResource, TaggedResource):
 
     bucket: str = immutable(physical_name=True)
     versioning: bool = mutable(default=False)
-    #: Block all four public-access routes. On by default; the AWS default for a
-    #: new bucket is also on, and turning it off here is an explicit decision.
+    #: Block all four public-access routes. On by default, matching AWS for a new
+    #: bucket.
     block_public_access: bool = mutable(default=True)
     #: ``"AES256"`` (SSE-S3), ``"aws:kms"``, or ``None`` for no default encryption.
     encryption: str | None = mutable(default="AES256")
     #: KMS key for ``encryption="aws:kms"``; the AWS-managed key when unset.
     kms_key_id: str | None = mutable(default=None)
-    #: Empty the bucket before deleting it. Without this a destroy fails on any
-    #: bucket holding objects — S3 refuses — which wedges the whole stack.
+    #: Empty the bucket before deleting it; S3 refuses to delete a non-empty bucket.
     force_destroy: bool = mutable(default=False)
     name: str = computed()  # the bucket name as a reference (orders dependents after create)
-    arn: str = computed()  # the bucket ARN (arn:aws:s3:::name)
-    objects_arn: str = computed()  # the objects ARN (arn:aws:s3:::name/*), for policies
+    arn: str = computed()  # arn:aws:s3:::name
+    objects_arn: str = computed()  # arn:aws:s3:::name/*, for policies
     regional_domain_name: str = computed()  # {bucket}.s3.{region}.amazonaws.com (CloudFront origin)
 
     @model_validator(mode="after")
@@ -78,8 +76,8 @@ class S3Bucket(RegionalResource, TaggedResource):
 def _dir_manifest(root: Path) -> dict[str, str]:
     """Map each file under ``root`` to its sha256, keyed by relative posix path.
 
-    Sorted and excluding derived Python caches, so the mapping is deterministic
-    and content changes (not just paths) enter the Merkle inputs.
+    Sorted and excluding Python caches, so the mapping is deterministic and content
+    changes, not only path changes, reach the Merkle inputs.
     """
     if not root.is_dir():
         raise LanguageError(f"S3Folder.source_path is not a directory: {root}")
@@ -93,25 +91,26 @@ def _dir_manifest(root: Path) -> dict[str, str]:
 
 
 class S3Folder(RegionalResource):
-    """Sync a local directory into an S3 bucket under ``prefix`` (mirror, prunes).
+    """Mirror a local directory into an S3 bucket under ``prefix``, pruning extras.
 
     The directory is fingerprinted at config-evaluation time into ``manifest``
-    (``{relpath: sha256}``), an input that drives the diff: any file add, change,
-    or removal alters the manifest, so plan/apply see an UPDATE and re-sync only
-    the delta. File bytes are read by the provider at apply. ``source_path`` must
-    be a literal directory (the read precedes apply); a rehydrate (deploy) passes
-    the artifact's pinned ``manifest`` and never touches disk.
+    (``{relpath: sha256}``), so any file add, change or removal plans as an UPDATE
+    and apply re-syncs only the delta. The provider reads file bytes at apply.
+    ``source_path`` must be a literal directory; a rehydrate (deploy) passes the
+    artifact's pinned ``manifest`` and never reads disk.
 
-    ``bucket`` is the target bucket name — pass the bucket's ``.name`` (a computed
-    reference) to order the folder after the bucket; a literal name creates no
-    dependency edge. ``bucket``, ``prefix``, and ``source_path`` are immutable;
-    ``manifest`` and ``cache_control`` update in place. ``uploaded``
-    (``{key: sha256}`` currently in S3) is a computed output.
+    Pass the bucket's ``.name`` (a computed reference) as ``bucket`` to order the
+    folder after the bucket; a literal name creates no dependency edge. ``bucket``
+    and ``prefix`` are immutable; ``source_path``, ``manifest`` and
+    ``cache_control`` update in place. ``manifest`` carries the content, so moving
+    the directory with identical files is an UPDATE that uploads nothing, not a
+    replacement that wipes and re-uploads the folder. ``uploaded`` (``{key:
+    sha256}`` in S3) is computed.
     """
 
-    bucket: str = immutable()  # bucket name; pass bucket.name to order after it
+    bucket: str = immutable()
     prefix: str = immutable(default="")
-    source_path: str = immutable()
+    source_path: str = mutable()
     manifest: dict[str, str] = mutable(default_factory=dict)
     cache_control: str = mutable(default="")
     uploaded: dict[str, str] = computed()

@@ -16,8 +16,8 @@ from atlantide.lang import evaluate_source
 from tests.support import FakeProvider, globals_of
 
 
-# Minimal, local shapes: these tests assert exact lowered properties, so a rich
-# shared resource (with defaulted fields) would only add noise here.
+# Minimal local shapes: these tests assert exact lowered properties, so a shared
+# resource with defaulted fields would add noise.
 class Bucket(Resource):
     class Meta:
         provider: ClassVar[str] = "test"

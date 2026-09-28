@@ -1,13 +1,11 @@
 """Hypothesis generators for atlantide's pure layers.
 
 The lower half of the package is algebraic: total functions over values, with no
-clock, no I/O and no configuration. That is the shape generated input is good at,
-and these are the inputs those functions take.
+clock, no I/O and no configuration. Generated input suits that shape, and these
+are the inputs those functions take.
 
-Kept in one module so a strategy is written once. ``json_values`` in particular
-was inline in ``tests/ir/test_canonical.py`` and is wanted by the codec suite too;
-two copies would drift, and a strategy that has drifted quietly tests less than
-it looks like it tests.
+Kept in one module so a strategy is written once: copies drift, and a drifted
+strategy tests less than it appears to.
 """
 
 from __future__ import annotations
@@ -24,10 +22,9 @@ from atlantide.graph.build import build_graph
 from atlantide.graph.order import topological_order
 from atlantide.ir.merkle import merkle_hashes
 from atlantide.ir.model import IRGraph, IRNode
-from atlantide.state.backend import (
+from atlantide.state import (
     NO_INPUT_HASH,
-    STATUS_CREATED,
-    STATUS_CREATING,
+    NodeStatus,
     StateGraph,
     StateNode,
 )
@@ -58,7 +55,7 @@ def json_values(max_leaves: int = 20) -> st.SearchStrategy[Any]:
 
 
 def refs() -> st.SearchStrategy[Ref]:
-    """A live `Ref` handle — the thing tree walkers exist to find."""
+    """A live `Ref` handle, which tree walkers must find."""
     return st.builds(Ref, node_id=names, attr=names)
 
 
@@ -67,10 +64,8 @@ def _containers(
 ) -> st.SearchStrategy[Any]:
     """Every container the tree walkers treat as structure.
 
-    Written once because both tree generators need the same list for the same
-    reason, and a container added to one and not the other would leave the second
-    generator quietly testing less than it looks like it tests — which is the
-    drift this module exists to prevent.
+    Shared by both tree generators so a container added to one cannot be missing
+    from the other.
 
     The three that matter are the ones a hand-rolled walker stops at: a `set`
     (lowered to a sorted list, because iteration order varies with
@@ -111,18 +106,26 @@ def state_nodes(node_id: str | None = None) -> st.SearchStrategy[StateNode]:
         outputs=st.dictionaries(names, json_values(max_leaves=4), max_size=3),
         properties=st.dictionaries(names, json_values(max_leaves=4), max_size=3),
         dependencies=st.lists(names, max_size=3).map(tuple),
+        depends_on=st.lists(names, max_size=2).map(tuple),
         prevent_destroy=st.booleans(),
         secret_digests=st.dictionaries(names, names, max_size=2),
+        ref_digests=st.dictionaries(names, names, max_size=2),
     )
 
 
 def state_documents() -> st.SearchStrategy[StateDocument]:
-    """A whole committed state: nodes, exported outputs, and the serial."""
+    """A whole committed state: nodes, outputs, the serial, and the journal bookkeeping."""
     return st.builds(
         StateDocument,
         serial=st.integers(min_value=0, max_value=2**31),
         nodes=st.lists(state_nodes(), max_size=4).map(lambda ns: {n.id: n for n in ns}),
         outputs=st.dictionaries(names, json_values(max_leaves=4), max_size=3),
+        fences=st.dictionaries(names, st.integers(min_value=0, max_value=2**53), max_size=3),
+        max_fence=st.integers(min_value=0, max_value=2**53),
+        wm=st.dictionaries(names, st.integers(min_value=0, max_value=2**31), max_size=3),
+        owm=st.dictionaries(names, st.integers(min_value=0, max_value=2**31), max_size=3),
+        gen=st.integers(min_value=0, max_value=2**31),
+        epoch=st.text(alphabet="0123456789abcdef", max_size=16),
     )
 
 
@@ -137,9 +140,9 @@ def ir_graphs(
     avoids throwing away most generated examples.
 
     ``connected`` gives every node after the first at least one dependency. The
-    default may draw a graph with no edges at all, which is the right default —
-    an edgeless config is a real one — but leaves a caller that needs an edge to
-    work with either filtering or patching one in afterwards.
+    default may draw a graph with no edges at all (an edgeless config is a real
+    one), which leaves a caller that needs an edge either filtering or patching
+    one in afterwards.
     """
     count = draw(st.integers(min_value=min_nodes, max_value=max_nodes))
     ids = [f"s:t.T:{index}" for index in range(count)]
@@ -186,9 +189,9 @@ def cyclic_ir_graphs(draw: st.DrawFn) -> PlantedCycle:
 
     The edge runs from one of a node's *transitive* dependencies back to the node
     itself, which is what makes the result cyclic by construction rather than by
-    luck. Adding a merely forward edge — from an earlier id to a later one — closes
-    a loop only when the later node already reaches back, so a graph built that way
-    is usually still acyclic and a test over it passes while asserting nothing.
+    luck. A forward edge (from an earlier id to a later one) closes a loop only
+    when the later node already reaches back, so a graph built that way is usually
+    still acyclic and a test over it passes while asserting nothing.
 
     Naming the joined ids lets a test check that the reported cycle is the one
     that was planted, rather than only that *something* was reported.
@@ -228,10 +231,10 @@ def cyclic_ir_graphs(draw: st.DrawFn) -> PlantedCycle:
 def hashes_for(ir: IRGraph) -> dict[str, str]:
     """The Merkle hashes of ``ir``, derived the way the engine derives them.
 
-    Every property that diffs a generated graph needs these, and spelling the
-    three-call chain out at each site invites one of them to get it subtly wrong —
-    hashing in declaration order rather than dependency order still returns a
-    dict, just not the one the diff compares against.
+    Every property that diffs a generated graph needs these, and spelling out the
+    three-call chain at each site invites mistakes: hashing in declaration order
+    rather than dependency order still returns a dict, but not the one the diff
+    compares against.
     """
     return merkle_hashes(ir, topological_order(build_graph(ir).unwrap()))
 
@@ -239,17 +242,17 @@ def hashes_for(ir: IRGraph) -> dict[str, str]:
 def applied_row(node: IRNode, hashes: Mapping[str, str]) -> StateNode:
     """The state row a successful apply of ``node`` leaves behind.
 
-    A hand copy of :meth:`~atlantide.reconcile.executor.Executor._state_node`,
+    A hand copy of :meth:`~atlantide.reconcile.executor.records.NodeRecords.state_node`,
     restricted to the fields the diff can observe. ``outputs`` and
     ``secret_digests`` are empty because they come from the provider and the
-    keyfile, and no branch of :func:`~atlantide.reconcile.diff.diff` reads either —
-    ``_change_for`` looks at ``status`` and ``input_hash``, ``_changed_fields`` at
+    keyfile, and no branch of :func:`~atlantide.reconcile.diff.diff` reads either:
+    ``_DiffInputs.change_for`` looks at ``status`` and ``input_hash``, ``_changed_fields`` at
     ``properties`` and ``input_hash``.
 
-    That restriction is what lets the idempotency property run without an
-    executor, a provider, or an event loop. It is also what makes the model a
-    liability if the executor's row ever diverges, so a pin test in
-    ``tests/reconcile/test_diff_properties.py`` compares this against a real apply.
+    That restriction lets the idempotency property run without an executor, a
+    provider, or an event loop. It also means the model could diverge from the
+    executor's row, so a pin test in ``tests/reconcile/test_diff_properties.py``
+    compares this against a real apply.
     """
     return StateNode(
         id=node.id,
@@ -261,7 +264,7 @@ def applied_row(node: IRNode, hashes: Mapping[str, str]) -> StateNode:
         properties=node.properties,
         dependencies=node.dependencies,
         prevent_destroy=node.prevent_destroy,
-        status=STATUS_CREATED,
+        status=NodeStatus.CREATED,
         secret_digests={},
     )
 
@@ -270,9 +273,8 @@ def mutabilities(ir: IRGraph) -> st.SearchStrategy[dict[str, dict[str, Mutabilit
     """Per-type field mutability: the third argument the diff takes.
 
     Keyed on the types and field names *actually present* in ``ir``, so an
-    IMMUTABLE draw can land on a field that changed and produce a REPLACE — the
-    branch worth generating. A map over invented names would type-check, satisfy
-    the signature, and make every example an UPDATE.
+    IMMUTABLE draw can land on a field that changed and produce a REPLACE. A map
+    over invented names would type-check but make every example an UPDATE.
     """
     types = sorted({node.type for node in ir.nodes})
     fields = sorted({key for node in ir.nodes for key in node.properties})
@@ -287,12 +289,12 @@ def mutabilities(ir: IRGraph) -> st.SearchStrategy[dict[str, dict[str, Mutabilit
 
 #: How an applied row can have been left behind, beyond the clean case. Keyed by
 #: the name a shrink report shows, so a failure says "poisoned" rather than
-#: naming a lambda. ``absent`` is the fifth condition and needs no builder — it is
-#: the row not being there at all.
+#: naming a lambda. ``absent`` is the fifth condition and needs no builder: the
+#: row is missing.
 _ROW_CONDITIONS: dict[str, Callable[[StateNode], StateNode]] = {
     "applied": lambda row: row,
     "poisoned": lambda row: replace(row, input_hash=NO_INPUT_HASH),
-    "creating": lambda row: replace(row, status=STATUS_CREATING),
+    "creating": lambda row: replace(row, status=NodeStatus.CREATING),
     "drifted": lambda row: replace(row, input_hash="0" * 64, properties={"drifted": True}),
 }
 
@@ -303,11 +305,11 @@ def prior_states(
 ) -> StateGraph:
     """A state file to diff against, drawn from the conditions a real one reaches.
 
-    Not "the state after a clean apply" — that would make the idempotency property
+    Not "the state after a clean apply": that would make the idempotency property
     a restatement of the Merkle skip, since the diff NOOPs on hash equality and
     the model is what set the hash. Each node lands in one of the five conditions
-    in :data:`_ROW_CONDITIONS` instead, and the interesting ones are the two the
-    hash cannot express: a row poisoned by ``refresh --write`` (which no digest
+    in :data:`_ROW_CONDITIONS` instead; the ones that matter are the two the hash
+    cannot express: a row poisoned by ``refresh --write`` (which no digest
     equals) and a row left ``creating`` by an apply that died between the
     write-ahead and the confirm.
 
@@ -328,7 +330,7 @@ def prior_states(
 
 #: The plaintext planted inside generated secret markers. Distinctive so that
 #: scanning redacted output for it cannot match by accident, and deliberately
-#: never emitted as a bare leaf — a sentinel that could appear outside a marker
+#: never emitted as a bare leaf: a sentinel that could appear outside a marker
 #: would make "no plaintext survives" false by construction rather than by bug.
 SECRET_SENTINEL = "PLAINTEXT-MUST-NEVER-BE-LOGGED"
 
@@ -336,12 +338,12 @@ SECRET_SENTINEL = "PLAINTEXT-MUST-NEVER-BE-LOGGED"
 def secret_marker_trees(max_leaves: int = 12) -> st.SearchStrategy[Any]:
     """A log payload with secret markers buried at arbitrary depth.
 
-    Uses the same containers as :func:`property_trees` — every kind the walkers
-    treat as structure, not just the dicts and lists a payload obviously has —
+    Uses the same containers as :func:`property_trees` (every kind the walkers
+    treat as structure, not only the dicts and lists a payload obviously has),
     because a walker that stops at any of them logs the value it exists to hide.
 
     The ``$sealed`` marker appears both alone and alongside a second key, because
-    redaction tests key *membership* — a one-key dict would not catch a check
+    redaction tests key *membership*; a one-key dict would not catch a check
     written as an equality against the marker's exact shape.
 
     Leaves are drawn from an alphabet with no ``$`` and no sentinel, so a scan of

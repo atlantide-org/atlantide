@@ -40,8 +40,8 @@ def test_an_interrupt_becomes_a_typed_failure_not_a_traceback() -> None:
 
 
 def test_the_message_says_what_happened_to_the_resources() -> None:
-    """An interrupt mid-apply leaves a question — what got built? — and the one
-    line the operator sees has to answer it rather than just say "cancelled"."""
+    """After an interrupt mid-apply, the one line the operator sees must say what
+    happened to the resources, not only "cancelled"."""
     message = str(run_async(_sigint_after_start()).failure())
 
     assert "rolled back" in message
@@ -49,7 +49,7 @@ def test_the_message_says_what_happened_to_the_resources() -> None:
 
 
 def test_an_ordinary_failure_is_still_reported_as_itself() -> None:
-    """The widened except clause must not swallow real errors into "interrupted"."""
+    """Interrupt handling must not swallow real errors into "interrupted"."""
 
     async def boom() -> Result[str, AtlantideError]:
         raise ProviderError("bucket already exists", op="create")
@@ -100,11 +100,11 @@ def test_a_rollback_failure_rides_along_with_the_interrupt() -> None:
 
 
 def test_a_second_interrupt_abandons_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The escape hatch: an operator pressing Ctrl-C twice wants out now, and an
-    unkillable "cleaning up" is worse than an honest abandonment.
+    """An operator pressing Ctrl-C twice wants out now, so the second interrupt
+    exits immediately instead of waiting on cleanup.
 
-    `os._exit` is patched to something observable — the real one would take the
-    test runner with it, which is precisely the point of using it.
+    `os._exit` is patched to record its code, since the real one would also
+    terminate the test runner.
     """
     exited: list[int] = []
     monkeypatch.setattr(os, "_exit", lambda code: exited.append(code))

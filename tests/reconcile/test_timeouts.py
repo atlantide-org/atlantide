@@ -1,10 +1,8 @@
 """A node that never finishes fails the apply instead of hanging it forever.
 
 Without a ceiling, a provider call that never answers keeps the run alive
-indefinitely — holding its lease the whole time, which does *not* also hang: the
-lease lapses, someone else takes it, and now two runs believe they own the same
-resources. A hang is therefore not merely a stalled apply; it is the setup for
-the divergence everything else here is built to prevent.
+indefinitely while its lease lapses; another run can then take the lease, and two
+runs believe they own the same resources.
 """
 
 from __future__ import annotations
@@ -15,7 +13,7 @@ from typing import Any
 import pytest
 
 from atlantide.core.errors import ProviderError
-from atlantide.reconcile.context import DEFAULT_NODE_TIMEOUT
+from atlantide.reconcile.env import DEFAULT_NODE_TIMEOUT
 from atlantide.state import MemoryStateBackend
 from tests.support import FakeProvider
 
@@ -59,9 +57,8 @@ def test_a_stuck_node_fails_rather_than_hanging_the_apply() -> None:
 
 
 def test_a_timeout_is_a_node_failure_not_an_interrupt() -> None:
-    """`asyncio.timeout` raises `TimeoutError`, not `CancelledError`, precisely so
-    it reads as this node failing — which is what lets the saga treat it like any
-    other provider failure rather than like a Ctrl-C."""
+    """`asyncio.timeout` raises `TimeoutError`, not `CancelledError`, so the saga
+    treats it as an ordinary provider failure rather than an interrupt."""
     h = _harness(A)
 
     with pytest.raises(ExceptionGroup) as caught:
@@ -74,8 +71,7 @@ def test_a_timeout_is_a_node_failure_not_an_interrupt() -> None:
 
 
 def test_a_stuck_node_triggers_the_saga_for_its_siblings() -> None:
-    """The point of making a timeout an ordinary failure: everything already
-    built gets compensated, instead of being stranded by a hang."""
+    """As an ordinary failure, a timeout compensates everything already built."""
     h = _harness(B)
 
     with pytest.raises(ExceptionGroup):
@@ -86,7 +82,7 @@ def test_a_stuck_node_triggers_the_saga_for_its_siblings() -> None:
 
 
 def test_a_node_within_its_budget_is_untouched() -> None:
-    """The ceiling must be invisible to an apply that simply takes a while."""
+    """The ceiling does not affect a node that finishes within it."""
     h = Harness(MemoryStateBackend())
     h.node_timeout = 30.0
     report = h.apply("Box('a', size=1)\n")
@@ -94,8 +90,8 @@ def test_a_node_within_its_budget_is_untouched() -> None:
 
 
 def test_the_default_budget_clears_the_slowest_real_wait() -> None:
-    """CloudFront polls up to 30 minutes for a distribution to deploy. A default
-    below that would fail correct applies, which is worse than not having one."""
+    """CloudFront polls up to 30 minutes for a distribution to deploy; a lower
+    default would fail correct applies."""
     from atlantide.providers.aws.handlers.cloudfront import (
         _DEPLOY_POLL_ATTEMPTS,
         _DEPLOY_POLL_DELAY,
@@ -105,7 +101,7 @@ def test_the_default_budget_clears_the_slowest_real_wait() -> None:
 
 
 def test_a_stuck_delete_also_fails(tmp_path: object) -> None:
-    """Destroy is the other direction and hangs just as easily."""
+    """A delete that never returns is bounded by the same timeout."""
 
     class StuckDelete(FakeProvider):
         async def delete(self, ctx: Any, res: Any) -> None:

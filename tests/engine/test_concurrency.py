@@ -43,7 +43,7 @@ async def test_two_engines_in_one_process_exclude_each_other() -> None:
     assert is_successful(held)
 
     engine = make_engine(local.TYPES, LocalProvider(), backend=backend)
-    result = await engine.apply(_config(Path("/tmp/atlantide-test-unused")))
+    result = await engine.apply(_config(Path("unused")))
     assert not is_successful(result)
     assert "locked" in str(result.failure())
 

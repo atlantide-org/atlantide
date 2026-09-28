@@ -22,7 +22,7 @@ from atlantide.providers.aws.resources import S3Bucket, S3BucketPolicy
 class SecureSite(Component):
     """A private, TLS-only S3 bucket for static-site assets.
 
-    Mirrors the built-in ``aws.SecureBucket`` — a worked shape for a shared L2
+    Mirrors the built-in ``aws.SecureBucket`` as an example of a shared L2
     construct: a bucket plus a hardening policy that denies any non-TLS request.
     """
 

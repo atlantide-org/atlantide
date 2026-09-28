@@ -1,8 +1,7 @@
-"""A third-party provider package, as one would actually be written.
+"""A third-party provider package, written as a real one would be.
 
-Nothing here imports from atlantide's internals beyond the public contract, and
-nothing is registered by hand — it is discovered the same way the shipped
-providers are. That is the point: if this works, the door is open.
+Nothing here imports atlantide internals beyond the public contract, and nothing
+is registered by hand: it is discovered the same way the shipped providers are.
 """
 
 from __future__ import annotations

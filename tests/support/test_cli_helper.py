@@ -1,9 +1,8 @@
 """The harness's own CLI driver.
 
-Worth testing directly rather than relying on the suites that use it: its
-assertions are guards over commands that normally succeed, so they stay silent
-until the day something breaks — which is exactly when the message has to be
-good, and the only time nobody is watching.
+Tested directly rather than through the suites that use it: its assertions
+guard commands that normally succeed, so they only fire when something breaks,
+and the failure message must be useful then.
 """
 
 from __future__ import annotations
@@ -23,8 +22,8 @@ def test_ok_returns_the_result_of_a_successful_command() -> None:
 
 
 def test_ok_fails_when_the_command_fails() -> None:
-    """The whole point: a setup step that quietly failed used to surface as an
-    unrelated assertion several lines later, with the error text discarded."""
+    """A failed setup step must fail here, not surface as an unrelated assertion
+    several lines later with the error text discarded."""
     with pytest.raises(AssertionError):
         cli.ok("schema", "does.NotExist")
 
@@ -55,8 +54,7 @@ def test_fails_requires_the_expected_code() -> None:
 
 
 def test_arguments_are_stringified() -> None:
-    """So a `Path` can be passed as itself instead of wrapped in `str()` at every
-    call site — which was most of the noise in the old invocations."""
+    """A `Path` can be passed as itself instead of wrapped in `str()`."""
     from pathlib import Path
 
     result = cli.run("schema", Path("does.NotExist"))

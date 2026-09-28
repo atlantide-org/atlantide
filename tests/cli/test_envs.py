@@ -1,10 +1,10 @@
 """``--env``: selecting one environment out of a config's ``Config``.
 
-The load-bearing assertion here is
+The key assertion is
 :func:`test_a_narrowed_plan_does_not_delete_the_other_environment`. Narrowing
 makes the config declare nothing for the environments left out, so without
-suppression every one of their nodes diffs as a delete — the flag an operator
-reaches for to be *careful* would destroy the environment they were protecting.
+suppression every one of their nodes diffs as a delete, and a flag meant to limit
+a run would destroy the excluded environments.
 
 Structured like ``test_inputs.py``, whose determinism contract this extends:
 the guarantee is over *(config, inputs, selected environments)*.
@@ -100,7 +100,7 @@ def test_a_narrowed_plan_does_not_delete_the_other_environment(tmp_path: Path) -
 
     dev's node stays in the changeset as a NOOP rather than vanishing, the same
     shape `--target` produces: a NOOP writes nothing, and keeping the node means
-    its stored ``input_hash`` is left exactly as it was, so the next full run
+    its stored ``input_hash`` is left unchanged, so the next full run
     sees no spurious change.
     """
     cfg = _config(tmp_path)
@@ -152,8 +152,8 @@ def test_a_stack_outside_the_environment_loop_is_untouched(tmp_path: Path) -> No
 def test_suppression_survives_an_in_config_cross_stack_reference(tmp_path: Path) -> None:
     """`inline_stack_outputs` rebuilds the registry when a config reads another
     stack's output, and every carried field has to survive that rebuild. Losing
-    the selection here would disable suppression for exactly the configs that
-    share a stack across environments — where a `common` stack lives."""
+    the selection here would disable suppression for configs that share a
+    `common` stack across environments."""
     cfg = _shared_config(tmp_path, cross_stack_ref=True)
     state = tmp_path / "s.db"
     cli.ok("apply", cfg, "--state", state, "-y")
@@ -208,7 +208,7 @@ def test_the_same_selection_produces_the_same_ir(tmp_path: Path) -> None:
 
 
 def test_a_different_selection_produces_different_ir(tmp_path: Path) -> None:
-    """The config really did describe something else, so the hash has to say so."""
+    """A different selection describes different infrastructure, so the hash must differ."""
     assert _built_hash(tmp_path, "a", "--env", "dev") != _built_hash(tmp_path, "b", "--env", "prod")
 
 

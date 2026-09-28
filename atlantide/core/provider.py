@@ -61,20 +61,17 @@ class Provider(ABC):
     def identity_field(self, resource_type: type[Resource]) -> str | None:
         """The computed field holding this type's provider-assigned id, if it has one.
 
-        ``read`` is handed a resource, not an id, so a type the provider can only
-        locate by an opaque id — an ACM certificate's ``arn``, a VPC's ``vpc_id`` —
-        is unreadable until that value is set on it. After an apply state restores
-        it; before one there is nothing to restore, which is what stops an existing
-        resource from being adopted. Naming the field is what lets a caller supply
-        it.
+        ``read`` receives a resource, not an id, so a type the provider can only
+        locate by an opaque id (an ACM certificate's ``arn``, a VPC's ``vpc_id``)
+        is unreadable until that value is set on it. After an apply, state restores
+        it; before one there is nothing to restore, so an existing resource cannot
+        be adopted unless a caller supplies the field named here.
 
-        Keyed on the *type*, not on an instance: the answer is a property of the
-        type, and asking it of an instance would force a caller who has only a
-        declaration to build a resource first — which means resolving its refs and
-        its secrets to read back a constant.
+        Keyed on the *type*, so a caller holding only a declaration need not build
+        a resource, resolving its refs and secrets, to read a constant.
 
         ``None``, the default, means ``read`` finds the resource from its declared
-        attributes and needs nothing restored. Not abstract for that reason: a
-        provider whose resources are all name-addressed implements nothing.
+        attributes. Not abstract, so a provider whose resources are all
+        name-addressed need not override it.
         """
         return None

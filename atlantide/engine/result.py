@@ -1,19 +1,25 @@
-"""Bridges between the pure ``Result`` layer and the raising async layer.
-
-The engine's two-tier error model (see :mod:`atlantide.engine.engine`) needs
-exactly two conversions, and every module in the package needs them — collected
-here so call sites stop open-coding ``Failure(x.failure())``.
-"""
+"""Bridges between the pure ``Result`` layer and the raising layer; see ``README.md``."""
 
 from __future__ import annotations
 
-from typing import Any, TypeVar
+from collections.abc import Callable
+from typing import Any
 
-from returns.result import Failure, Result
+from returns.result import Failure, Result, Success
 
 from atlantide.core import AtlantideError
 
-_T = TypeVar("_T")
+
+def catching[T](fn: Callable[[], T]) -> Result[T, AtlantideError]:
+    """Call ``fn``, returning its value as ``Success`` or its ``AtlantideError`` as ``Failure``.
+
+    Bridges a raising helper back into the ``Result`` layer. Only
+    ``AtlantideError`` is caught; any other exception is a bug and propagates.
+    """
+    try:
+        return Success(fn())
+    except AtlantideError as exc:
+        return Failure(exc)
 
 
 def forward_failure(result: Result[Any, AtlantideError]) -> Failure[AtlantideError]:
@@ -25,7 +31,7 @@ def forward_failure(result: Result[Any, AtlantideError]) -> Failure[AtlantideErr
     return Failure(result.failure())
 
 
-def raise_on_failure(result: Result[_T, AtlantideError]) -> _T:
+def raise_on_failure[T](result: Result[T, AtlantideError]) -> T:
     """Unwrap ``result``, raising its error.
 
     For the stages that run inside the state lock, where the ``Result`` cannot be

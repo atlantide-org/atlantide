@@ -9,9 +9,9 @@ in both directions and in a way examples cover badly:
 * a hash that moves when nothing changed is churn on every run — and, for an
   immutable field, a destroy-and-recreate.
 
-The second failure has already happened here once (a poisoned row manufacturing a
-change on ref-bearing fields), which is why "and no other node's hash moved" is
-asserted explicitly below rather than left implied.
+To guard against the second (e.g. a poisoned row manufacturing a change on
+ref-bearing fields), "and no other node's hash moved" is asserted explicitly
+below rather than left implied.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ def _dependents_of(ir: IRGraph, node_id: str) -> set[str]:
 
 @given(ir_graphs())
 def test_hashing_is_deterministic(ir: IRGraph) -> None:
-    """The headline claim, at the level it is actually computed."""
+    """Determinism at the level the hash is computed."""
     assert _hashes(ir) == _hashes(ir)
 
 
@@ -60,13 +60,13 @@ def test_every_node_gets_a_hash(ir: IRGraph) -> None:
 def test_changing_a_node_moves_its_hash_and_every_dependents_and_nothing_else(
     ir: IRGraph,
 ) -> None:
-    """The NOOP-skip promise in one sentence.
+    """The NOOP-skip guarantee.
 
-    A change must ripple to everything downstream — a dependent's resolved inputs
-    move when its dependency's outputs do, and the dependency hashes folded into
-    the payload are what carry that. And it must ripple no further: a node that
-    neither changed nor depends on the change has nothing to re-apply, and moving
-    its hash would mean a plan full of updates nobody asked for.
+    A change must ripple to everything downstream: a dependent's resolved inputs
+    move when its dependency's outputs do, carried by the dependency hashes folded
+    into the payload. It must ripple no further: a node that neither changed nor
+    depends on the change has nothing to re-apply, and moving its hash would mean
+    a plan full of unrequested updates.
     """
     before = _hashes(ir)
     target = ir.nodes[0]
@@ -101,8 +101,8 @@ def test_declaring_dependencies_in_another_order_hashes_the_same(ir: IRGraph) ->
 
 @given(ir_graphs(), st.text(min_size=1, max_size=6))
 def test_ignored_fields_never_move_the_hash(ir: IRGraph, noise: str) -> None:
-    """`ignore_changes` means "drift here is not my business". If it moved the
-    hash it would trigger the UPDATE it exists to prevent."""
+    """`ignore_changes` excludes a field's drift; if it moved the hash it would
+    trigger the UPDATE it exists to prevent."""
     ignoring = IRGraph(
         nodes=tuple(
             replace(node, properties={**node.properties, "vol": "a"}, ignore_changes=("vol",))
@@ -121,8 +121,8 @@ def test_ignored_fields_never_move_the_hash(ir: IRGraph, noise: str) -> None:
 
 @given(ir_graphs())
 def test_a_hash_is_a_sha256_digest(ir: IRGraph) -> None:
-    """Cheap shape check — a hash silently becoming a repr or an id would still
-    compare equal to itself and pass every law above."""
+    """Shape check: a hash becoming a repr or an id would still compare equal to
+    itself and pass every law above."""
     assert all(
         len(digest) == 64 and set(digest) <= set("0123456789abcdef")
         for digest in _hashes(ir).values()

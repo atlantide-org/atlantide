@@ -1,10 +1,9 @@
 """ACM certificate with DNS validation.
 
-Global to the config but the handler pins the client to ``us-east-1`` — CloudFront
-requires its viewer certificate to live there. The certificate is located by its
-``arn``. On request, ACM emits a DNS validation record (a CNAME); its name/type/
-value are surfaced as computed outputs so a ``Route53Record`` can create it and the
-certificate can validate.
+Has no ``region`` field: the handler pins the client to ``us-east-1``, where
+CloudFront requires its viewer certificate. The certificate is located by its
+``arn``. ACM emits a DNS validation record (a CNAME), exposed as computed outputs so
+a ``Route53Record`` can create it.
 """
 
 from __future__ import annotations
@@ -31,9 +30,9 @@ class AcmCertificate(TaggedResource):
     subject_alternative_names: list[str] = immutable(default_factory=list)
     validation_method: str = immutable(default="DNS")
     arn: str = computed()  # CertificateArn (the id)
-    validation_name: str = computed()  # the DNS validation record name
-    validation_type: str = computed()  # ...its type (CNAME)
-    validation_value: str = computed()  # ...its value
+    validation_name: str = computed()
+    validation_type: str = computed()  # CNAME
+    validation_value: str = computed()
 
     @model_validator(mode="after")
     def _validate(self) -> AcmCertificate:

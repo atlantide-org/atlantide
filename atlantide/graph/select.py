@@ -1,9 +1,8 @@
 """Selecting a subset of the graph: ``--target`` and its dependency closure.
 
-Targeting one resource never means only that resource. A subnet cannot be created
-before its VPC, and a VPC cannot be destroyed while a subnet still references it —
-so a selection is always closed over the graph, and which direction it closes in
-depends on what is about to happen to it.
+A selection is always closed over the graph: a subnet cannot be created before its
+VPC, and a VPC cannot be destroyed while a subnet references it. The closure
+direction depends on the action (see :func:`closure`).
 """
 
 from __future__ import annotations
@@ -19,9 +18,8 @@ from atlantide.graph.model import DiGraph
 class TargetError(AtlantideError):
     """A ``--target`` pattern matched nothing.
 
-    Deliberately an error rather than an empty selection: a typo would otherwise
-    read as "did everything you asked for", having done nothing — and the next
-    thing the operator does is assume the resource is fine.
+    Raised instead of returning an empty selection, so a mistyped target fails
+    rather than reporting success with no changes.
     """
 
 
@@ -48,10 +46,9 @@ def match_targets(
 ) -> frozenset[str]:
     """Resolve ``--target`` patterns to node ids.
 
-    Three spellings, because a full node id is precise and nobody wants to type
-    one: the id itself (``prod:aws.S3Bucket:assets``), the short form against the
+    Accepts the full id (``prod:aws.S3Bucket:assets``), the short form against the
     default stack (``aws.S3Bucket:assets``), or an fnmatch glob over either
-    (``prod:*`` , ``*:assets``).
+    (``prod:*``, ``*:assets``).
     """
     node_ids = list(known)
     selected: set[str] = set()

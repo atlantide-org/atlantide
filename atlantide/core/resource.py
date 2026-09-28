@@ -12,14 +12,14 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, ClassVar
+from typing import Any, ClassVar, override
 
-from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator
+from pydantic import BaseModel, ConfigDict, PrivateAttr, ValidationError, field_validator
+from pydantic_core import InitErrorDetails
 from pydantic_core.core_schema import ValidatorFunctionWrapHandler
 from returns.result import Failure, Result, Success
-from typing_extensions import override
 
-from atlantide.core.component import current_component_prefix
+from atlantide.core._component_prefix import active_prefix as _component_prefix
 from atlantide.core.errors import IRError, RegistryError
 from atlantide.core.fields import Mutability, field_mutability, physical_name_field
 from atlantide.core.lifecycle import Lifecycle
@@ -32,7 +32,10 @@ from atlantide.core.stack import (
     current_stack_region,
     current_stack_tags,
 )
-from atlantide.core.types import Ref, StackOutputRef, _Unset
+from atlantide.core.types import HANDLES, UNSET, Ref, StackOutputRef
+
+#: Shared by every resource that declares no lifecycle; ``Lifecycle`` is frozen.
+_DEFAULT_LIFECYCLE = Lifecycle()
 
 
 class Resource(BaseModel):
@@ -45,8 +48,10 @@ class Resource(BaseModel):
 
     _logical_name: str = PrivateAttr()
     _stack: str = PrivateAttr()
-    _lifecycle: Lifecycle = PrivateAttr(default_factory=Lifecycle)
-    #: Explicit ordering edges, as node ids. See ``depends_on`` in ``__init__``.
+    #: ``None`` means no overrides and reads back as ``_DEFAULT_LIFECYCLE``. Not
+    #: ``default_factory=Lifecycle``: pydantic inspects a factory's signature on
+    #: every instantiation.
+    _lifecycle: Lifecycle | None = PrivateAttr(default=None)
     _depends_on: tuple[str, ...] = PrivateAttr(default=())
 
     def __init__(
@@ -61,26 +66,23 @@ class Resource(BaseModel):
         """Declare a resource.
 
         ``depends_on`` orders this resource after others when the dependency is
-        real but not expressible as a value. Most ordering needs no declaring —
-        reading ``other.arn`` already creates the edge — so reach for this only
-        when nothing is read: an IAM policy that must propagate before the thing
-        using it starts, a bucket policy that must exist before an upload.
+        not expressed through a value. Reading ``other.arn`` already creates an
+        edge; ``depends_on`` covers cases where nothing is read, such as an IAM
+        policy that must propagate before its consumer starts.
 
-        Pass the resources themselves (or their node ids). The edge orders and
-        nothing more: it is deliberately excluded from the content hash, so
-        adding one never re-plans the resources it points at.
+        Entries are resources or node ids. The edge affects ordering only: it is
+        excluded from the content hash, so adding one does not re-plan its targets.
         """
         require_identifier(name, "resource")
-        # Namespace the logical name under any enclosing component (deterministic),
-        # so a component instantiated twice does not collide on node ids.
-        prefix = current_component_prefix()
+        # Namespace under the enclosing component so a component instantiated
+        # twice does not collide on node ids.
+        prefix = _component_prefix()
         if prefix is not None:
             name = f"{prefix}-{name}"
-        _apply_stack_defaults(type(self), name, data)  # region + name-prefix, before validation
+        _apply_stack_defaults(type(self), name, data)
         super().__init__(**data)
         self._logical_name = name
         self._stack = current_stack()
-        self._apply_stack_tags()
         if lifecycle is not None:
             self._lifecycle = lifecycle
         self._depends_on = _explicit_edges(depends_on)
@@ -94,59 +96,47 @@ class Resource(BaseModel):
     @property
     def depends_on(self) -> tuple[str, ...]:
         """Explicitly declared ordering edges, as node ids."""
-        return self._depends_on
+        value: tuple[str, ...] = self._private("_depends_on")
+        return value
 
     @field_validator("*", mode="wrap")
     @classmethod
     def _allow_refs_and_unset(cls, value: Any, handler: ValidatorFunctionWrapHandler) -> Any:
-        """Let Ref, SecretRef, StackOutputRef, and UNSET pass through any typed field.
+        """Let Ref, SecretRef, StackOutputRef, Transform, and UNSET pass through any typed field.
 
-        A value containing *any* live handle anywhere (even nested — a
-        ``StackReference`` output inside a ``tags`` dict, a ``Transform`` in an
-        ``env`` mapping) also skips validation here; it is re-validated at apply
-        time once the handle resolves. Testing only for nested ``Ref`` rejected
-        the other handle types in exactly the nested positions the inline
-        machinery exists to support.
+        A value containing a live handle at any depth (for example a
+        ``StackReference`` output inside a ``tags`` dict) is validated everywhere
+        except where a handle stands; see :func:`_validate_unless_handle`.
         """
         return _validate_unless_handle(value, handler)
 
-    def _apply_stack_tags(self) -> None:
-        """Merge active stack tags under this resource's own ``tags`` (own wins)."""
-        stack_tags = current_stack_tags()
-        if not stack_tags or "tags" not in type(self).model_fields:
-            return
-        # The raw stored value, not `getattr`: `__getattribute__` turns a stored
-        # UNSET into a Ref, which would send a computed `tags` field into the
-        # non-dict arm below instead of being tolerated.
-        own = self.__dict__.get("tags")
-        if isinstance(own, _Unset):
-            # A computed `tags` field is provider-owned output: there is nothing
-            # to merge at config time, and writing the stack tags over UNSET
-            # would hand back a literal where a Ref belongs.
-            return
-        if own is not None and not isinstance(own, dict):
-            # Runs after `super().__init__`, so replacing a non-dict would discard
-            # the declared value before `input_values()` sees it, dropping the
-            # property from the IR and its edge from the graph.
-            raise IRError(
-                f"{type(self).__name__}.tags must be a dict to merge with the stack's "
-                f"tags, got {type(own).__name__} — a Ref or Transform cannot be merged "
-                "at config time; build the full mapping yourself"
-            )
-        merged = {**stack_tags, **own} if isinstance(own, dict) else dict(stack_tags)
-        setattr(self, "tags", merged)  # noqa: B010 - dynamic field name
-
     @property
     def logical_name(self) -> str:
-        return self._logical_name
+        value: str = self._private("_logical_name")
+        return value
 
     @property
     def stack(self) -> str:
-        return self._stack
+        value: str = self._private("_stack")
+        return value
 
     @property
     def lifecycle(self) -> Lifecycle:
-        return self._lifecycle
+        lifecycle: Lifecycle | None = self._private("_lifecycle")
+        return _DEFAULT_LIFECYCLE if lifecycle is None else lifecycle
+
+    def _private(self, name: str) -> Any:
+        """A private attribute, read directly from pydantic's private store.
+
+        Private attributes are not in the instance ``__dict__``, so ordinary lookup
+        raises ``AttributeError`` internally before pydantic's ``__getattr__`` finds
+        the value. These accessors run on every ``node_id`` access. Names not in the
+        store fall back to ordinary lookup.
+        """
+        private = self.__pydantic_private__
+        if private is not None and name in private:
+            return private[name]
+        return getattr(self, name)
 
     @classmethod
     def provider_name(cls) -> str:
@@ -159,12 +149,19 @@ class Resource(BaseModel):
 
     @property
     def node_id(self) -> str:
+        private = self.__pydantic_private__
+        if private is not None and "_stack" in private and "_logical_name" in private:
+            return format_node_id(private["_stack"], self.type_name(), private["_logical_name"])
         return format_node_id(self._stack, self.type_name(), self._logical_name)
 
     @override
     def __getattribute__(self, item: str) -> Any:
+        if item[:1] == "_":
+            # Pydantic never makes an underscore name a field, so the UNSET->Ref
+            # rewrite below cannot apply.
+            return super().__getattribute__(item)
         value = super().__getattribute__(item)
-        if isinstance(value, _Unset) and item in type(self).model_fields:
+        if value is UNSET and item in type(self).model_fields:
             return Ref(node_id=self.node_id, attr=item)
         return value
 
@@ -188,12 +185,52 @@ class Resource(BaseModel):
 def _validate_unless_handle(value: Any, handler: ValidatorFunctionWrapHandler) -> Any:
     """The shared wrap-validator body for ``Resource`` and ``Nested``.
 
-    UNSET and anything containing a live handle skip validation now and are
-    re-validated at apply once the handle resolves.
+    UNSET and a bare handle pass through unvalidated. A value with a handle
+    nested inside it is validated as written, and only errors whose input holds a
+    handle are dropped: ``{"k": ref, "n": 7}`` on a ``dict[str, str]`` still
+    rejects the ``7``. The check is all it does: the value is stored exactly as
+    written (a route dict stays a dict, no defaults filled in), so its canonical
+    form and hash match what it had before handle-bearing values were checked.
+    Nothing re-validates the field once its handles resolve at apply.
     """
-    if isinstance(value, _Unset) or contains_handle(value):
+    if value is UNSET or isinstance(value, HANDLES):
         return value
-    return handler(value)
+    if not contains_handle(value):
+        return handler(value)
+    try:
+        handler(value)
+    except ValidationError as exc:
+        # An unknown key is wrong whatever its value, so `extra_forbidden` (whose
+        # input is the value) is never excused by a handle.
+        real = [
+            err
+            for err in exc.errors()
+            if err["type"] == "extra_forbidden" or not contains_handle(err["input"])
+        ]
+        if real:
+            raise _narrowed(exc, real) from None
+    return value
+
+
+def _narrowed(exc: ValidationError, errors: list[Any]) -> ValidationError:
+    """``exc`` restricted to ``errors``, so a handle is not reported as a type error.
+
+    Falls back to ``exc`` whole for an error type pydantic cannot rebuild (a
+    validator's custom error).
+    """
+    details: list[InitErrorDetails] = [
+        {
+            "type": err["type"],
+            "loc": err["loc"],
+            "input": err["input"],
+            **({"ctx": err["ctx"]} if "ctx" in err else {}),  # type: ignore[typeddict-item]
+        }
+        for err in errors
+    ]
+    try:
+        return ValidationError.from_exception_data(exc.title, details)
+    except KeyError:
+        return exc
 
 
 def _apply_stack_defaults(cls: type[Resource], name: str, data: dict[str, Any]) -> None:
@@ -203,6 +240,7 @@ def _apply_stack_defaults(cls: type[Resource], name: str, data: dict[str, Any]) 
       the caller did not pass one.
     - physical name: when a stack ``name_prefix`` is active and the marked name
       field is omitted, compose it as ``{prefix}-{logical-name}-{stack}``.
+    - ``tags``: the active stack's tags, merged under the resource's own.
 
     An explicit value always wins.
     """
@@ -215,18 +253,44 @@ def _apply_stack_defaults(cls: type[Resource], name: str, data: dict[str, Any]) 
         field = physical_name_field(cls)
         if field is not None and field not in data:
             data[field] = f"{prefix}-{name}-{current_stack()}"
+    _merge_stack_tags(cls, data)
+
+
+def _merge_stack_tags(cls: type[Resource], data: dict[str, Any]) -> None:
+    """Merge active stack tags under the resource's own ``tags`` (own wins).
+
+    Runs before validation, so a stack tag of the wrong type is rejected by the
+    field's own type like any other value.
+    """
+    stack_tags = current_stack_tags()
+    field = cls.model_fields.get("tags")
+    if not stack_tags or field is None:
+        return
+    own = data["tags"] if "tags" in data else field.get_default(call_default_factory=True)
+    if own is UNSET:
+        # A computed `tags` field is provider output; overwriting UNSET would
+        # replace its Ref with a literal.
+        return
+    if own is not None and not isinstance(own, dict):
+        # Replacing a non-dict here would discard the declared value, dropping
+        # the property from the IR and its edge from the graph.
+        raise IRError(
+            f"{cls.__name__}.tags must be a dict to merge with the stack's "
+            f"tags, got {type(own).__name__} — a Ref or Transform cannot be merged "
+            "at config time; build the full mapping yourself"
+        )
+    data["tags"] = {**stack_tags, **own} if isinstance(own, dict) else stack_tags
 
 
 def output(name: str, value: Any) -> StackOutputRef:
     """Export ``value`` (a literal or a resource ``Ref``) under ``name``.
 
-    Recorded into the active registry, namespaced by the current stack. Must be
-    called during config evaluation. Returns a handle to the export so a later
-    stack in the *same* config can consume it without repeating the name — it is
-    exactly ``StackReference(<this stack>).output(name)``, and is inlined into a
-    real dependency edge (see :func:`atlantide.core.inline.inline_stack_outputs`).
-    A stack applied by a *separate* config must still name it via
-    :class:`StackReference` (resolved from committed state at apply).
+    Recorded into the active registry, namespaced by the current stack; must be
+    called during config evaluation. The returned handle is equivalent to
+    ``StackReference(<this stack>).output(name)`` and lets a later stack in the
+    same config consume the export; it is inlined into a dependency edge (see
+    :func:`atlantide.core.inline.inline_stack_outputs`). A stack in a separate
+    config uses :class:`StackReference`, resolved from committed state at apply.
     """
     registry = active_registry()
     if registry is None:
@@ -238,18 +302,15 @@ def output(name: str, value: Any) -> StackOutputRef:
 class Nested(BaseModel):
     """Base for a structured value inside a resource field.
 
-    A security-group rule, a route, an alias target: things with a shape worth
-    typing, which are not resources of their own. Two behaviours they need and a
-    plain ``BaseModel`` does not have:
+    For example a security-group rule, a route, or an alias target. Differences
+    from a plain ``BaseModel``:
 
-    * a field may hold a :class:`~atlantide.core.types.Ref` — ``Route(gateway_id=
-      igw.internet_gateway_id)`` is the whole point of the type, and pydantic
-      would otherwise reject it as "not a string";
-    * unknown keys are refused, so a typo in a nested field is caught rather than
-      silently ignored.
+    * a field may hold a :class:`~atlantide.core.types.Ref` (``Route(gateway_id=
+      igw.internet_gateway_id)``), which pydantic would otherwise reject;
+    * unknown keys are refused, so a typo in a nested field raises.
 
-    Refs inside one are found by the tree walkers, so the dependency edge forms
-    exactly as it would from a top-level field.
+    The tree walkers find Refs inside a ``Nested``, so dependency edges form as
+    they do from a top-level field.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -262,25 +323,19 @@ class Nested(BaseModel):
 
 
 class DataSource(Resource):
-    """A read-only lookup: something that exists already and is not managed here.
+    """A read-only lookup of an object that exists already and is not managed here.
 
-    Deliberately a :class:`Resource` subclass rather than a fifth method on the
-    provider ABC. A data source *is* a resource whose create and update are reads
-    and whose delete is nothing — ``providers/local``'s ``SourceFile`` already was
-    one, hand-rolled. Forking the executor, the diff, the state model and the lock
-    to express that would buy nothing the type flag does not.
-
-    What follows from the subclassing:
+    A :class:`Resource` whose create and update are reads and whose delete is a
+    no-op (``providers/local``'s ``SourceFile`` is one). Consequently:
 
     * inputs are the query and are immutable; outputs are what was found;
     * the value is read once at apply and pinned in state, so a plan performs no
-      provider I/O and two runs of one config still produce identical IR;
-    * it is never destroyed — ``destroy`` drops the row without calling anyone,
-      because atlantide did not create the thing and must not remove it.
+      provider I/O and two runs of one config produce identical IR;
+    * ``destroy`` drops the state row without a provider call, since atlantide
+      did not create the object.
 
-    The re-read-on-every-plan tier that a *latest AMI* lookup needs is where the
-    determinism budget gets spent, and is deliberately not here yet: a half-wired
-    flag in the public model is worse than an absent one.
+    Re-reading on every plan (as a latest-AMI lookup needs) is not supported: it
+    breaks plan determinism.
     """
 
 
@@ -291,11 +346,11 @@ class ResourceRegistry:
         self._resources: dict[str, Resource] = {}
         self._policy_bindings: list[PolicyBinding] = []
         self._outputs: dict[str, Any] = {}
-        #: The config inputs this evaluation actually read (see `ConfigAPI.input`).
+        #: The config inputs this evaluation read (see `ConfigAPI.input`).
         self.inputs: dict[str, Any] = {}
-        #: Every environment a `Config` in this evaluation declared, and the
-        #: subset `--env` selected. The planner needs both to tell a
-        #: declared-but-unselected environment from one the config dropped.
+        #: Every environment a `Config` in this evaluation declared, and the subset
+        #: `--env` selected. The planner uses both to distinguish an unselected
+        #: environment from one the config no longer declares.
         self.envs_declared: tuple[str, ...] = ()
         self.envs_selected: tuple[str, ...] = ()
 
@@ -363,9 +418,8 @@ def collecting() -> Iterator[ResourceRegistry]:
 def _explicit_edges(declared: Sequence[Resource | str]) -> tuple[str, ...]:
     """Normalise ``depends_on=`` to node ids.
 
-    A bare string is rejected rather than iterated: ``depends_on="a"`` would
-    otherwise become three single-character edges, which is the same trap
-    ``Lifecycle.aliases`` guards against.
+    A bare string is rejected rather than iterated into single-character edges,
+    as ``Lifecycle.aliases`` does.
     """
     require_sequence(
         declared,

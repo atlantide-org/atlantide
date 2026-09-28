@@ -1,36 +1,36 @@
-"""Turning flags and ``atlantide.toml`` into the objects a command runs against.
+"""Turning ``atlantide.toml`` and a resolved state target into providers and engines.
 
-Every command starts the same way — find the project, resolve which config and
-which state, build providers, build an engine — and none of that is what the
-command is *about*. Keeping it here leaves each command body to the thing it
-actually does, and means there is one place to look when the answer to "which
-state did that run touch?" is not the expected one.
+Every command starts the same way: find the project, resolve config and state,
+build providers, build an engine. Config resolution lives in
+:mod:`atlantide.cli.config_source` and state in :mod:`atlantide.cli.target`; this
+module wires what they resolved into an :class:`~atlantide.engine.Engine`.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
-from pathlib import Path
 from typing import Any
 
+from returns.result import Failure
 from rich.markup import escape
 
-from atlantide.cli.console import console
-from atlantide.cli.context import current, set_json_mode
-from atlantide.cli.errors import fail
-from atlantide.cli.options import resolve_inputs
+from atlantide.cli.console import out
+from atlantide.cli.context import current
+from atlantide.cli.errors import fail, fail_error
 from atlantide.cli.project import ProjectConfig
-from atlantide.cli.target import StateTarget, load_project
-from atlantide.core import ProviderRegistry
+from atlantide.cli.target import StateTarget
+from atlantide.components import mount as mount_components
+from atlantide.core import ComponentError, ProviderRegistry
+from atlantide.core.errors import RegistryError
 from atlantide.core.plugin import Discovery
-from atlantide.engine import Engine, Plan
+from atlantide.engine import Engine
 from atlantide.graph.schedule import DEFAULT_PARALLELISM
 from atlantide.lang import LanguageSurface
 from atlantide.providers.loader import discover
-from atlantide.reconcile.context import DEFAULT_NODE_TIMEOUT
+from atlantide.reconcile.env import DEFAULT_NODE_TIMEOUT
 from atlantide.state import MemoryStateBackend
+from atlantide.util.errors import attach_also_failed
 
 
 def version() -> str:
@@ -55,10 +55,9 @@ def provider_settings(
 ) -> dict[str, dict[str, Any]]:
     """Per-provider settings tables, as each plugin's factory expects them.
 
-    AWS's keys are still spelled at the top level of ``atlantide.toml``
-    (``aws_region``, ``aws_profile``, ...) because that is what existing projects
-    have; they are gathered into the provider's table here rather than making
-    every project rewrite its config for a mechanism it did not ask for.
+    AWS's keys are spelled at the top level of ``atlantide.toml``
+    (``aws_region``, ``aws_profile``, ...); they are gathered into the provider's
+    table here, so the plugin factory sees the same shape as every other plugin.
     """
     aws: dict[str, Any] = {
         "parallelism": parallelism or project.parallelism or DEFAULT_PARALLELISM,
@@ -67,15 +66,23 @@ def provider_settings(
         "endpoint": project.aws_endpoint,
         "aliases": project.aws_aliases,
     }
-    return {"aws": {key: value for key, value in aws.items() if value is not None}}
+    # The local provider resolves relative paths against the project root and
+    # confines them to it; without a project file there is no root to hand it.
+    local: dict[str, Any] = dict(project.provider_tables.get("local", {}))
+    local.pop("root", None)  # the root is the project's, not a user setting
+    if project.root is not None:
+        local["root"] = str(project.root)
+    return {
+        "aws": {key: value for key, value in aws.items() if value is not None},
+        "local": local,
+    }
 
 
 def surface(found: Discovery) -> LanguageSurface:
     """What config may import, given what is installed.
 
-    A plugin's resource types are useless if config cannot name the module they
-    live in — which is why the registry alone was never enough to make
-    third-party providers work.
+    Registering a provider is not enough: config must also be able to import the
+    modules its resource types live in.
     """
     return LanguageSurface(extra=frozenset(found.modules()))
 
@@ -84,43 +91,71 @@ def discovered_surface() -> LanguageSurface:
     return surface(discovery())
 
 
-def providers(
+def build_providers(
     project: ProjectConfig, region: str | None = None, parallelism: int | None = None
 ) -> tuple[ProviderRegistry, dict[str, Any]]:
     """Build the provider registry from the discovered plugins.
 
-    ``parallelism`` reaches the AWS plugin's factory because its client pool has
-    to be sized to the concurrency the scheduler will actually use — a pool too
-    small silently serialises the apply.
+    ``parallelism`` reaches the AWS plugin's factory because its client pool must
+    match the scheduler's concurrency; a smaller pool serialises the apply.
     """
     found = discovery()
+    _refuse_contested(found)
     settings = provider_settings(project, region, parallelism)
     registry = ProviderRegistry()
     for plugin in found.plugins:
         try:
-            registry.register(plugin.factory(settings.get(plugin.name, {})))
+            provider = plugin.factory(settings.get(plugin.name, {}))
         except Exception as exc:
             fail(f"provider {plugin.name!r} could not be configured: {exc}")
+        # Checked here rather than by the registry: a provider built under another
+        # plugin's name would register cleanly when that plugin is not installed,
+        # and resources naming that provider would be routed to the wrong code.
+        misnamed = plugin.provider_error(provider)
+        if misnamed is not None:
+            fail_error(_unregistered(plugin.name, misnamed))
+        registered = registry.register(provider)
+        if isinstance(registered, Failure):
+            fail_error(_unregistered(plugin.name, str(registered.failure())))
     for problem in found.errors:
         # A plugin that failed to load is reported, not fatal: the run may not need
-        # it, and the commands used to diagnose it must keep working.
-        console.print(
+        # it, and diagnostic commands must keep working.
+        out().print(
             f"[yellow]warning[/] provider plugin {problem.name!r} was not loaded: "
             f"{escape(problem.detail)}"
         )
     return registry, found.types()
 
 
-# -- state and engines --------------------------------------------------------
+def _refuse_contested(found: Discovery) -> None:
+    """Abort when discovery refused a plugin over its identity.
+
+    Such a plugin is not in ``found.plugins`` but claimed a name that is not
+    unambiguously its own, so resources of that name may belong to it. Every
+    refusal is reported: the first as the error, the rest attached to it.
+    """
+    refused = [
+        _unregistered(problem.name, problem.detail) for problem in found.errors if problem.fatal
+    ]
+    if refused:
+        first, *rest = refused
+        attach_also_failed(first, rest)
+        fail_error(first)
 
 
-def target(state: Path | None, project: ProjectConfig, *, announce: bool = True) -> StateTarget:
-    """This command's state target. Announced unless the output is machine-readable,
-    where the same value rides along as a ``state`` field instead."""
-    resolved = StateTarget.resolve(state, project)
-    if announce:
-        resolved.announce()
-    return resolved
+def _unregistered(plugin: str, detail: str) -> RegistryError:
+    """Why ``plugin``'s provider was refused, as the error a command aborts with.
+
+    Fatal, unlike a plugin that failed to load. A plugin refused at registration
+    did load, so config can import its resource types and would compile without
+    its provider: the result is an "unknown provider" error far from the cause, or
+    a plan that omits the provider owning resources in state. A plugin refused over
+    its identity may claim resources it does not own.
+    """
+    return RegistryError(f"provider plugin {plugin!r} could not be registered: {detail}")
+
+
+# -- engines ------------------------------------------------------------------
 
 
 def engine_for(
@@ -128,115 +163,60 @@ def engine_for(
     *,
     region: str | None = None,
     parallelism: int | None = None,
+    fuel: int | None = None,
 ) -> Engine:
-    """The engine for a state-touching command, wired to ``state_target``."""
+    """The engine for a state-touching command, wired to ``state_target``.
+
+    ``fuel`` is ``--fuel``; ``None`` falls back to the project's ``[lang] fuel``.
+
+    The backend is opened last, so a failure building anything else cannot leave
+    it open.
+    """
     project = state_target.project
-    registry, types = providers(project, region, parallelism)
+    _mount(project)
+    registry, types = build_providers(project, region, parallelism)
+    secrets = state_target.secrets()
+    lang = discovered_surface()
+    backend = state_target.open()
+    try:
+        return Engine(
+            registry,
+            backend,
+            types,
+            secrets=secrets,
+            parallelism=parallelism or project.parallelism,
+            lock_policy=state_target.lock_policy,
+            node_timeout=project.state_backend.node_timeout or DEFAULT_NODE_TIMEOUT,
+            surface=lang,
+            fuel=fuel if fuel is not None else project.fuel,
+        )
+    except BaseException:
+        backend.close()
+        raise
+
+
+def stateless_engine(project: ProjectConfig, *, fuel: int | None = None) -> Engine:
+    """Engine for compile-only commands (graph/build); touches no state or keyfile."""
+    _mount(project)
+    registry, types = build_providers(project)
     return Engine(
         registry,
-        state_target.open(),
+        MemoryStateBackend(),
         types,
-        secrets=state_target.secrets(),
-        parallelism=parallelism or project.parallelism,
-        lock_policy=project.state_backend.lock_policy(),
-        node_timeout=project.state_backend.node_timeout or DEFAULT_NODE_TIMEOUT,
         surface=discovered_surface(),
+        fuel=fuel if fuel is not None else project.fuel,
     )
 
 
-def stateless_engine(project: ProjectConfig) -> Engine:
-    """Engine for compile-only commands (graph/build); touches no state or keyfile."""
-    registry, types = providers(project)
-    return Engine(registry, MemoryStateBackend(), types, surface=discovered_surface())
+def _mount(project: ProjectConfig) -> None:
+    """Make vendored published components importable as ``atlantide.components.*``.
 
-
-def machine_readable(json_out: bool) -> None:
-    """Declare that stdout belongs to a JSON document, so every human-facing
-    print — banners, warnings, errors — routes to stderr instead of corrupting it."""
-    set_json_mode(json_out)
-
-
-def run_header(
-    command: str, cfg: Path, state_target: StateTarget, plan_obj: Plan, planned: int
-) -> dict[str, Any]:
-    """What identifies this run in its audit record.
-
-    The events alone are a list of things that happened to nothing in
-    particular; this is what makes the file a trail.
-    """
-    return {
-        "command": command,
-        "config": str(cfg),
-        "state": state_target.label,
-        "version": version(),
-        "inputs": plan_obj.compiled.inputs,
-        "envs": list(plan_obj.compiled.envs_selected),
-        "planned": planned,
-    }
-
-
-# -- the config a command was pointed at --------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class ConfigRun:
-    """A config located, read, and paired with the inputs it will be given.
-
-    One object because the four are never useful apart: a path with no source is
-    a file that may not exist, and inputs are only meaningful against the project
-    whose ``[inputs]`` table they were merged over.
-    """
-
-    project: ProjectConfig
-    path: Path
-    source: str
-    inputs: dict[str, Any]
-    #: The environments ``--env`` named, or ``None`` for every declared one.
-    #: ``None`` differs from ``()``, which would mean "act on nothing".
-    envs: tuple[str, ...] | None = None
-
-
-def config_run(
-    config: Path | None,
-    var: list[str] | None,
-    var_file: list[Path] | None,
-    env: list[str] | None = None,
-) -> ConfigRun:
-    """Resolve, read and parameterise the config a command was pointed at.
-
-    Reading the source here rather than inside the engine block is deliberate: a
-    mistyped path should fail before a state backend is opened and a lock taken,
-    not after.
-    """
-    project = load_project()
-    path = resolve_config(config, project)
-    return ConfigRun(
-        project=project,
-        path=path,
-        source=read_config(path),
-        inputs=resolve_inputs(project.inputs, var_file, var),
-        envs=tuple(env) if env else None,
-    )
-
-
-def resolve_config(config: Path | None, project: ProjectConfig) -> Path:
-    """The config to evaluate. A path from the toml is relative to the project
-    root; one typed on the command line is relative to where it was typed."""
-    if config is not None:
-        return config
-    if project.config:
-        return project.resolve(project.config)
-    fail("no config given and none set in atlantide.toml (expected a .py path)")
-
-
-def read_config(cfg: Path) -> str:
-    """The config's source, or a diagnostic naming the path.
-
-    A mistyped path is the most ordinary mistake there is, and an unguarded
-    ``read_text`` answers it with a Python traceback — which under ``--json``
-    is also not a document any consumer can read.
+    Done here, before any config is evaluated, rather than for every command: each
+    vendored tree is re-hashed against atlantide.lock, and a tampered one must
+    fail the commands that would import it, not ``state unlock`` or ``--help``.
+    A no-op until ``atlantide component vendor`` has run.
     """
     try:
-        return cfg.read_text()
-    except OSError as exc:
-        fail(f"cannot read config {cfg}: {exc.strerror or exc}")
+        mount_components(project.directory)
+    except ComponentError as exc:
+        fail_error(exc)

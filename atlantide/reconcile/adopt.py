@@ -1,24 +1,22 @@
-"""Adopt an existing cloud resource into state, without creating anything.
+"""Adopt an existing cloud resource into state without creating it.
 
-The engine can only manage what state records, and until now the only way to get
-a row was to create the resource. That makes an account full of infrastructure
-unreachable: the config describes it exactly, and the first apply tries to build
-a second copy of everything.
+The engine manages only what state records, and an apply writes a row only by
+creating the resource. Without import, the first apply creates a second copy of
+existing infrastructure even when config describes it exactly.
 
-Import closes that. The user declares the resource as normal and names the node;
-this reads the live resource through the provider, checks it against what config
-declares, and writes the :class:`~atlantide.state.backend.StateNode` an apply
-would have written — so the next plan is a NOOP rather than a CREATE.
+The user declares the resource in config and names the node. Adoption reads the
+live resource through the provider, checks it against config, and writes the
+:class:`~atlantide.state.model.StateNode` an apply would write, so the next plan
+reports NOOP rather than CREATE.
 
-Anchored on config rather than on a bare type-and-id pair because
-:meth:`~atlantide.core.provider.Provider.read` takes a *resource*, not an id:
-there is nothing to read with until config has said what the resource is. It also
-means the row carries the same Merkle ``input_hash`` an apply would have
-computed, which is the whole reason the following plan can skip it.
+Adoption is anchored on config rather than a type-and-id pair because
+:meth:`~atlantide.core.provider.Provider.read` takes a *resource*, not an id. The
+row then carries the same Merkle ``input_hash`` an apply computes, so the next
+plan skips it.
 
-Distinct from :func:`~atlantide.providers.aws.handlers.base.create_or_adopt`,
-which is a fallback *inside* a create for a resource this node already made.
-Nothing here calls a mutating provider method at all.
+Distinct from :func:`~atlantide.providers.aws.handlers.faults.create_or_adopt`,
+a fallback *inside* a create for a resource this node already made. Nothing here
+calls a mutating provider method.
 """
 
 from __future__ import annotations
@@ -33,7 +31,8 @@ from atlantide.core.fields import sensitive_fields
 from atlantide.core.provider import Provider
 from atlantide.core.resource import Resource
 from atlantide.ir.model import IRGraph, IRNode
-from atlantide.reconcile.context import ApplyEnv, LiveOutputs, provider_for
+from atlantide.reconcile.applied import ref_digests
+from atlantide.reconcile.env import ApplyEnv, LiveOutputs, provider_for
 from atlantide.reconcile.refresh import Drift, NodeDrift, classify_drift, resolved_properties
 from atlantide.reconcile.resolve import (
     live_outputs,
@@ -41,18 +40,20 @@ from atlantide.reconcile.resolve import (
     seal_outputs,
     secret_digests,
 )
-from atlantide.state.backend import (
+from atlantide.state import (
     NO_INPUT_HASH,
-    STATUS_CREATED,
+    NodeStatus,
     StateGraph,
     StateNode,
 )
 
 
 class ImportStatus(StrEnum):
-    """What became of one request. An enum rather than loose strings so a renderer
-    can cover the set exhaustively, as :class:`~atlantide.reconcile.refresh.Drift`
-    already lets the drift report do."""
+    """Result of one import request.
+
+    An enum so a renderer can cover every case, as with
+    :class:`~atlantide.reconcile.refresh.Drift`.
+    """
 
     #: The row was written; the next plan will report this node unchanged.
     IMPORTED = "imported"
@@ -64,7 +65,8 @@ class ImportStatus(StrEnum):
     NOT_FOUND = "not_found"
     #: Already in state. Nothing written unless ``force``.
     ALREADY_TRACKED = "already_tracked"
-    #: Cannot be attempted — unknown node, missing dependency, or a missing id.
+    #: Cannot be attempted (unknown node, missing dependency, or missing id), or
+    #: the read failed; ``detail`` says which.
     BLOCKED = "blocked"
 
 
@@ -74,9 +76,23 @@ class ImportRequest:
 
     node_id: str
     external_id: str | None = None
-    #: Overrides the provider's declared identity field, for the rare type whose
-    #: read keys on something else.
+    #: Overrides the provider's declared identity field, for a type whose read
+    #: keys on another field.
     id_field: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AdoptOptions:
+    """How a batch treats what it finds; the same for every request in it."""
+
+    #: Record each adopted row. ``False`` is a dry run: everything is checked and
+    #: nothing is written.
+    write: bool = True
+    #: Adopt a resource whose live state differs from config instead of refusing
+    #: it. The row is then poisoned so the next plan shows the drift.
+    allow_drift: bool = False
+    #: Re-adopt a node state already tracks, overwriting its row.
+    force: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +105,7 @@ class ImportOutcome:
     identity_field: str | None = None
     external_id: str | None = None
     drift: NodeDrift | None = None
-    #: Names of the outputs recorded — names only, since a value may be sealed.
+    #: Names of the recorded outputs; values are omitted because they may be sealed.
     recorded: tuple[str, ...] = ()
     detail: str = ""
 
@@ -99,10 +115,10 @@ class ImportOutcome:
 
     @property
     def unresolved(self) -> bool:
-        """Whether this request ended without adopting anything it could have.
+        """Whether this request ended without adopting a resource it could have.
 
-        A domain fact, not an exit code: the CLI decides what to do with it, as it
-        does with :attr:`~atlantide.reconcile.refresh.DriftReport.has_drift`.
+        A domain fact, not an exit code: the CLI interprets it, as it does
+        :attr:`~atlantide.reconcile.refresh.DriftReport.has_drift`.
         """
         return self.status in (
             ImportStatus.DRIFTED,
@@ -112,9 +128,11 @@ class ImportOutcome:
 
     @property
     def unobserved(self) -> tuple[str, ...]:
-        """Fields the provider's read did not report, so this import's "matches
-        config" verdict says nothing about them. Derived, never stored: it is the
-        drift verdict's own scope and cannot be allowed to disagree with it."""
+        """Fields the provider's read did not report.
+
+        The import's match verdict does not cover these fields. Derived from
+        ``drift`` rather than stored, so it always agrees with the drift verdict.
+        """
         return self.drift.unobserved if self.drift else ()
 
 
@@ -125,44 +143,35 @@ async def adopt(
     hashes: Mapping[str, str],
     prior: StateGraph,
     env: ApplyEnv,
-    write: bool = True,
-    allow_drift: bool = False,
-    force: bool = False,
+    options: AdoptOptions,
 ) -> list[ImportOutcome]:
-    """Adopt each request in turn, returning one outcome per request.
+    """Adopt each request in turn and return one outcome per request.
 
-    Sequential, and in the order given — which the caller sorts topologically.
-    A node's ``$ref`` inputs resolve against the outputs of the nodes it depends
-    on, so a VPC has to be adopted before the subnet that references it can even
-    be read. Concurrency would break that, and there is nothing to gain from it:
-    adoption is a one-off, and the reads are few.
+    Requests run sequentially in the given order, which the caller sorts
+    topologically: a node's ``$ref`` inputs resolve against its dependencies'
+    outputs, so a VPC must be adopted before a subnet that references it can be read.
 
-    Nothing is written for a request that fails, and a failure does not stop the
-    ones after it: a partial adoption is resumable, and stopping at the first
-    problem in a twenty-node batch just means finding the problems one per run.
+    A failed request writes nothing and does not stop later requests, so one run
+    reports every problem in the batch and a partial adoption is resumable.
     """
     session = _Session(
         env=env,
         hashes=hashes,
         nodes={node.id: node for node in ir.nodes},
-        # Seeded from committed state and extended as this batch proceeds, so a
-        # reference to a node adopted moments ago resolves like any other.
+        # Seeded from committed state and extended per adopted node, so a ref to a
+        # node adopted earlier in this batch resolves.
         outputs=live_outputs(prior, env.secrets),
         tracked=set(prior.nodes),
-        write=write,
-        allow_drift=allow_drift,
-        force=force,
+        options=options,
     )
     return [await session.adopt(request) for request in requests]
 
 
 @dataclass(slots=True)
 class _Session:
-    """One batch's shared context, and the per-node steps that run against it.
+    """Shared context for one batch.
 
-    A class rather than a chain of parameters because every step needs the same
-    six things and the last two — ``outputs`` and ``tracked`` — are what one
-    node's adoption hands to the next.
+    ``outputs`` and ``tracked`` carry state from one node's adoption to the next.
     """
 
     env: ApplyEnv
@@ -170,13 +179,11 @@ class _Session:
     nodes: Mapping[str, IRNode]
     outputs: LiveOutputs
     tracked: set[str]
-    write: bool
-    allow_drift: bool
-    force: bool
+    options: AdoptOptions
     ctx: Context = field(default_factory=Context)
 
     async def adopt(self, request: ImportRequest) -> ImportOutcome:
-        """One node: check it can be adopted, read it, compare it, record it."""
+        """Check, read, compare and record one node."""
         node = self.nodes.get(request.node_id)
         if node is None:
             return ImportOutcome(
@@ -191,8 +198,7 @@ class _Session:
 
 @dataclass(slots=True)
 class _Adoption:
-    """One node's adoption. Holds what every step and every outcome shares, so
-    neither the checks nor the result construction has to pass it around."""
+    """One node's adoption, holding the context shared by every step and outcome."""
 
     session: _Session
     request: ImportRequest
@@ -204,16 +210,15 @@ class _Adoption:
     def refusal(self) -> ImportOutcome | None:
         """The first reason this node cannot be adopted, or ``None`` to proceed.
 
-        Resolves ``identity_field`` on the way through, since two of the checks
-        are about it.
+        Also resolves ``identity_field``, which two of the checks depend on.
         """
         session = self.session
-        if self.node.id in session.tracked and not session.force:
+        if self.node.id in session.tracked and not session.options.force:
             return self.outcome(ImportStatus.ALREADY_TRACKED, detail="already in state")
         if missing := [dep for dep in sorted(self.node.dependencies) if dep not in session.tracked]:
-            # A `$ref` to a node with no recorded outputs resolves to nothing
-            # usable, and the read would then look for a resource whose inputs are
-            # half unresolved — matching nothing, or something unrelated.
+            # A `$ref` to a node with no recorded outputs does not resolve, so the
+            # read would match on partially resolved inputs and find nothing or an
+            # unrelated resource.
             return self.outcome(
                 ImportStatus.BLOCKED,
                 detail=f"depends on nodes not in state yet: {', '.join(missing)}",
@@ -242,13 +247,17 @@ class _Adoption:
 
     async def run(self) -> ImportOutcome:
         """Read the live resource, compare it to config, and record it."""
-        # Restoring the id onto its computed field is exactly what state does
-        # after an apply, so `read` needs no new entry point: it is handed the
-        # same shape it always is.
+        # The id goes on its computed field, as in a row an apply writes, so
+        # `read` receives its usual input shape.
         seed = {self.identity_field: self.request.external_id} if self.identity_field else {}
-        res = reconstruct(self.row(seed), self.session.env, self.session.outputs)
-
-        live = await self.provider.read(self.session.ctx, res)
+        try:
+            res = reconstruct(self.row(seed), self.session.env, self.session.outputs)
+            live = await self.provider.read(self.session.ctx, res)
+        except Exception as exc:
+            # This request only: nothing was written, and the batch goes on.
+            return self.outcome(
+                ImportStatus.BLOCKED, detail=f"read failed: {type(exc).__name__}: {exc}"
+            )
         if live is None:
             return self.outcome(
                 ImportStatus.NOT_FOUND, detail="the provider found no such resource"
@@ -256,38 +265,34 @@ class _Adoption:
 
         recorded = self.split_outputs(live)
         drift = self.compare(res, live, recorded)
-        if drift.kind is Drift.DRIFTED and not self.session.allow_drift:
+        if drift.kind is Drift.DRIFTED and not self.session.options.allow_drift:
             return self.outcome(
                 ImportStatus.DRIFTED,
                 drift=drift,
                 detail="the live resource differs from what config declares",
             )
 
-        if self.session.write:
+        if self.session.options.write:
             self.persist(res, recorded, poisoned=drift.kind is Drift.DRIFTED)
         else:
-            # A dry run writes no state, but later requests in this batch must
-            # see the same world the real run would: the dependency and
-            # ALREADY_TRACKED checks read ``tracked``, and a dependent's
-            # ``$ref``s resolve through ``outputs``. Without this, a request
-            # depending on an earlier one reports BLOCKED here and IMPORTED
-            # under ``--write`` — a dry run that answers differently.
+            # A dry run writes no state, but later requests must see what a real
+            # run would: the dependency and ALREADY_TRACKED checks read
+            # ``tracked``, and dependents' ``$ref``s resolve through ``outputs``.
             self.session.tracked.add(self.node.id)
             self.session.outputs[self.node.id] = recorded
         return self.outcome(
-            ImportStatus.IMPORTED if self.session.write else ImportStatus.WOULD_IMPORT,
+            ImportStatus.IMPORTED if self.session.options.write else ImportStatus.WOULD_IMPORT,
             drift=drift,
             recorded=tuple(sorted(recorded)),
         )
 
     def split_outputs(self, live: dict[str, Any]) -> dict[str, Any]:
-        """The half of the read that belongs in ``outputs`` rather than ``properties``.
+        """The part of the read that belongs in ``outputs`` rather than ``properties``.
 
-        A read reports inputs and computed values in one mapping, and the two are
-        judged differently: an input that differs is drift, a computed value is
-        simply this resource's identity. Recording a reported input as an output
-        would also shadow the input it mirrors on every later refresh — the
-        mistake ``_sync_state`` documents from the other direction.
+        A read reports inputs and computed values in one mapping: a differing input
+        is drift, while a computed value is this resource's identity. Recording a
+        reported input as an output would shadow that input on every later refresh;
+        :func:`~atlantide.reconcile.refresh._folded` splits a read the same way.
         """
         recorded = {k: v for k, v in live.items() if k not in self.node.properties}
         if self.identity_field and self.request.external_id:
@@ -295,11 +300,10 @@ class _Adoption:
         return recorded
 
     def compare(self, res: Resource, live: dict[str, Any], recorded: dict[str, Any]) -> NodeDrift:
-        """Does the live resource match what config declares?
+        """Compare the live resource against what config declares.
 
-        Compared through a probe row carrying the *unsealed* outputs, because
-        ``classify_drift`` unseals whatever it is given and the values here have
-        not been sealed yet.
+        Uses a probe row carrying the *unsealed* outputs: ``classify_drift`` unseals
+        whatever it receives, and these values are not sealed yet.
         """
         assert self.resource_type is not None  # refusal() proved it
         probe = self.row(recorded)
@@ -318,13 +322,21 @@ class _Adoption:
         row = self.row(
             seal_outputs(recorded, self.resource_type, env.secrets),
             digests=secret_digests(res, self.node.id, env.secrets),
-            # Drift adopted under `allow_drift` has to be visible to the next
-            # plan, and a symbolic diff cannot see it: config and state hash
-            # identically. Clearing the hash is the only channel there is — the
-            # same one `refresh --write` uses.
+            # What the refs resolve to now: the read matched config (or the row is
+            # poisoned below), so the live resource holds these values.
+            refs=ref_digests(
+                self.node.type,
+                self.node.properties,
+                self.session.outputs,
+                types=env.types,
+                secrets=env.secrets,
+            ),
+            # Drift adopted under `allow_drift` must reach the next plan, but
+            # config and state hash identically. Clearing the hash surfaces it, as
+            # `refresh --write` does.
             poison=poisoned,
         )
-        env.lease.check()  # as every other state write does; a lost lease must not write
+        env.lease.check()  # a lost lease must not write state
         env.backend.put(row)
         self.session.tracked.add(self.node.id)
         self.session.outputs[self.node.id] = recorded
@@ -355,21 +367,19 @@ class _Adoption:
         outputs: dict[str, Any],
         *,
         digests: dict[str, str] | None = None,
+        refs: dict[str, str] | None = None,
         poison: bool = False,
     ) -> StateNode:
-        """The state row for this node, field for field as the executor writes it.
+        """The state row for this node, matching the row the executor writes.
 
-        Two of these matter more than the rest:
+        ``input_hash`` is the Merkle hash from the compile, never recomputed here.
+        The diff compares against it, so an unchanged config skips this node
+        without a provider call.
 
-        ``input_hash`` is the Merkle hash the compile already produced, never one
-        recomputed here. It is the exact value the diff compares against, so an
-        unchanged config skips this node without a provider call — which is the
-        definition of a successful import.
-
-        ``properties`` keeps the IR's symbolic form, ``$ref`` and ``$secret_ref``
-        markers included. Substituting the values they resolved to would erase the
-        dependency from state, and the next config change would diff a marker
-        against a literal — a spurious REPLACE on any ``immutable()`` field.
+        ``properties`` keeps the IR's symbolic form, including ``$ref`` and
+        ``$secret_ref`` markers. Resolved values would drop the dependency from
+        state, and the next config change would compare a marker against a literal,
+        planning a spurious REPLACE on any ``immutable()`` field.
         """
         node = self.node
         return StateNode(
@@ -381,11 +391,13 @@ class _Adoption:
             outputs=outputs,
             properties=node.properties,
             dependencies=node.dependencies,
+            depends_on=node.depends_on,
             prevent_destroy=node.prevent_destroy,
             secret_digests=digests or {},
-            # Never `creating`: nothing is being created, and a write-ahead row is
-            # re-created by the next plan rather than skipped.
-            status=STATUS_CREATED,
+            ref_digests=refs or {},
+            # Not `creating`: the next plan re-creates a write-ahead row instead of
+            # skipping it.
+            status=NodeStatus.CREATED,
         )
 
 
@@ -394,9 +406,8 @@ def identity_fields(
 ) -> dict[str, str | None]:
     """The id field each node's type is located by, or ``None`` if found by name.
 
-    Answers "what would importing this need from me" from the config alone — no
-    provider call, and no resource construction either, since the answer is a
-    property of the type.
+    Computed from config and resource types alone, with no provider call or
+    resource construction.
     """
     by_id = {node.id: node for node in ir.nodes}
 

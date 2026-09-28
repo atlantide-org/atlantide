@@ -9,10 +9,10 @@ parsers, and the tree-level conversions.
 
 Three distinct ref-detection predicates answer different questions:
 
-- :func:`contains_ref` — a live ``Ref`` *object* anywhere (pre-lowering values);
-- :func:`has_ref_key` — a dict with a ``"$ref"`` key anywhere (canonicalized
+- :func:`contains_ref`: a live ``Ref`` object anywhere (pre-lowering values);
+- :func:`has_ref_key`: a dict with a ``"$ref"`` key anywhere (canonicalized
   IR/state trees, loose match used by the diff);
-- :func:`is_ref_or_marker` — a single value that stands in for an upstream
+- :func:`is_ref_or_marker`: a single value that stands in for an upstream
   output, in either form (the executor's resolution test).
 
 ``$secret_ref`` markers are owned by :mod:`atlantide.secrets` (import
@@ -24,6 +24,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from atlantide.core import _tree
 from atlantide.core._tree import tree_any, tree_collect, tree_map
 from atlantide.core.types import (
     HANDLES,
@@ -33,7 +34,6 @@ from atlantide.core.types import (
     Ref,
     StackOutputRef,
     Transform,
-    _to_markers,
 )
 
 __all__ = [
@@ -62,9 +62,8 @@ __all__ = [
 def single_key_marker(value: Any, key: str) -> Any | None:
     """The payload of a strict single-key ``{key: payload}`` marker, or ``None``.
 
-    Every ``$…`` marker shares this shape; each predicate adds only its own
-    payload test on top. Centralised so "strict" means the same thing for all
-    of them — exactly one key, and that key is the marker's.
+    Every ``$…`` marker shares this shape: exactly one key, and that key is the
+    marker's. Each predicate adds its own payload test on top.
     """
     if isinstance(value, dict) and len(value) == 1:
         return value.get(key)
@@ -74,9 +73,8 @@ def single_key_marker(value: Any, key: str) -> Any | None:
 def is_ref_marker(value: Any) -> bool:
     """A strict ``{"$ref": "node_id#attr"}`` marker (single key, str value).
 
-    The ``"#"`` is part of the shape: a dict whose ``$ref`` value cannot split
-    into ``node_id#attr`` is data that happens to carry the key, and treating it
-    as a marker would send a raw ``ValueError`` up from ``ref_from_marker``.
+    The ``"#"`` is part of the shape: a ``$ref`` value without it is plain data,
+    and :func:`ref_from_marker` would raise ``ValueError`` on it.
     """
     target = single_key_marker(value, REF_KEY)
     return isinstance(target, str) and "#" in target
@@ -124,9 +122,8 @@ def contains_ref(value: Any) -> bool:
 def contains_handle(value: Any) -> bool:
     """True if any live handle occurs anywhere in ``value``.
 
-    The validator's test: a nested ``SecretRef``/``StackOutputRef``/``Transform``
-    (e.g. inside a ``tags`` dict) defers validation exactly as a nested ``Ref``
-    does — the value is only known once the handle resolves at apply.
+    Used by the field validator: any nested handle (e.g. inside a ``tags`` dict)
+    defers validation until it resolves at apply.
     """
     return tree_any(value, lambda v: isinstance(v, HANDLES))
 
@@ -139,8 +136,8 @@ def collect_refs(value: Any) -> list[Ref]:
 def has_ref_key(value: Any) -> bool:
     """True if any dict in ``value`` carries a ``"$ref"`` key (canonicalized trees).
 
-    Looser than :func:`is_ref_marker`: the diff walks already-lowered IR/state
-    values, where sets are gone and a ``$ref`` key is decisive.
+    Looser than :func:`is_ref_marker`. Used by the diff on lowered IR/state values,
+    which contain no sets.
     """
     return tree_any(value, lambda v: isinstance(v, dict) and REF_KEY in v, include_sets=False)
 
@@ -148,9 +145,8 @@ def has_ref_key(value: Any) -> bool:
 def collect_ref_targets(value: Any) -> frozenset[str]:
     """Node ids every ``$ref`` key anywhere in ``value`` points at.
 
-    The loose-match companion of :func:`has_ref_key`, for the same canonicalized
-    IR/state trees: the diff uses it to attribute a field's change to the
-    specific upstream nodes it references.
+    Same loose match as :func:`has_ref_key`. The diff uses it to attribute a
+    field's change to the upstream nodes it references.
     """
     found = tree_collect(
         value,
@@ -166,16 +162,16 @@ def canonicalize(value: Any) -> Any:
     Matches ``Resource.canonical_inputs`` semantics exactly (keys stringified,
     sets lowered to sorted lists); the bytes feed the IR canonical hash.
     """
-    return _to_markers(value, HANDLES, stringify_keys=True)
+    return _tree.handles_to_markers(value, HANDLES, stringify_keys=True)
 
 
 def remap_refs(value: Any, remap: Mapping[str, str]) -> Any:
     """Rewrite the target node id of every ``$ref`` marker via ``remap``.
 
-    Operates on already-canonicalized trees (markers, not live handles) — used to
-    migrate persisted state when a resource is renamed via ``aliases``. Nested
-    markers (e.g. a ``$transform`` carrying ``$ref``s) are reached because
-    ``tree_map`` descends into their dicts.
+    Operates on canonicalized trees (markers, not live handles); migrates
+    persisted state when a resource is renamed via ``aliases``. ``tree_map``
+    descends into nested markers, so ``$ref``s inside a ``$transform`` are
+    rewritten too.
     """
 
     def leaf(v: Any) -> Any:
@@ -189,9 +185,9 @@ def remap_refs(value: Any, remap: Mapping[str, str]) -> Any:
 
 
 def refs_to_markers(value: Any) -> Any:
-    """Artifact-output form: only ``Ref`` objects become markers.
+    """Artifact-output form: only ``Ref`` and ``Transform`` objects become markers.
 
     Matches the ``.atlas`` artifact's stored-output semantics exactly (keys
     stringified, sets lowered to sorted lists); other handle types are left as-is.
     """
-    return _to_markers(value, (Ref, Transform), stringify_keys=True)
+    return _tree.handles_to_markers(value, (Ref, Transform), stringify_keys=True)

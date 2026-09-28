@@ -4,20 +4,18 @@ from __future__ import annotations
 
 import string
 from dataclasses import dataclass
-from typing import Any, TypeVar, Union, cast
+from typing import Any, TypeVar, Union, override
 
-from typing_extensions import override
-
-from atlantide.core._tree import tree_map
+from atlantide.core import _tree
 from atlantide.core.errors import IRError, LanguageError
 from atlantide.core.node_id import require_sequence
 
 T = TypeVar("T")
 
-# The single-key ``{"$...": ...}`` markers handles serialize to. Declared here,
-# below every other module, because the layers that must recognise them cannot
+# Keys of the single-key ``{"$...": ...}`` markers that handles serialize to.
+# Defined in this low-level module because the layers that recognise them cannot
 # import each other: ``core.markers`` owns the codec, ``secrets`` owns sealing,
-# and ``core.logging`` must redact both without importing either.
+# and ``core.logging`` redacts both without importing either.
 REF_KEY = "$ref"
 SECRET_REF_KEY = "$secret_ref"
 STACK_OUTPUT_KEY = "$stack_output"
@@ -29,7 +27,7 @@ SECRET_MARKER_KEYS = (SECRET_REF_KEY, SEALED_KEY)
 
 
 def _reject_field(field_name: str) -> None:
-    """Raise unless ``field_name`` is a bare positional index (``{}``, ``{0}``)."""
+    """Refuse a template field that is not a bare positional index (``{}``, ``{0}``)."""
     raise LanguageError(
         f"template field {field_name!r} is not a plain positional index; "
         "attribute and item access in a format template is not allowed"
@@ -39,10 +37,9 @@ def _reject_field(field_name: str) -> None:
 class _PositionalFormatter(string.Formatter):
     """``str.format`` restricted to bare positional substitution.
 
-    A field name may address attributes and items — ``{0.__class__.__init__}`` —
-    which walks a live object rather than substituting into the string, and
-    reaches the interpreter's own globals from a config-supplied template. Format
-    specs and ``!r`` conversions remain available; they are pure.
+    A field name such as ``{0.__class__.__init__}`` walks a live object and can
+    reach the interpreter's globals from a config-supplied template. Format specs
+    and ``!r`` conversions stay allowed because they have no side effects.
     """
 
     @override
@@ -61,13 +58,12 @@ _FORMATTER = _PositionalFormatter()
 
 
 def check_template(template: str) -> None:
-    """Raise :class:`LanguageError` if ``template`` addresses attributes or items,
-    or mixes auto (``{}``) and manual (``{0}``) numbering.
+    """Raise :class:`LanguageError` if ``template`` is not plain positional substitution.
 
-    Checks without substituting, so a template can be validated at config time
-    before its arguments are known. The numbering check matters because
-    ``vformat`` raises a raw ``ValueError`` for mixed numbering at *apply* time —
-    the untyped, late failure this function exists to prevent.
+    Rejects attribute or item access and mixed auto (``{}``) and manual (``{0}``)
+    numbering. Checks without substituting, so a template is validated at config
+    time before its arguments are known; otherwise ``vformat`` would raise a bare
+    ``ValueError`` for mixed numbering at apply time.
     """
     auto = manual = False
     for _, field_name, _, _ in _FORMATTER.parse(template):
@@ -88,8 +84,9 @@ def check_template(template: str) -> None:
 def format_template(template: str, *args: Any) -> str:
     """Substitute ``args`` into ``template``'s positional placeholders.
 
-    The sanctioned way to evaluate a config-supplied format string, used by the
-    executor when it reduces an :func:`interpolate` transform at apply time.
+    Config-supplied format strings are evaluated through this, not ``str.format``;
+    :mod:`atlantide.reconcile.resolve` uses it to reduce an :func:`interpolate`
+    transform at apply time.
     """
     return _FORMATTER.vformat(template, args, {})
 
@@ -138,7 +135,7 @@ class Ref:
 
 @dataclass(frozen=True, slots=True)
 class SecretRef:
-    """A named handle to an externally-stored secret — never the value itself.
+    """A named handle to an externally stored secret, not the secret value.
 
     A field set to ``SecretRef("app/signing-key")`` records only the *name* (and
     optionally which secrets provider). Source, IR, and state carry the handle;
@@ -161,8 +158,8 @@ class StackOutputRef:
 
     ``StackReference("prod").output("vpc_id")`` yields this handle; the engine
     resolves it from the referenced stack's persisted outputs in state. Not a
-    :class:`Ref` subclass, so it is never a within-graph dependency edge — the
-    referenced stack is applied separately (its outputs already committed).
+    :class:`Ref` subclass, so it never forms a within-graph dependency edge: the
+    referenced stack is applied separately.
     """
 
     stack: str
@@ -173,43 +170,22 @@ class StackOutputRef:
         return {STACK_OUTPUT_KEY: f"{self.stack}:{self.name}"}
 
 
-def _to_markers(value: Any, kinds: tuple[type, ...], *, stringify_keys: bool = False) -> Any:
-    """Rebuild ``value`` with every ``kinds`` handle replaced by its ``canonical()`` marker.
-
-    The one walker behind every handle -> marker conversion; the call sites
-    differ only in which handle types convert and whether dict keys are
-    stringified (``stringify_keys`` also lowers sets to sorted lists, matching
-    ``tree_map`` semantics).
-    """
-
-    def leaf(v: Any) -> Any:
-        if isinstance(v, kinds):
-            # Every handle type carries canonical(); `kinds` is always a subset
-            # of HANDLES, which mypy cannot see through the tuple[type, ...].
-            return cast("Ref | SecretRef | StackOutputRef | Transform", v).canonical()
-        return v
-
-    return tree_map(value, leaf, stringify_keys=stringify_keys)
-
-
 def _canonical_arg(value: Any) -> Any:
     """Canonical form of one transform argument (handles -> markers, recursively).
 
-    Delegates to the shared walker rather than recursing itself. The hand-rolled
-    version reached into lists and tuples but not into dicts or nested models, so
-    a ``Ref`` inside one — ``concat("p-", {"k": other.arn})`` — stayed a live
-    object in the canonical form and was rejected at hash time with "value of
-    type Ref is not JSON-encodable", which names where but not why.
+    Recurses into dicts and nested models: a live ``Ref`` inside one
+    (``concat("p-", {"k": other.arn})``) would otherwise fail hashing as not
+    JSON-encodable.
     """
-    return _to_markers(value, HANDLES)
+    return _tree.handles_to_markers(value, HANDLES)
 
 
 @dataclass(frozen=True, slots=True)
 class Transform:
     """A deferred, pure transform over values that are unknown until apply.
 
-    The language is not re-run at apply, so a transform is serialized as **data**
-    — an operation name plus arguments (literals or other handles) — never a
+    The language is not re-run at apply, so a transform is serialized as data (an
+    operation name plus arguments, which are literals or other handles), not a
     closure. Its ``$transform`` marker canonicalizes and hashes deterministically;
     the executor evaluates it from a fixed op allowlist once the wrapped ``Ref``s
     resolve. Build one with :func:`concat`, :func:`interpolate`, or :func:`join`.
@@ -234,11 +210,11 @@ def concat(*parts: Any) -> Transform:
 
 
 def interpolate(template: str, *args: Any) -> Transform:
-    """Fill ``{}`` placeholders in ``template`` with ``args`` at apply
-    (``interpolate("{}/img/{}", dist.domain, key)``).
+    """Fill ``{}`` placeholders in ``template`` with ``args`` at apply.
 
-    The template is checked at config time, so a field addressing attributes
-    fails the plan rather than the apply.
+    Example: ``interpolate("{}/img/{}", dist.domain, key)``. The template is
+    checked at config time, so a field addressing attributes fails the plan
+    rather than the apply.
     """
     check_template(template)
     return Transform("interpolate", (template, *args))
@@ -249,8 +225,8 @@ def join(separator: str, parts: Any) -> Transform:
 
     ``parts`` may itself be unresolved (a computed list field reads back as a
     ``Ref``), so iteration is deferred to apply for handles. A bare string is
-    refused: ``tuple("abc")`` would silently join its characters — the same trap
-    ``Lifecycle`` and ``depends_on`` guard against.
+    rejected because ``tuple("abc")`` would join its characters; ``Lifecycle``
+    and ``depends_on`` apply the same check.
     """
     require_sequence(
         parts,
@@ -268,5 +244,6 @@ def join(separator: str, parts: Any) -> Transform:
 HANDLES = (Ref, SecretRef, StackOutputRef, Transform)
 
 
-# ``Input[T]``: a field accepts either a concrete value or a Ref.
+# ``Input[T]``: a field accepts either a concrete value or a Ref. A plain alias, not a
+# ``type`` statement: pydantic field annotations need the real ``Union`` at runtime.
 Input = Union[T, Ref]  # noqa: UP007 - Union spelling required for a generic alias

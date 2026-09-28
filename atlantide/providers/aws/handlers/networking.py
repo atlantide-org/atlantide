@@ -1,15 +1,14 @@
 """EC2 networking handlers: VPCs, subnets, security groups, and routing.
 
-The EC2 base these share lives in :mod:`.ec2`; the security-group rule
-translation in :mod:`.sgrules`.
+The shared EC2 base is in :mod:`.ec2`; security-group rule translation is in
+:mod:`.sgrules`.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, override
 
-from typing_extensions import override
-
+from atlantide.providers.aws.handlers.base import Client
 from atlantide.providers.aws.handlers.ec2 import (
     Ec2Handler,
     tag_spec,
@@ -17,6 +16,7 @@ from atlantide.providers.aws.handlers.ec2 import (
 from atlantide.providers.aws.handlers.sgrules import (
     atomic_units,
     has_rule,
+    redescribed,
     rule_to_aws,
     rules_from_aws,
 )
@@ -25,8 +25,24 @@ from atlantide.providers.aws.resources.networking import (
     ElasticIp,
     InternetGateway,
     NatGateway,
+    Route,
     RouteTable,
+    SgRule,
 )
+
+
+def _reported_rules(live: list[dict[str, Any]], declared: list[SgRule]) -> list[dict[str, Any]]:
+    """The live rules, expressed the way this config states them.
+
+    EC2 merges rules sharing protocol and ports and returns ranges in no stable
+    order, so a verbatim report rarely equals config. When both sides normalize
+    to the same single-source rules (see :func:`rules_from_aws`) the declared
+    rules are reported; otherwise the live ones are, so a console edit surfaces
+    as drift.
+    """
+    if live == rules_from_aws([rule_to_aws(rule) for rule in declared]):
+        return [rule.model_dump() for rule in declared]
+    return live
 
 
 class VpcHandler(Ec2Handler[Vpc]):
@@ -38,18 +54,18 @@ class VpcHandler(Ec2Handler[Vpc]):
     ids_kwarg = "VpcIds"
 
     @override
-    def _create(self, client: Any, res: Vpc) -> str:
+    def _create(self, client: Client, res: Vpc) -> str:
         resp = client.create_vpc(
             CidrBlock=res.cidr_block, TagSpecifications=tag_spec("vpc", res.node_id)
         )
         return str(resp["Vpc"]["VpcId"])
 
     @override
-    def _find(self, client: Any, res: Vpc) -> str | None:
+    def _find(self, client: Client, res: Vpc) -> str | None:
         return self._first_id(client, Filters=[{"Name": "cidr", "Values": [res.cidr_block]}])
 
     @override
-    def _delete(self, client: Any, resource_id: str) -> None:
+    def _delete(self, client: Client, resource_id: str) -> None:
         client.delete_vpc(VpcId=resource_id)
 
 
@@ -62,7 +78,7 @@ class SubnetHandler(Ec2Handler[Subnet]):
     ids_kwarg = "SubnetIds"
 
     @override
-    def _create(self, client: Any, res: Subnet) -> str:
+    def _create(self, client: Client, res: Subnet) -> str:
         kwargs: dict[str, Any] = {
             "VpcId": res.vpc_id,
             "CidrBlock": res.cidr_block,
@@ -73,19 +89,18 @@ class SubnetHandler(Ec2Handler[Subnet]):
         return str(client.create_subnet(**kwargs)["Subnet"]["SubnetId"])
 
     @override
-    def _after_create(self, client: Any, resource_id: str, res: Subnet) -> None:
+    def _after_create(self, client: Client, resource_id: str, res: Subnet) -> None:
         self._set_public_ip(client, resource_id, res)
 
     @override
-    def update(self, client: Any, prior: dict[str, Any], res: Subnet) -> dict[str, Any]:
+    def update(self, client: Client, prior: dict[str, Any], res: Subnet) -> dict[str, Any]:
         outputs = super().update(client, prior, res)
         self._set_public_ip(client, str(outputs[self.identity_field]), res)
         return outputs
 
     @override
     def _observed(self, live: dict[str, Any]) -> dict[str, Any]:
-        # Only what the describe actually returned: a key AWS omitted is unchecked,
-        # not equal to whatever config asked for.
+        # A key AWS omits is left out, so refresh treats it as unchecked.
         return {
             name: caster(live[key])
             for name, key, caster in (
@@ -96,14 +111,14 @@ class SubnetHandler(Ec2Handler[Subnet]):
         }
 
     @staticmethod
-    def _set_public_ip(client: Any, subnet_id: str, res: Subnet) -> None:
+    def _set_public_ip(client: Client, subnet_id: str, res: Subnet) -> None:
         client.modify_subnet_attribute(
             SubnetId=subnet_id,
             MapPublicIpOnLaunch={"Value": res.map_public_ip_on_launch},
         )
 
     @override
-    def _find(self, client: Any, res: Subnet) -> str | None:
+    def _find(self, client: Client, res: Subnet) -> str | None:
         return self._first_id(
             client,
             Filters=[
@@ -113,7 +128,7 @@ class SubnetHandler(Ec2Handler[Subnet]):
         )
 
     @override
-    def _delete(self, client: Any, resource_id: str) -> None:
+    def _delete(self, client: Client, resource_id: str) -> None:
         client.delete_subnet(SubnetId=resource_id)
 
 
@@ -126,7 +141,7 @@ class SecurityGroupHandler(Ec2Handler[SecurityGroup]):
     ids_kwarg = "GroupIds"
 
     @override
-    def _create(self, client: Any, res: SecurityGroup) -> str:
+    def _create(self, client: Client, res: SecurityGroup) -> str:
         resp = client.create_security_group(
             GroupName=res.group_name,
             Description=res.description,
@@ -136,65 +151,72 @@ class SecurityGroupHandler(Ec2Handler[SecurityGroup]):
         return str(resp["GroupId"])
 
     @override
-    def _after_create(self, client: Any, resource_id: str, res: SecurityGroup) -> None:
+    def _after_create(self, client: Client, resource_id: str, res: SecurityGroup) -> None:
         self._sync_rules(client, resource_id, res)
 
     @override
-    def update(self, client: Any, prior: dict[str, Any], res: SecurityGroup) -> dict[str, Any]:
+    def update(self, client: Client, prior: dict[str, Any], res: SecurityGroup) -> dict[str, Any]:
         outputs = super().update(client, prior, res)
         self._sync_rules(client, str(outputs[self.identity_field]), res)
         return outputs
 
     @override
     def _observed(self, live: dict[str, Any]) -> dict[str, Any]:
-        # Report the rules, so a port opened in the console shows as drift rather
-        # than as a blanket "in sync" nothing checked. An absent key is unchecked;
-        # an empty list is the meaningful "no rules".
+        # Rules are reported so console edits show as drift. An absent key is
+        # unchecked; an empty list means no rules.
         return {
             name: rules_from_aws(live[key])
             for name, key in (("ingress", "IpPermissions"), ("egress", "IpPermissionsEgress"))
             if key in live
         }
 
-    def _sync_rules(self, client: Any, group_id: str, res: SecurityGroup) -> None:
+    @override
+    def read(self, client: Client, res: SecurityGroup) -> dict[str, Any] | None:
+        observed = super().read(client, res)
+        if observed is not None:
+            for name, declared in (("ingress", res.ingress), ("egress", res.egress)):
+                if name in observed:
+                    observed[name] = _reported_rules(observed[name], declared)
+        return observed
+
+    def _sync_rules(self, client: Client, group_id: str, res: SecurityGroup) -> None:
         """Make the live rules match the declared ones, in both directions.
 
-        Rules are set-like: AWS has no "replace the rule set" call, so the delta
-        is computed here and applied as an authorize plus a revoke. Revoking is
-        the half that matters — without it, removing a rule from config would
-        leave the port open, which is the failure mode nobody notices.
+        AWS has no call to replace a rule set, so the delta is applied as an
+        authorize plus a revoke; the revoke closes rules removed from config.
 
-        A new group is born with an allow-all egress rule. Declaring ``egress=[]``
-        therefore has to *revoke* something rather than simply not add it.
+        A new group starts with an allow-all egress rule, so ``egress=[]`` revokes it.
         """
         live = client.describe_security_groups(GroupIds=[group_id])["SecurityGroups"][0]
-        for direction, key, authorize, revoke in (
+        for direction, key, authorize, revoke, redescribe in (
             (
                 res.ingress,
                 "IpPermissions",
                 client.authorize_security_group_ingress,
                 client.revoke_security_group_ingress,
+                client.update_security_group_rule_descriptions_ingress,
             ),
             (
                 res.egress,
                 "IpPermissionsEgress",
                 client.authorize_security_group_egress,
                 client.revoke_security_group_egress,
+                client.update_security_group_rule_descriptions_egress,
             ),
         ):
-            # Compared and applied per atomic unit (one range each): EC2 merges
-            # live ranges into one permission per (protocol, from, to), so whole-
-            # permission comparison re-authorizes present ranges and revokes
-            # merged rules wholesale. See :func:`atomic_units`.
+            # Compared per one-range unit because EC2 merges live ranges into one
+            # permission per (protocol, from, to). See :func:`atomic_units`.
             desired = atomic_units([rule_to_aws(rule) for rule in direction])
             current = atomic_units(live.get(key, []))
             if added := [p for p in desired if not has_rule(current, p)]:
                 authorize(GroupId=group_id, IpPermissions=added)
             if stale := [p for p in current if not has_rule(desired, p)]:
                 revoke(GroupId=group_id, IpPermissions=stale)
+            if relabelled := redescribed(desired, current):
+                redescribe(GroupId=group_id, IpPermissions=relabelled)
 
     @override
-    def _find(self, client: Any, res: SecurityGroup) -> str | None:
+    def _find(self, client: Client, res: SecurityGroup) -> str | None:
         return self._first_id(
             client,
             Filters=[
@@ -204,7 +226,7 @@ class SecurityGroupHandler(Ec2Handler[SecurityGroup]):
         )
 
     @override
-    def _delete(self, client: Any, resource_id: str) -> None:
+    def _delete(self, client: Client, resource_id: str) -> None:
         client.delete_security_group(GroupId=resource_id)
 
 
@@ -217,31 +239,30 @@ class InternetGatewayHandler(Ec2Handler[InternetGateway]):
     ids_kwarg = "InternetGatewayIds"
 
     @override
-    def _create(self, client: Any, res: InternetGateway) -> str:
+    def _create(self, client: Client, res: InternetGateway) -> str:
         resp = client.create_internet_gateway(
             TagSpecifications=tag_spec("internet-gateway", res.node_id)
         )
         return str(resp["InternetGateway"]["InternetGatewayId"])
 
     @override
-    def _after_create(self, client: Any, resource_id: str, res: InternetGateway) -> None:
-        # Idempotent attach: an adopted gateway (re-run create) is already attached.
+    def _after_create(self, client: Client, resource_id: str, res: InternetGateway) -> None:
+        # An adopted gateway may already be attached.
         described = client.describe_internet_gateways(InternetGatewayIds=[resource_id])
         attachments = described["InternetGateways"][0].get("Attachments", [])
         if not any(a.get("VpcId") == res.vpc_id for a in attachments):
             client.attach_internet_gateway(InternetGatewayId=resource_id, VpcId=res.vpc_id)
 
     @override
-    def _find(self, client: Any, res: InternetGateway) -> str | None:
+    def _find(self, client: Client, res: InternetGateway) -> str | None:
         return self._first_id(
             client, Filters=[{"Name": "attachment.vpc-id", "Values": [res.vpc_id]}]
         )
 
     @override
-    def _delete(self, client: Any, resource_id: str) -> None:
-        # Detach first: AWS refuses to delete an attached gateway, and the VPC it
-        # is attached to is read back rather than taken from config, which by
-        # this point may no longer describe it.
+    def _delete(self, client: Client, resource_id: str) -> None:
+        # AWS refuses to delete an attached gateway. The attached VPC is read back
+        # because config may no longer describe it.
         described = client.describe_internet_gateways(InternetGatewayIds=[resource_id])
         for attachment in described["InternetGateways"][0].get("Attachments", []):
             client.detach_internet_gateway(InternetGatewayId=resource_id, VpcId=attachment["VpcId"])
@@ -257,14 +278,14 @@ class ElasticIpHandler(Ec2Handler[ElasticIp]):
     ids_kwarg = "AllocationIds"
 
     @override
-    def _create(self, client: Any, res: ElasticIp) -> str:
+    def _create(self, client: Client, res: ElasticIp) -> str:
         resp = client.allocate_address(
             Domain="vpc", TagSpecifications=tag_spec("elastic-ip", res.node_id)
         )
         return str(resp["AllocationId"])
 
     @override
-    def create(self, client: Any, res: ElasticIp) -> dict[str, Any]:
+    def create(self, client: Client, res: ElasticIp) -> dict[str, Any]:
         outputs = super().create(client, res)
         return {**outputs, **self._address(client, str(outputs[self.identity_field]))}
 
@@ -273,27 +294,25 @@ class ElasticIpHandler(Ec2Handler[ElasticIp]):
         return {"public_ip": live["PublicIp"]} if "PublicIp" in live else {}
 
     @staticmethod
-    def _address(client: Any, allocation_id: str) -> dict[str, Any]:
+    def _address(client: Client, allocation_id: str) -> dict[str, Any]:
         found = client.describe_addresses(AllocationIds=[allocation_id])["Addresses"]
         return {"public_ip": found[0].get("PublicIp", "")} if found else {}
 
     @override
-    def _find(self, client: Any, res: ElasticIp) -> str | None:
-        # An address has no attributes of its own to match on, so the node tag is
-        # the only identity — `_find` and `_find_tagged` are the same lookup. That
-        # also means an address atlantide did not create cannot be found this way;
-        # `read` prefers the id from state precisely so it does not have to be.
+    def _find(self, client: Client, res: ElasticIp) -> str | None:
+        # An address has no attributes to match on, so the node tag is its only
+        # identity. An unmanaged address is found only by the state id.
         return self._find_tagged(client, res.node_id)
 
     @override
-    def _delete(self, client: Any, resource_id: str) -> None:
+    def _delete(self, client: Client, resource_id: str) -> None:
         client.release_address(AllocationId=resource_id)
 
 
-#: A deleted NAT lingers in the API for a while, so its id still resolves and a
-#: filter still matches it. Treating one as live would make a destroyed gateway
-#: read as present — enforced once, in `_is_live`, which every lookup consults.
-_DEAD_NAT_STATES = frozenset({"deleted", "deleting"})
+#: A deleted or failed NAT gateway stays visible in the API for a while. `_is_live`
+#: excludes these states so a destroyed gateway does not read as present and a
+#: failed one is never adopted.
+_DEAD_NAT_STATES = frozenset({"deleted", "deleting", "failed"})
 
 
 class NatGatewayHandler(Ec2Handler[NatGateway]):
@@ -303,7 +322,7 @@ class NatGatewayHandler(Ec2Handler[NatGateway]):
     list_key = "NatGateways"
     id_key = "NatGatewayId"
     ids_kwarg = "NatGatewayIds"
-    filters_kwarg = "Filter"  # EC2's one singular spelling
+    filters_kwarg = "Filter"
 
     @staticmethod
     @override
@@ -311,7 +330,7 @@ class NatGatewayHandler(Ec2Handler[NatGateway]):
         return item.get("State") not in _DEAD_NAT_STATES
 
     @override
-    def _create(self, client: Any, res: NatGateway) -> str:
+    def _create(self, client: Client, res: NatGateway) -> str:
         resp = client.create_nat_gateway(
             SubnetId=res.subnet_id,
             AllocationId=res.allocation_id,
@@ -320,19 +339,39 @@ class NatGatewayHandler(Ec2Handler[NatGateway]):
         return str(resp["NatGateway"]["NatGatewayId"])
 
     @override
-    def _find(self, client: Any, res: NatGateway) -> str | None:
+    def _after_create(self, client: Client, resource_id: str, res: NatGateway) -> None:
+        # A gateway starts `pending` and may fail in the background (subnet or
+        # EIP problems); returning early would report that as success. Waiting
+        # here also covers an adopted gateway that is still pending. The waiter
+        # raises on `failed`.
+        client.get_waiter("nat_gateway_available").wait(
+            NatGatewayIds=[resource_id], WaiterConfig={"Delay": 15, "MaxAttempts": 40}
+        )
+
+    @override
+    def _find(self, client: Client, res: NatGateway) -> str | None:
         return self._first_id(client, Filter=[{"Name": "subnet-id", "Values": [res.subnet_id]}])
 
     @override
-    def _delete(self, client: Any, resource_id: str) -> None:
+    def _delete(self, client: Client, resource_id: str) -> None:
         client.delete_nat_gateway(NatGatewayId=resource_id)
-        # NAT deletion takes minutes, and the dependents run right after this
-        # returns: releasing the EIP (still associated) and deleting the subnet/
-        # VPC fail with InUse/DependencyViolation — a routine full destroy broke
-        # partway every time. Wait for the gateway to actually be gone.
+        # NAT deletion takes minutes. Dependents deleted before it completes (the
+        # EIP, subnet, VPC) fail with InUse/DependencyViolation.
         client.get_waiter("nat_gateway_deleted").wait(
             NatGatewayIds=[resource_id], WaiterConfig={"Delay": 15, "MaxAttempts": 40}
         )
+
+
+def _live_routes(live: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """A described table's routes keyed by destination CIDR, minus the local route.
+
+    The local route is created with the table and cannot be removed.
+    """
+    return {
+        route["DestinationCidrBlock"]: route
+        for route in live.get("Routes", [])
+        if route.get("DestinationCidrBlock") is not None and route.get("GatewayId") != "local"
+    }
 
 
 class RouteTableHandler(Ec2Handler[RouteTable]):
@@ -344,66 +383,62 @@ class RouteTableHandler(Ec2Handler[RouteTable]):
     ids_kwarg = "RouteTableIds"
 
     @override
-    def _create(self, client: Any, res: RouteTable) -> str:
+    def _create(self, client: Client, res: RouteTable) -> str:
         resp = client.create_route_table(
             VpcId=res.vpc_id, TagSpecifications=tag_spec("route-table", res.node_id)
         )
         return str(resp["RouteTable"]["RouteTableId"])
 
     @override
-    def _after_create(self, client: Any, resource_id: str, res: RouteTable) -> None:
+    def _after_create(self, client: Client, resource_id: str, res: RouteTable) -> None:
         self._sync(client, resource_id, res)
 
     @override
-    def update(self, client: Any, prior: dict[str, Any], res: RouteTable) -> dict[str, Any]:
+    def update(self, client: Client, prior: dict[str, Any], res: RouteTable) -> dict[str, Any]:
         outputs = super().update(client, prior, res)
         self._sync(client, str(outputs[self.identity_field]), res)
         return outputs
 
-    def _sync(self, client: Any, table_id: str, res: RouteTable) -> None:
+    def _sync(self, client: Client, table_id: str, res: RouteTable) -> None:
         """Make the table's routes and associations match what config declares.
 
-        Routes are replaced rather than diffed: a route table holds a handful of
-        entries, ``replace_route`` exists for exactly this, and a delete-then-add
-        would leave a window with no default route at all.
+        A changed target uses ``replace_route``: a delete-then-add would leave a
+        window with no default route.
         """
         live = client.describe_route_tables(RouteTableIds=[table_id])["RouteTables"][0]
-        declared = {route.cidr_block: route for route in res.routes}
-        live_routes: dict[str, dict[str, Any]] = {}
-        for existing in live.get("Routes", []):
-            cidr = existing.get("DestinationCidrBlock")
-            # The local route is created with the table and cannot be removed.
-            if cidr is None or existing.get("GatewayId") == "local":
-                continue
-            live_routes[cidr] = existing
-            if cidr not in declared:
-                client.delete_route(RouteTableId=table_id, DestinationCidrBlock=cidr)
+        live_routes = _live_routes(live)
+        declared = {route.cidr_block for route in res.routes}
+        for cidr in [cidr for cidr in live_routes if cidr not in declared]:
+            client.delete_route(RouteTableId=table_id, DestinationCidrBlock=cidr)
         for route in res.routes:
-            target: dict[str, Any] = (
-                {"GatewayId": route.gateway_id}
-                if route.gateway_id
-                else {"NatGatewayId": route.nat_gateway_id}
-            )
-            existing = live_routes.get(route.cidr_block)
-            if existing is None:
-                client.create_route(
-                    RouteTableId=table_id,
-                    DestinationCidrBlock=route.cidr_block,
-                    **target,
-                )
-            elif any(existing.get(key) != value for key, value in target.items()):
-                # An existing route's target changed. `create_route` cannot do
-                # this — it raises RouteAlreadyExists — and swallowing that made
-                # repointing a route (IGW -> NAT) a silent no-op forever.
-                client.replace_route(
-                    RouteTableId=table_id,
-                    DestinationCidrBlock=route.cidr_block,
-                    **target,
-                )
+            self._put_route(client, table_id, route, live_routes.get(route.cidr_block))
         self._associate(client, table_id, res, live)
 
     @staticmethod
-    def _associate(client: Any, table_id: str, res: RouteTable, live: dict[str, Any]) -> None:
+    def _put_route(
+        client: Client, table_id: str, route: Route, existing: dict[str, Any] | None
+    ) -> None:
+        """Create ``route``, or repoint it when its live target differs.
+
+        ``create_route`` cannot change an existing route's target: it raises
+        ``RouteAlreadyExists``.
+        """
+        target: dict[str, Any] = (
+            {"GatewayId": route.gateway_id}
+            if route.gateway_id
+            else {"NatGatewayId": route.nat_gateway_id}
+        )
+        if existing is None:
+            client.create_route(
+                RouteTableId=table_id, DestinationCidrBlock=route.cidr_block, **target
+            )
+        elif any(existing.get(key) != value for key, value in target.items()):
+            client.replace_route(
+                RouteTableId=table_id, DestinationCidrBlock=route.cidr_block, **target
+            )
+
+    @staticmethod
+    def _associate(client: Client, table_id: str, res: RouteTable, live: dict[str, Any]) -> None:
         associated = {
             a["SubnetId"]: a["RouteTableAssociationId"]
             for a in live.get("Associations", [])
@@ -417,14 +452,13 @@ class RouteTableHandler(Ec2Handler[RouteTable]):
                 client.disassociate_route_table(AssociationId=association_id)
 
     @override
-    def _find(self, client: Any, res: RouteTable) -> str | None:
-        # Nothing on a route table distinguishes it from its siblings in the same
-        # VPC, so the node tag is the only attribute identity there is. As with an
-        # address, that makes an unmanaged table findable only by its id.
+    def _find(self, client: Client, res: RouteTable) -> str | None:
+        # No attribute distinguishes a route table from others in the same VPC, so
+        # the node tag is its only identity. An unmanaged table is found only by id.
         return self._find_tagged(client, res.node_id)
 
     @override
-    def _delete(self, client: Any, resource_id: str) -> None:
+    def _delete(self, client: Client, resource_id: str) -> None:
         described = client.describe_route_tables(RouteTableIds=[resource_id])
         for association in described["RouteTables"][0].get("Associations", []):
             if association.get("SubnetId"):

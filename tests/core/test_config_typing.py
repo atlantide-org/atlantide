@@ -1,14 +1,14 @@
-"""What a type checker sees — the whole point of declaring an ``EnvSchema``.
+"""What a type checker sees for a declared ``EnvSchema``.
 
-A declared schema exists so an editor can complete ``env.<var>`` and flag a
-typo. That benefit lives entirely in annotations, and ``pyproject.toml`` sets
-``packages = ["atlantide"]`` — so user configs and ``examples/`` are never
-type-checked, and nothing else in the suite would notice if it regressed.
+A declared schema lets an editor complete ``env.<var>`` and flag a typo. That
+lives entirely in annotations, and ``pyproject.toml`` sets
+``packages = ["atlantide"]``, so user configs and ``examples/`` are never
+type-checked and nothing else in the suite would catch a regression.
 
-The mechanism is easy to break by accident: ``EnvSchema.__getattr__`` is hidden
-behind ``if not TYPE_CHECKING`` so that only *declared* fields type-check, and
-``EnvView`` re-declares a visible one so the ``var()`` form stays permissive.
-Remove either half and one of the two assertions below fails.
+``EnvSchema.__getattr__`` is hidden behind ``if not TYPE_CHECKING`` so only
+*declared* fields type-check, and ``EnvView`` re-declares a visible one so the
+``var()`` form stays permissive. Removing either half fails one of the two
+assertions below.
 """
 
 from __future__ import annotations
@@ -84,9 +84,8 @@ def test_a_typo_on_a_declared_environment_is_a_type_error(report: str) -> None:
 
 
 def test_the_var_form_stays_permissive(report: str) -> None:
-    """`EnvView` re-declares `__getattr__`, so a config that never declared a
-    schema class gains no new diagnostics — this is what keeps the shipped
-    `var()` API working in a user's editor."""
+    """`EnvView` re-declares `__getattr__`, so a config without a schema class
+    gains no new diagnostics and the `var()` API keeps working in an editor."""
     assert 'Revealed type is "atlantide.core.config.EnvView"' in report
     assert 'Revealed type is "Any"' in report
     assert "anything_at_all" not in report

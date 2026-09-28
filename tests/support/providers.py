@@ -1,8 +1,8 @@
 """FakeProvider: one configurable in-memory provider for tests.
 
-Subsumes every ad-hoc mock the suite used to define. It records each call and
-the resource seen, generates outputs (static dict, per-op callable, or a derived
-default), injects failures, and can serve pre-seeded reads for drift tests.
+Records each call and the resource seen, generates outputs (static dict, per-op
+callable, or a derived default), injects failures, and can serve pre-seeded
+reads for drift tests.
 """
 
 from __future__ import annotations
@@ -14,12 +14,12 @@ from atlantide.core import Context, Provider, Resource
 
 #: Output for one op: a fixed dict, a callable of ``(ctx, res)``, or ``None`` to
 #: fall back to :func:`default_outputs`.
-OutputSpec = dict[str, Any] | Callable[[Context, Resource], dict[str, Any]] | None
+type OutputSpec = dict[str, Any] | Callable[[Context, Resource], dict[str, Any]] | None
 
 
 def default_outputs(op: str, res: Resource) -> dict[str, Any]:
     """Derive ``{"out": "<name>:<size>"}`` (``:u`` on update) for resources with a
-    ``size`` field; ``{}`` otherwise. Reproduces the old reconcile MockProvider."""
+    ``size`` field; ``{}`` otherwise."""
     size = getattr(res, "size", None)
     if size is None:
         return {}
@@ -36,13 +36,12 @@ class FakeProvider(Provider):
     ``fail_*`` sets inject a ``RuntimeError`` for the named resources.
     """
 
-    # Instance-level identity overriding the base ClassVars (a fresh provider per
-    # suite needs its own name/version; the registry reads ``provider.name``).
-    # Default "test" matches the canonical resources in tests.support.resources.
+    # Default identity, overridden per instance in ``__init__``. "test" matches the
+    # canonical resources in tests.support.resources.
     name: ClassVar[str] = "test"
     version: ClassVar[str] = "1.0.0"
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - test double: one keyword per scripted behaviour
         self,
         *,
         name: str = "test",
@@ -62,7 +61,7 @@ class FakeProvider(Provider):
         self.version = version  # type: ignore[misc]
         self._on = {"create": on_create, "update": on_update, "read": on_read}
         self._live = live
-        # Public mutable failure sets — add/clear logical names to inject errors.
+        # Public mutable failure sets: add or clear logical names to inject errors.
         self.fail_create: set[str] = fail_create or set()
         self.fail_update: set[str] = fail_update or set()
         self.fail_delete: set[str] = fail_delete or set()

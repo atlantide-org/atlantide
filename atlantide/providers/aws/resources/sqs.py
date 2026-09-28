@@ -10,16 +10,19 @@ from atlantide.core import computed, immutable, mutable
 from atlantide.providers.aws import validate as v
 from atlantide.providers.aws.resources.base import RegionalResource, TaggedResource
 
-_SQS_BASE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+#: ASCII only, matched against the whole name (``fullmatch``).
+_SQS_BASE_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 
 def _queue_name_rule(*, fifo: bool) -> v.Validator:
     """Validate the effective name, including the ``.fifo`` suffix for FIFO queues."""
 
     def run(name: str) -> str | None:
+        if name.endswith(".fifo") and not fifo:
+            return f"SQS queue name {name!r} ends in '.fifo', which requires fifo=True"
         effective = name if name.endswith(".fifo") or not fifo else f"{name}.fifo"
         base = effective.removesuffix(".fifo")
-        if not _SQS_BASE_NAME.match(base):
+        if not _SQS_BASE_NAME.fullmatch(base):
             return f"invalid SQS queue name {name!r}: only alphanumeric, hyphens, underscores"
         if len(effective) > 80:
             return f"SQS queue name {effective!r} exceeds the 80-character limit"
@@ -35,9 +38,8 @@ class SqsQueue(RegionalResource, TaggedResource):
     queue); everything else updates in place. ``url`` and ``arn`` are computed.
 
     **Dead-letter queue.** ``dead_letter_target_arn`` (pass another queue's
-    ``arn``) plus ``max_receive_count`` is what stops a message that always fails
-    from being redelivered forever, blocking everything behind it. Without one a
-    poison message is a queue that never drains.
+    ``arn``) with ``max_receive_count`` stops a message that always fails from
+    being redelivered indefinitely.
     """
 
     class Action:
@@ -56,8 +58,7 @@ class SqsQueue(RegionalResource, TaggedResource):
     visibility_timeout: int = mutable(default=30)
     #: Seconds an unconsumed message is kept. Four days is AWS's default.
     message_retention_seconds: int = mutable(default=345_600)
-    #: Long-poll wait. Non-zero cuts empty receives and their cost; 0 is AWS's
-    #: default and is almost never what anyone wants.
+    #: Long-poll wait in seconds; 0 (the AWS default) disables long polling.
     receive_wait_time_seconds: int = mutable(default=0)
     #: Where messages go after failing ``max_receive_count`` times.
     dead_letter_target_arn: str | None = mutable(default=None)

@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import contextlib
 import json
-from typing import Any
+from typing import Any, override
 from urllib.parse import unquote
-
-from typing_extensions import override
 
 from atlantide.providers.aws.handlers.base import (
     AwsHandler,
+    Client,
     create_or_adopt,
     ignore_missing,
     sync_tags,
@@ -26,7 +25,7 @@ class IamRoleHandler(AwsHandler[IamRole]):
     resource_type = IamRole
 
     @override
-    def create(self, client: Any, res: IamRole) -> dict[str, Any]:
+    def create(self, client: Client, res: IamRole) -> dict[str, Any]:
         def make() -> dict[str, Any]:
             resp = client.create_role(
                 RoleName=res.role_name,
@@ -36,34 +35,37 @@ class IamRoleHandler(AwsHandler[IamRole]):
             )
             return {"arn": resp["Role"]["Arn"]}
 
-        # Adopt to the *create* shape, not the read shape: `read` reports the
-        # mutable inputs too, and storing those as outputs would shadow the
-        # inputs they mirror the next time refresh compares them.
-        return create_or_adopt(make, lambda: self._outputs(client, res))
+        def adopt() -> dict[str, Any] | None:
+            if self._outputs(client, res) is None:
+                return None
+            # The live role carries whatever trust policy, description and tags
+            # it was created with; the update path makes them match config.
+            return self.update(client, {}, res)
 
-    def _outputs(self, client: Any, res: IamRole) -> dict[str, Any] | None:
-        """Just what a create returns: the arn, or None if the role is absent."""
+        # Adopt with the create-shaped outputs: `read` also reports the mutable
+        # inputs, which stored as outputs would shadow those inputs on refresh.
+        return create_or_adopt(make, adopt)
+
+    def _outputs(self, client: Client, res: IamRole) -> dict[str, Any] | None:
+        """The create-shaped outputs: the arn, or None if the role is absent."""
         try:
             return {"arn": client.get_role(RoleName=res.role_name)["Role"]["Arn"]}
         except client.exceptions.NoSuchEntityException:
             return None
 
     @override
-    def read(self, client: Any, res: IamRole) -> dict[str, Any] | None:
+    def read(self, client: Client, res: IamRole) -> dict[str, Any] | None:
         try:
             role = client.get_role(RoleName=res.role_name)["Role"]
         except client.exceptions.NoSuchEntityException:
             return None
-        # The trust policy decides who may assume this role, so a hand-edit is
-        # the change that most needs surfacing — and it was the one nothing
-        # looked at. Compared as the parsed document rather than the raw string:
-        # AWS returns it URL-encoded and reorders keys, so a text comparison
-        # reports drift on every run.
+        # The trust policy decides who may assume this role, so out-of-band edits
+        # must surface. It is compared as a parsed document: AWS returns it
+        # URL-encoded with reordered keys.
         observed: dict[str, Any] = {
             "arn": role["Arn"],
-            # IAM omits the key when the description is empty; report the live
-            # truth ("") rather than echoing the desired value as observed —
-            # otherwise a description cleared out of band is invisible forever.
+            # IAM omits the key when the description is empty; report "" rather
+            # than echoing the desired value, so an out-of-band clear is visible.
             "description": role.get("Description", ""),
             "tags": tags_from_list(role.get("Tags", [])),
         }
@@ -72,7 +74,7 @@ class IamRoleHandler(AwsHandler[IamRole]):
         return observed
 
     @override
-    def update(self, client: Any, prior: dict[str, Any], res: IamRole) -> dict[str, Any]:
+    def update(self, client: Client, prior: dict[str, Any], res: IamRole) -> dict[str, Any]:
         client.update_assume_role_policy(
             RoleName=res.role_name, PolicyDocument=_trust_document(res)
         )
@@ -81,12 +83,12 @@ class IamRoleHandler(AwsHandler[IamRole]):
         return {"arn": client.get_role(RoleName=res.role_name)["Role"]["Arn"]}
 
     @override
-    def delete(self, client: Any, res: IamRole) -> None:
+    def delete(self, client: Client, res: IamRole) -> None:
         with ignore_missing():
             client.delete_role(RoleName=res.role_name)
 
 
-def _sync_role_tags(client: Any, res: IamRole) -> None:
+def _sync_role_tags(client: Client, res: IamRole) -> None:
     """Make the role's tags match config, removing any it no longer declares."""
     sync_tags(
         res.tags,
@@ -99,18 +101,11 @@ def _sync_role_tags(client: Any, res: IamRole) -> None:
 def _reported_trust(live: Any, res: IamRole) -> Any:
     """The live trust policy, expressed the way this config states it.
 
-    Config says the same thing two ways — ``assumed_by`` with a service name, or
-    ``assume_role_policy`` with ready-made JSON — and AWS answers with a parsed
-    document either way, URL-encoded and key-reordered. Reporting that answer
-    verbatim compares a dict against a string (or against ``None``, when
-    ``assumed_by`` was used), which is never equal: an untouched role reports
-    drift on every refresh, and ``refresh --write`` clears its ``input_hash``
-    each time.
-
-    So compare the *documents*, and when they agree report back the value config
-    holds — which is what "no drift" means. When they disagree, report the live
-    document: a trust policy rewritten in the console is the single most important
-    thing about a role to surface, and it must not be swallowed by this.
+    Config states the policy as ``assumed_by`` (service names) or
+    ``assume_role_policy`` (JSON), while AWS returns a URL-encoded, key-reordered
+    document, so a verbatim report never equals config. When the parsed documents
+    match, the config value is reported; otherwise the live document is, so a
+    console edit surfaces as drift.
     """
     if _normalised_policy(live) == _normalised_policy(_trust_document(res)):
         return res.assume_role_policy
@@ -131,31 +126,30 @@ class IamPolicyHandler(AwsHandler[IamPolicy]):
     resource_type = IamPolicy
 
     @override
-    def create(self, client: Any, res: IamPolicy) -> dict[str, Any]:
+    def create(self, client: Client, res: IamPolicy) -> dict[str, Any]:
         self._put(client, res)
         return {}
 
     @override
-    def read(self, client: Any, res: IamPolicy) -> dict[str, Any] | None:
+    def read(self, client: Client, res: IamPolicy) -> dict[str, Any] | None:
         try:
             live = client.get_role_policy(
                 RoleName=_role_name(res.role_arn), PolicyName=res.policy_name
             )
         except client.exceptions.NoSuchEntityException:
             return None
-        # The permission document itself, so a policy widened out of band shows
-        # as drift rather than as a bare "the policy still exists".
+        # Report the statements so an out-of-band change to the policy shows as drift.
         document = _normalised_policy(live.get("PolicyDocument"))
         statements = document.get("Statement") if isinstance(document, dict) else None
         return {"statements": statements} if statements is not None else {}
 
     @override
-    def update(self, client: Any, prior: dict[str, Any], res: IamPolicy) -> dict[str, Any]:
+    def update(self, client: Client, prior: dict[str, Any], res: IamPolicy) -> dict[str, Any]:
         self._put(client, res)  # put_role_policy overwrites in place
         return {}
 
     @staticmethod
-    def _put(client: Any, res: IamPolicy) -> None:
+    def _put(client: Client, res: IamPolicy) -> None:
         client.put_role_policy(
             RoleName=_role_name(res.role_arn),
             PolicyName=res.policy_name,
@@ -163,7 +157,7 @@ class IamPolicyHandler(AwsHandler[IamPolicy]):
         )
 
     @override
-    def delete(self, client: Any, res: IamPolicy) -> None:
+    def delete(self, client: Client, res: IamPolicy) -> None:
         with ignore_missing():  # the role and its inline policy may already be gone
             client.delete_role_policy(RoleName=_role_name(res.role_arn), PolicyName=res.policy_name)
 
@@ -177,9 +171,8 @@ def _normalised_policy(document: Any) -> Any:
     """An IAM policy document as data, whatever shape AWS handed back.
 
     A document arrives either as a parsed dict or as a URL-encoded JSON string
-    depending on the call, and its key order is not stable. Comparing the raw
-    form would report drift on every run, which is worse than not checking at
-    all — a permanently-drifted resource is one nobody reads.
+    depending on the call, and its key order is not stable, so comparing the raw
+    form would report drift on every run.
     """
     if isinstance(document, str):
         with contextlib.suppress(ValueError):

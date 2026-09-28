@@ -1,19 +1,19 @@
 """The sandbox boundary: what config must not be able to reach.
 
-Each test names the capability being denied — environment, disk, subprocess, the
-interpreter's own globals — rather than the syntax that reaches it, since the
-subset rules in :mod:`atlantide.lang.validate` are worth exactly what this file
-proves about them.
+Each test names the capability being denied (environment, disk, subprocess, the
+interpreter's own globals) rather than the syntax that reaches it, so the file
+states what the subset rules in :mod:`atlantide.lang.validate` guarantee.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from atlantide.core import LanguageError, is_successful
+from atlantide.core import FuelExhaustedError, LanguageError, is_successful
 from atlantide.core.errors import LanguageError as CoreLanguageError
 from atlantide.core.types import format_template, interpolate
 from atlantide.lang import evaluate_source, validate_source
+from tests.lang.test_interp import Widget
 
 #: (capability, source). Denied by the import allow-list: each target module is
 #: ordinary unsandboxed Python importing `os`, `pathlib`, or `subprocess`, and the
@@ -23,7 +23,7 @@ ESCAPES = [
     ("file_read", "from atlantide.providers.local.provider import _read_content"),
     ("subprocess", "from atlantide.components.fetch import _git"),
     ("secret_store", "from atlantide.secrets.keyfile_store import KeyfileValueStore"),
-    ("state_write", "from atlantide.state.sqlite_backend import SqliteStateBackend"),
+    ("state_write", "from atlantide.state.sql.sqlite import SqliteStateBackend"),
     ("cli", "from atlantide.cli.main import app"),
     ("component_lock", "from atlantide.components.lock import load_lock"),
     ("aws_handler", "from atlantide.providers.aws.handlers.s3 import S3BucketHandler"),
@@ -31,7 +31,7 @@ ESCAPES = [
 ]
 
 
-@pytest.mark.parametrize("capability, source", ESCAPES, ids=[c for c, _ in ESCAPES])
+@pytest.mark.parametrize(("capability", "source"), ESCAPES, ids=[c for c, _ in ESCAPES])
 def test_import_escapes_are_rejected(capability: str, source: str) -> None:
     result = validate_source(source)
     assert not is_successful(result), f"{capability} escape should be rejected"
@@ -47,7 +47,7 @@ def test_provider_classes_are_not_importable_by_config() -> None:
 
 
 def test_interpreter_rejects_a_denied_module_even_without_validation() -> None:
-    """The allow-list is re-checked where the name is actually bound.
+    """The allow-list is re-checked where the name is bound.
 
     `import_module` executes the target and `getattr` hands config a live
     callable, so `_st_ImportFrom` cannot rely on having been validated first.
@@ -110,7 +110,7 @@ DISCARDED = [
 ]
 
 
-@pytest.mark.parametrize("name, source", DISCARDED, ids=[n for n, _ in DISCARDED])
+@pytest.mark.parametrize(("name", "source"), DISCARDED, ids=[n for n, _ in DISCARDED])
 def test_silently_discarded_arguments_are_rejected(name: str, source: str) -> None:
     result = evaluate_source(source)
     assert not is_successful(result), f"{name} should be rejected"
@@ -201,3 +201,188 @@ ALLOWED = [
 @pytest.mark.parametrize("source", ALLOWED)
 def test_config_surface_is_still_importable(source: str) -> None:
     assert is_successful(validate_source(source))
+
+
+# -- attribute policy -------------------------------------------------------
+#
+# A plain `getattr` with only dunders refused would make everything pydantic
+# hangs off a resource class config API: `Widget.parse_file("/etc/hosts")` reads
+# the disk (and `/dev/zero` reads until memory runs out). Leading-underscore
+# state on `atlantide` would bypass input tracking, and a user function's
+# `interp` is the evaluator itself.
+
+ATTRIBUTE_ESCAPES = [
+    ("parse_file", "data = Widget.parse_file('/etc/hosts')"),
+    ("model_validate_json", "data = Widget.model_validate_json('{}')"),
+    ("model_fields", "f = Widget.model_fields"),
+    ("model_construct", "w = Widget.model_construct(size=1)"),
+    ("instance_model_dump", "w = Widget('w', size=1)\nd = w.model_dump()"),
+    ("private_inputs", "x = atlantide._inputs"),
+    ("private_resource_state", "w = Widget('w', size=1)\ns = w._stack"),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "source"), ATTRIBUTE_ESCAPES, ids=[n for n, _ in ATTRIBUTE_ESCAPES]
+)
+def test_attribute_escapes_are_rejected_statically(name: str, source: str) -> None:
+    result = validate_source(source)
+    assert not is_successful(result), f"{name} should be rejected by the validator"
+
+
+RUNTIME_ATTRIBUTE_ESCAPES = [
+    # Plausible field names, so only the interpreter (knowing the model) refuses.
+    ("instance_json", "w = Widget('w', size=1)\nx = w.json()"),
+    ("class_schema", "x = Widget.schema()"),
+    ("class_copy", "x = Widget.copy"),
+    # A user function's attributes are the evaluator: `f.interp.fuel`, `f.scope`.
+    ("closure_interp", "def f():\n    return 1\ni = f.interp"),
+    ("closure_scope", "g = lambda: 1\ns = g.scope"),
+    # Mutable bookkeeping is not public.
+    ("consumed", "atlantide.consumed['x'] = 1"),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "source"), RUNTIME_ATTRIBUTE_ESCAPES, ids=[n for n, _ in RUNTIME_ATTRIBUTE_ESCAPES]
+)
+def test_attribute_escapes_are_rejected_at_runtime(name: str, source: str) -> None:
+    result = evaluate_source(source, extra_globals={"Widget": Widget})
+    assert not is_successful(result), f"{name} should be rejected"
+
+
+def test_the_interpreter_applies_the_attribute_policy_without_validation() -> None:
+    """`validate` sees spellings; the interpreter re-checks the attribute read."""
+    from atlantide.lang.builtins import build_globals
+    from atlantide.lang.interp import Interpreter, Scope
+
+    tree = __import__("ast").parse("x = Widget.parse_file('/etc/hosts')")
+    with pytest.raises(CoreLanguageError, match="parse_file"):
+        Interpreter().run(tree, Scope(init={**build_globals({}), "Widget": Widget}))
+
+
+def test_reading_an_input_is_still_recorded_and_private_state_is_not_reachable() -> None:
+    reg = evaluate_source(
+        "Widget('w', size=atlantide.input('n'))",
+        inputs={"n": 3, "unread": 1},
+        extra_globals={"Widget": Widget},
+    ).unwrap()
+    assert reg.inputs == {"n": 3}
+
+
+def test_declared_fields_and_resource_outputs_stay_readable() -> None:
+    source = (
+        "a = Widget('a', size=2, label='x')\n"
+        "Widget('b', size=a.size * 2, label=a.label + str(a.node_id))\n"
+    )
+    reg = evaluate_source(source, extra_globals={"Widget": Widget}).unwrap()
+    b = reg.get("default:test.Widget:b").unwrap()
+    assert (b.size, b.label) == (4, "xdefault:test.Widget:a")
+
+
+# -- resource bounds --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # Repeated squaring: 2**(2**30), 544MB if uncapped.
+        "x = 2\nfor i in range(30):\n    x = x * x",
+        "x = 2\nfor i in range(30):\n    x *= x",
+        "x = 1 << 10**9",
+        "x = (10**300) ** 1000",
+    ],
+    ids=["square", "aug_square", "lshift", "power_of_power"],
+)
+def test_integer_growth_is_bounded(source: str) -> None:
+    result = evaluate_source(source)
+    assert not is_successful(result)
+    assert isinstance(result.failure(), FuelExhaustedError)
+    assert "bits" in str(result.failure())
+
+
+def test_ordinary_integer_arithmetic_is_unaffected() -> None:
+    reg = evaluate_source(
+        "Widget('w', size=(2**64 - 1) // 3 % 1000 + (1 << 20) * 3)",
+        extra_globals={"Widget": Widget},
+    ).unwrap()
+    assert reg.get("default:test.Widget:w").unwrap().size == (2**64 - 1) // 3 % 1000 + (1 << 20) * 3
+
+
+#: `x = [x, x]` sixty times is 61 objects but 2**60 nodes to anything that walks
+#: it natively: 1.5GB from `to_json` unless metered by nodes visited.
+_DAG = "x = [0]\nfor i in range(60):\n    x = [x, x]\n"
+_TUPLE_DAG = "t = (0,)\nfor i in range(60):\n    t = (t, t)\n"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        _DAG + "s = to_json(x)",
+        _DAG + "s = str(x)",
+        _DAG + "s = f'{x}'",
+        _DAG + "s = f'{x!r}'",
+        _DAG + "s = merge({'a': x}, {'b': 1})",
+        _DAG + "y = [0]\nfor i in range(60):\n    y = [y, y]\nb = x == y",
+        _TUPLE_DAG + "s = {t}",
+        _TUPLE_DAG + "d = {t: 1}",
+        "x = 'a'\nfor i in range(40):\n    x = x + x",
+        "x = [0]\nfor i in range(40):\n    x = x + x",
+    ],
+    ids=[
+        "to_json",
+        "str",
+        "fstring",
+        "fstring_repr",
+        "merge",
+        "eq",
+        "set_hash",
+        "dict_key_hash",
+        "str_concat",
+        "list_concat",
+    ],
+)
+def test_native_walks_are_metered_by_nodes_visited(source: str) -> None:
+    result = evaluate_source(source)
+    assert not is_successful(result)
+    assert isinstance(result.failure(), FuelExhaustedError)
+
+
+# -- determinism of rendered text -------------------------------------------
+#
+# A default repr embeds a memory address, so text built from one differs per run
+# and so does the IR hash of any field it reaches.
+
+ADDRESS_LEAKS = [
+    ("fstring_repr_api", "x = f'{to_json!r}'"),
+    ("str_function", "x = str(merge)"),
+    ("str_closure", "def f():\n    return 1\nx = str([f])"),
+    ("map_str", "x = ','.join(map(str, [to_json]))"),
+    ("sorted_key_str", "x = sorted([to_json, merge], key=str)"),
+    ("percent_format", "x = '%r' % (to_json,)"),
+    ("set_of_functions", "x = [1 for f in {to_json, merge}]"),
+]
+
+
+@pytest.mark.parametrize(("name", "source"), ADDRESS_LEAKS, ids=[n for n, _ in ADDRESS_LEAKS])
+def test_address_bearing_text_is_refused(name: str, source: str) -> None:
+    result = evaluate_source(source)
+    assert not is_successful(result), f"{name} should be rejected"
+    assert "memory layout" in str(result.failure())
+
+
+def test_the_config_api_renders_deterministically() -> None:
+    reg = evaluate_source(
+        "Widget('w', size=1, label=f'{atlantide!r}')", extra_globals={"Widget": Widget}
+    ).unwrap()
+    assert reg.get("default:test.Widget:w").unwrap().label == "<atlantide config API>"
+
+
+def test_data_and_handles_still_render() -> None:
+    source = (
+        "a = Widget('a', size=1)\n"
+        "Widget('b', size=1, label=f'{[1, 2.5, None, True]}|{ {\"k\": (1,)} }|{str}|{a.size}')\n"
+    )
+    reg = evaluate_source(source, extra_globals={"Widget": Widget}).unwrap()
+    label = reg.get("default:test.Widget:b").unwrap().label
+    assert label == "[1, 2.5, None, True]|{'k': (1,)}|<class 'str'>|1"

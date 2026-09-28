@@ -6,7 +6,7 @@ from typing import Any
 from atlantide.core.plugin import ProviderPlugin
 from atlantide.core.resource import Resource
 from atlantide.providers.aws.components import SecureBucket
-from atlantide.providers.aws.handlers import HANDLERS
+from atlantide.providers.aws.handlers import HANDLERS as _HANDLERS
 from atlantide.providers.aws.policy import ServicePrincipal, allow, assume_role, deny
 from atlantide.providers.aws.provider import AwsAlias, AwsProvider
 from atlantide.providers.aws.region import Region
@@ -41,20 +41,20 @@ from atlantide.providers.aws.resources import (
     Vpc,
 )
 
-#: Resource types this provider manages, keyed by ``type_name``.
-#: Derived from the handler registry so a type cannot exist without CRUD.
+#: Resource types this provider manages, keyed by ``type_name``. Derived from the
+#: handler registry, so every type has CRUD. The registry is imported under a private
+#: name because config can import public module-level names (see
+#: :mod:`atlantide.lang.surface`) and handlers make boto3 calls.
 TYPES: dict[str, type[Resource]] = {
-    name: handler.resource_type for name, handler in HANDLERS.items()
+    name: handler.resource_type for name, handler in _HANDLERS.items()
 }
 
 
 def _build(settings: Mapping[str, Any]) -> AwsProvider:
     """Construct the AWS provider from its settings table.
 
-    A raw mapping rather than typed parameters, because that is the contract a
-    third-party provider gets: it may accept keys this codebase has never heard
-    of. Unknown keys are ignored rather than rejected, so a config written for a
-    newer provider still loads against an older one.
+    Takes a raw mapping, the same contract a third-party provider gets. Unknown keys
+    are ignored, so a config written for a newer provider version still loads.
     """
     aliases = {
         name: AwsAlias(profile=cfg.get("profile"), endpoint_url=cfg.get("endpoint"))

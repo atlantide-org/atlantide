@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from typing import ClassVar
+from typing import ClassVar, Self
 
 from atlantide.core import (
     FuelExhaustedError,
@@ -26,7 +26,7 @@ def _base_env() -> dict[str, str]:
 
 
 class Widget(Resource):
-    """Test resource injected via extra_globals (no provider package yet)."""
+    """Test resource injected via extra_globals; it has no provider package."""
 
     class Meta:
         provider: ClassVar[str] = "test"
@@ -87,13 +87,11 @@ def test_an_input_reaches_the_config_as_its_value() -> None:
 
 
 def test_a_secret_is_a_handle_not_a_value() -> None:
-    """`atlantide.secret()` used to read from `inputs` and return the plaintext.
+    """`atlantide.secret()` returns a `SecretRef`, never the plaintext from `inputs`.
 
-    That put the value straight into a resource field, and from there into the
-    hashed IR, the `.atlas` artifact and the state store — a secret written down
-    in three places by the one function whose purpose is to keep it out of them.
-    It now returns a `SecretRef`: the *name* travels, the value is resolved
-    in-memory at apply.
+    A plaintext would go into a resource field and from there into the hashed IR,
+    the `.atlas` artifact and the state store. Only the *name* travels; the value
+    is resolved in memory at apply.
     """
     src = "Widget('w', size=1, label=atlantide.secret('tok'))"
     reg = _eval(src, inputs={"tok": "hunter2"}).unwrap()
@@ -122,7 +120,7 @@ def test_only_the_inputs_the_config_read_are_recorded() -> None:
 
 
 def test_a_taken_default_is_recorded_too() -> None:
-    """It shaped the config just as much as a passed value did."""
+    """It shapes the config as much as a passed value does."""
     src = "Widget('w', size=atlantide.input('n', 3), label='x')"
     assert _eval(src).unwrap().inputs == {"n": 3}
 
@@ -159,7 +157,7 @@ class _Recorder:
         self.suppress = suppress
         self.exits: list[tuple[object, object]] = []
 
-    def __enter__(self) -> _Recorder:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
@@ -223,6 +221,10 @@ def test_fuel_exhaustion() -> None:
     result = _eval(src, fuel=200)
     assert not is_successful(result)
     assert isinstance(result.failure(), FuelExhaustedError)
+    # The message is the only place a user learns the budget can be raised.
+    message = str(result.failure())
+    assert "(200 steps)" in message
+    assert "--fuel" in message and "[lang] fuel" in message
 
 
 def test_missing_required_input() -> None:

@@ -1,11 +1,10 @@
-"""A plan whose "rotations" are really the wrong keyfile says so.
+"""A plan whose "rotations" come from the wrong keyfile says so.
 
 Rotation digests are salted per install. A teammate who applies against shared
 state without the shared ``secrets_key`` recomputes every digest under a
 different salt, so every secret reads as rotated and the plan fills with UPDATEs
-that would push unchanged values back at the providers. The plan is not so much
-wrong as unreadable, and nothing in it points at the keyfile — hence the warning
-exercised here.
+that would push unchanged values back at the providers. Nothing in such a plan
+points at the keyfile, hence the warning exercised here.
 """
 
 from __future__ import annotations
@@ -17,8 +16,7 @@ from atlantide.core import SecretRef
 from atlantide.engine import Engine
 from atlantide.secrets import KeyMaterial, SecretsRegistry
 from atlantide.secrets.env import EnvSecretsProvider
-from atlantide.state import MemoryStateBackend
-from atlantide.state.backend import StateBackend
+from atlantide.state import MemoryStateBackend, StateBackend
 from tests.support import Bucket, FakeProvider, engine_for, globals_of
 
 #: The word the warning must carry for a reader to be able to act on it.
@@ -26,9 +24,15 @@ WARNING = "secrets_key"
 
 
 def _engine(key_path: Path, backend: StateBackend) -> Engine:
-    """An engine resolving secrets from the environment, salted by ``key_path``."""
-    secrets = SecretsRegistry(material=KeyMaterial(str(key_path)))
-    secrets.register(EnvSecretsProvider(), default=True)
+    """An engine resolving secrets from the environment, salted by ``key_path``.
+
+    The key is created up front: a plan never creates one, and a *missing*
+    keyfile is an error rather than a mismatch (see ``test_fix_keyfile2``).
+    """
+    material = KeyMaterial(str(key_path))
+    material.seal("create the key")
+    secrets = SecretsRegistry(material=material)
+    secrets.register(EnvSecretsProvider(allow=["S*"]), default=True)
     return engine_for(Bucket, provider=FakeProvider(), backend=backend, secrets=secrets)
 
 
@@ -85,7 +89,7 @@ async def test_the_original_keyfile_plans_clean(tmp_path: Path, monkeypatch: Any
 async def test_one_genuine_rotation_is_not_a_keyfile_warning(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    """A real rotation stays a plain UPDATE — the tell is that *nothing* matched."""
+    """A real rotation stays a plain UPDATE; a mismatch is when *nothing* matched."""
     _set_secrets(monkeypatch, 2)
     backend = MemoryStateBackend()
     config = _config(2)

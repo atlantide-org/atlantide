@@ -1,43 +1,28 @@
-"""atlantide.reconcile: diff (Merkle-skip), planner (guards), executor (apply)."""
+"""Reconciliation: diff (Merkle skip), prevent_destroy guard, apply, refresh, adopt, aliases."""
 
+from atlantide.core.actions import DESTRUCTIVE_ACTIONS, Action
 from atlantide.reconcile.adopt import (
+    AdoptOptions,
     ImportOutcome,
     ImportRequest,
     adopt,
     identity_fields,
 )
 from atlantide.reconcile.aliases import alias_remap, persist_migration, resolve_aliases
-from atlantide.reconcile.context import (
-    ApplyEnv,
-    Desired,
-    OnFailure,
-    ProgressCallback,
-    RefreshProgress,
-)
-from atlantide.reconcile.diff import (
-    DESTRUCTIVE_ACTIONS,
-    Action,
-    Change,
-    ChangeSet,
-    diff,
-    force_replace,
-    restrict,
-)
+from atlantide.reconcile.changes import Change, ChangeSet, restrict, type_mutability
+from atlantide.reconcile.classify import reclassify
+from atlantide.reconcile.diff import diff
+from atlantide.reconcile.env import ApplyEnv, Desired, OnFailure
 from atlantide.reconcile.executor import apply
-from atlantide.reconcile.planner import plan
-from atlantide.reconcile.refresh import (
-    Drift,
-    DriftReport,
-    NodeDrift,
-    classify_drift,
-    refresh,
-    resolved_properties,
-)
+from atlantide.reconcile.guards import check_prevent_destroy, deferred_to_apply
+from atlantide.reconcile.progress import ProgressCallback, RefreshProgress
+from atlantide.reconcile.refresh import Drift, DriftReport, NodeDrift, refresh
 from atlantide.reconcile.report import ApplyReport
 
 __all__ = [
     "DESTRUCTIVE_ACTIONS",
     "Action",
+    "AdoptOptions",
     "ApplyEnv",
     "ApplyReport",
     "Change",
@@ -54,14 +39,14 @@ __all__ = [
     "adopt",
     "alias_remap",
     "apply",
-    "classify_drift",
+    "check_prevent_destroy",
+    "deferred_to_apply",
     "diff",
-    "force_replace",
     "identity_fields",
     "persist_migration",
-    "plan",
+    "reclassify",
     "refresh",
     "resolve_aliases",
-    "resolved_properties",
     "restrict",
+    "type_mutability",
 ]

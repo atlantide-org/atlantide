@@ -1,5 +1,5 @@
 """Atlantide showcase: an L2 component, a per-block region override, and output
-combinators — three of the newer authoring features in one small graph.
+combinators in one small graph.
 
 Valid Python syntax, but run by the deterministic Atlas-lang interpreter (no
 clock, randomness, env, or network at config time). ``uuid5`` is an Atlas-lang

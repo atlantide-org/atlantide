@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from atlantide.cli.introspect import all_types, schema_rows
+from atlantide.cli.commands.introspect import all_types, schema_rows
 from atlantide.core.fields import Mutability
 from atlantide.providers.aws import S3Bucket
+from tests.support import Cli
+
+cli = Cli()
 
 
 def test_all_types_spans_providers() -> None:
@@ -32,3 +35,23 @@ def test_schema_rows_reflect_field_metadata() -> None:
     assert rows["arn"].mutability is Mutability.COMPUTED
     assert rows["arn"].required is False
     assert rows["arn"].default == ""
+
+
+def test_resources_lists_types() -> None:
+    result = cli.run("resources")
+    assert "aws.S3Bucket" in result.output
+    assert "local.File" in result.output
+
+
+def test_schema_shows_fields() -> None:
+    result = cli.run("schema", "aws.S3Bucket")
+    assert "bucket" in result.output
+    assert "immutable" in result.output
+    assert "computed" in result.output
+
+
+def test_schema_unknown_type_suggests_available() -> None:
+    result = cli.run("schema", "aws.Nope")
+    assert result.exit_code == 1
+    assert "unknown type" in result.output
+    assert "aws.S3Bucket" in result.output  # suggestion list

@@ -1,14 +1,9 @@
-"""Driving the CLI the way a user does, and failing loudly when it did not work.
+"""Drive the CLI the way a user does, and fail loudly when a command did not work.
 
-Two things were written out by hand at every call site. The first is the assertion::
-
-    result = runner.invoke(app, ["apply", str(cfg), "--state", str(state), "-y"])
-    assert result.exit_code == 0, result.output
-
-The second is what happens when it is *omitted* — and it often was, for setup
-steps whose result nobody looked at. A setup `apply` that failed then produced a
-test failure several assertions later, describing a symptom rather than the
-cause, with the actual error text discarded.
+A bare ``runner.invoke`` leaves the exit-code assertion to each call site. When
+it is omitted, as it often is for setup steps, a failed setup ``apply`` surfaces
+several assertions later as a symptom rather than the cause, with the error text
+discarded.
 
 :meth:`Cli.ok` makes the assertion the default and puts the command in the
 message, so a failure says which invocation broke and what it printed. Arguments
@@ -27,10 +22,9 @@ from typer.testing import CliRunner
 from atlantide.cli.main import app
 
 #: Rich falls back to an 80-column terminal when stdout is not a tty, so a line
-#: containing a ``tmp_path`` wraps at whatever column the temp directory's length
-#: happens to put it — which differs between a developer's machine and CI, and
-#: splits substrings tests assert on. Pinning the width makes CLI output depend
-#: on the command rather than on where pytest put its files.
+#: containing a ``tmp_path`` wraps at a column set by the temp directory's length,
+#: which differs between machines and splits substrings tests assert on. A fixed
+#: width makes CLI output depend on the command, not on where pytest put its files.
 _WIDE = "200"
 
 
@@ -43,8 +37,8 @@ class Cli:
     def run(self, *args: Any, **kwargs: Any) -> Result:
         """Invoke and return the result whatever the exit code.
 
-        For the cases that are *about* the exit code — an aborted prompt, a
-        ``--detailed-exitcode`` of 2 — where asserting it is the test.
+        For tests about the exit code (an aborted prompt, a ``--detailed-exitcode``
+        of 2), where asserting it is the test.
         """
         env = {"COLUMNS": _WIDE, **(kwargs.pop("env", None) or {})}
         return self.runner.invoke(app, [str(arg) for arg in args], env=env, **kwargs)
@@ -56,8 +50,7 @@ class Cli:
         return result
 
     def fails(self, *args: Any, code: int = 1, **kwargs: Any) -> Result:
-        """Invoke and require failure. ``code=0`` would be a contradiction, so the
-        assertion is that it did *not* succeed with the expected code."""
+        """Invoke and require it to exit with ``code``."""
         result = self.run(*args, **kwargs)
         assert result.exit_code == code, _explain(args, result, expected=code)
         return result

@@ -108,7 +108,7 @@ class _Tarjan:
                 self._pop_scc(node)
 
             work.pop()
-            if work:  # propagate lowlink up to the parent frame.
+            if work:
                 parent = work[-1].node
                 self.low[parent] = min(self.low[parent], self.low[node])
 

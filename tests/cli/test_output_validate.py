@@ -12,39 +12,39 @@ from pathlib import Path
 
 import pytest
 
-from tests.support import Cli
+from tests.support import Cli, write_config
 
 cli = Cli()
 
 
 def _config(tmp_path: Path, *, sensitive: bool = False, stacks: bool = False) -> Path:
-    cfg = tmp_path / "config.py"
     if stacks:
-        cfg.write_text(
+        return write_config(
+            tmp_path,
             "from atlantide.core import Stack, output\n"
             "from atlantide.providers.local import File\n"
             "for env in ('dev', 'prod'):\n"
             "    with Stack(env, region='eu-north-1'):\n"
             f"        f = File('f', path=f'{tmp_path}/{{env}}.txt', content=env)\n"
-            "        output('checksum', f.checksum)\n"
+            "        output('checksum', f.checksum)\n",
         )
-    elif sensitive:
-        cfg.write_text(
+    if sensitive:
+        return write_config(
+            tmp_path,
             "from atlantide.core import output\n"
             "from atlantide.providers.random import Password\n"
             "p = Password('p', length=12)\n"
             "output('secret_value', p.result)\n"
-            "output('plain', 'visible')\n"
+            "output('plain', 'visible')\n",
         )
-    else:
-        cfg.write_text(
-            "from atlantide.core import output\n"
-            "from atlantide.providers.local import File\n"
-            f"f = File('f', path={str(tmp_path / 'out.txt')!r}, content='hi')\n"
-            "output('checksum', f.checksum)\n"
-            "output('note', 'v1')\n"
-        )
-    return cfg
+    return write_config(
+        tmp_path,
+        "from atlantide.core import output\n"
+        "from atlantide.providers.local import File\n"
+        f"f = File('f', path={str(tmp_path / 'out.txt')!r}, content='hi')\n"
+        "output('checksum', f.checksum)\n"
+        "output('note', 'v1')\n",
+    )
 
 
 def _applied(tmp_path: Path, **kw: bool) -> Path:
@@ -73,8 +73,8 @@ def test_output_lists_everything_when_given_no_name(tmp_path: Path) -> None:
 
 
 def test_output_reads_state_without_the_config(tmp_path: Path) -> None:
-    """The reason it reads state and nothing else: a script needs the value most
-    when the config is broken or half-edited."""
+    """It reads only state because a script needs the value most when the config
+    is broken or half-edited."""
     cfg = _config(tmp_path)
     state = _applied(tmp_path)
     cfg.write_text("this is not valid python at all\n")
@@ -112,8 +112,8 @@ def test_listing_redacts_sensitive_values(tmp_path: Path) -> None:
 
 
 def test_a_name_exported_by_two_stacks_asks_which(tmp_path: Path) -> None:
-    """Guessing would be worse than asking: the two values are different, and
-    picking one silently is how a script deploys against the wrong environment."""
+    """The two values differ, and picking one silently could point a script at
+    the wrong environment."""
     state = _applied(tmp_path, stacks=True)
 
     ambiguous = cli.run("output", "checksum", "--state", state)
@@ -145,8 +145,8 @@ def test_validate_accepts_a_good_config(tmp_path: Path) -> None:
 
 
 def test_validate_touches_no_state(tmp_path: Path) -> None:
-    """The whole point: it can run in a pre-commit hook or on a pull request,
-    where `plan` would need a backend it should not be handed."""
+    """It can run in a pre-commit hook or on a pull request, where `plan` would
+    need a backend it should not be handed."""
     cfg = _config(tmp_path)
     result = cli.run("validate", cfg)
     assert not list(tmp_path.glob("*.db")), "no state database was created"
@@ -167,8 +167,8 @@ def test_validate_catches_a_dependency_cycle(tmp_path: Path) -> None:
     cfg = tmp_path / "cycle.py"
     cfg.write_text(
         "from atlantide.providers.local import File\n"
-        "a = File('a', path='/tmp/a', content='x')\n"
-        "b = File('b', path='/tmp/b', content=a.checksum)\n"
+        "a = File('a', path='a', content='x')\n"
+        "b = File('b', path='b', content=a.checksum)\n"
         "a.content = b.checksum\n"
     )
     result = cli.run("validate", cfg)

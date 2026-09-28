@@ -1,7 +1,6 @@
-# Everything the image does not need. This file is what keeps the build context
-# small and, more importantly, keeps unrelated edits from invalidating the layer
-# cache: anything sent as context is hashed, whether the Dockerfile reads it or
-# not.
+# Everything the image does not need. Keeps the build context small and stops
+# unrelated edits from invalidating the layer cache: anything sent as context is
+# hashed, whether the Dockerfile reads it or not.
 
 # VCS and CI
 .git/
@@ -31,8 +30,8 @@ htmlcov/
 coverage.xml
 .token-savior-cache.json
 
-# Tests and examples: neither is installed, and both change often enough to
-# needlessly bust the cache if they were sent.
+# Tests, examples and scripts are not installed, and change often enough to
+# invalidate the cache if sent.
 tests/
 examples/
 scripts/
@@ -43,8 +42,8 @@ scripts/
 !README.md
 LICENSE
 
-# Local atlantide artifacts — state, secrets, vendored components. None of this
-# belongs in an image, and the keyfile least of all.
+# Local atlantide artifacts: state, secrets (including the keyfile), vendored
+# components.
 atlantide.db
 atlantide.db-*
 atlantide.key
